@@ -1292,9 +1292,6 @@ TEST_P(RoundRobinLoadBalancerTest, ZoneAwareForceLocalityDirect) {
       ->mutable_min_size()
       ->set_value(2);
 
-  EXPECT_CALL(runtime_.snapshot_, getInteger("upstream.zone_routing.force_local_zone.min_size", 2))
-      .WillOnce(Return(2));
-
   init(true, false, false);
   updateHosts(hosts, local_hosts_per_locality);
 
@@ -1586,7 +1583,7 @@ TEST_P(RoundRobinLoadBalancerTest, NoZoneAwareRoutingLocalEmpty) {
   EXPECT_CALL(runtime_.snapshot_, featureEnabled("upstream.zone_routing.enabled", 100))
       .WillOnce(Return(true));
   EXPECT_CALL(runtime_.snapshot_, getInteger("upstream.zone_routing.force_local_zone.min_size", 0))
-    .WillRepeatedly(Return(0));
+      .WillRepeatedly(Return(0));
   EXPECT_CALL(runtime_.snapshot_, getInteger("upstream.zone_routing.min_cluster_size", 6))
       .WillOnce(Return(1));
 
@@ -1632,7 +1629,7 @@ TEST_P(RoundRobinLoadBalancerTest, NoZoneAwareRoutingLocalEmptyFailTrafficOnPani
   EXPECT_CALL(runtime_.snapshot_, featureEnabled("upstream.zone_routing.enabled", 100))
       .WillOnce(Return(true));
   EXPECT_CALL(runtime_.snapshot_, getInteger("upstream.zone_routing.force_local_zone.min_size", 0))
-    .WillRepeatedly(Return(0));
+      .WillRepeatedly(Return(0));
   EXPECT_CALL(runtime_.snapshot_, getInteger("upstream.zone_routing.min_cluster_size", 6))
       .WillOnce(Return(1));
 
