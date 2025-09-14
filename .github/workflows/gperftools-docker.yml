@@ -1,0 +1,20 @@
+name: gperftools-docker
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build release tarballs
+        run: |
+          ENVOY_BUILD_ARCH=amd64 ./ci/do_ci.sh release
+          ENVOY_BUILD_ARCH=arm64 ./ci/do_ci.sh release
+        env:
+          BAZEL_BUILD_EXTRA_OPTIONS: --define tcmalloc=gperftools
+      - name: Build multi-arch images
+        run: |
+          DOCKER_BUILD_PLATFORM=linux/amd64,linux/arm64 \
+            ./distribution/docker/build.sh
