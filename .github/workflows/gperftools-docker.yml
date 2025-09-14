@@ -1,0 +1,35 @@
+name: gperftools-docker
+
+permissions:
+  contents: read
+  packages: read
+
+on:
+  workflow_dispatch:
+  workflow_run:
+    workflows:
+    - Request
+    types:
+    - completed
+
+jobs:
+  build:
+    if: >-
+      github.event_name == 'workflow_dispatch'
+      || (github.event.workflow_run.conclusion == 'success'
+          && github.event.workflow_run.repository.full_name == github.repository)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+      - name: Build release tarballs
+        run: |
+          ENVOY_BUILD_ARCH=amd64 ./ci/do_ci.sh release
+          ENVOY_BUILD_ARCH=arm64 ./ci/do_ci.sh release
+        env:
+          BAZEL_BUILD_EXTRA_OPTIONS: --define tcmalloc=gperftools
+      - name: Build multi-arch images
+        run: |
+          DOCKER_BUILD_PLATFORM=linux/amd64,linux/arm64 \
+            ./distribution/docker/build.sh
