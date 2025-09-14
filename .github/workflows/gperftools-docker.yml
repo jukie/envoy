@@ -18,3 +18,4 @@ jobs:
         run: |
           DOCKER_BUILD_PLATFORM=linux/amd64,linux/arm64 \
             ./distribution/docker/build.sh
+
