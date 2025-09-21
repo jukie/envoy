@@ -100,6 +100,10 @@ LoadBalancerBase::LoadBalancerBase(const PrioritySet& priority_set, ClusterLbSta
                                    uint32_t healthy_panic_threshold)
     : stats_(stats), runtime_(runtime), random_(random),
       default_healthy_panic_percent_(healthy_panic_threshold), priority_set_(priority_set) {
+  // Initialize cached runtime values
+  cached_panic_threshold_ = std::min<uint64_t>(
+      100, runtime_.snapshot().getInteger(RuntimePanicThreshold, default_healthy_panic_percent_));
+  cached_zone_enabled_ = runtime_.snapshot().featureEnabled(RuntimeZoneEnabled, 100);
   for (auto& host_set : priority_set_.hostSetsPerPriority()) {
     recalculatePerPriorityState(host_set->priority(), priority_set_, per_priority_load_,
                                 per_priority_health_, per_priority_degraded_, total_healthy_hosts_);
@@ -273,8 +277,10 @@ void LoadBalancerBase::recalculatePerPriorityPanic() {
   const uint32_t normalized_total_availability =
       calculateNormalizedTotalAvailability(per_priority_health_, per_priority_degraded_);
 
-  const uint64_t panic_threshold = std::min<uint64_t>(
+  // Update cached panic threshold
+  cached_panic_threshold_ = std::min<uint64_t>(
       100, runtime_.snapshot().getInteger(RuntimePanicThreshold, default_healthy_panic_percent_));
+  const uint64_t panic_threshold = cached_panic_threshold_;
 
   // This is corner case when panic is disabled and there is no hosts available.
   // LoadBalancerBase::choosePriority method expects that the sum of
@@ -426,6 +432,10 @@ ZoneAwareLoadBalancerBase::ZoneAwareLoadBalancerBase(
       locality_weighted_balancing_(locality_config.has_value() &&
                                    locality_config->has_locality_weighted_lb_config()) {
   ASSERT(!priority_set.hostSetsPerPriority().empty());
+  
+  // Initialize cached runtime values for zone aware routing
+  cached_min_cluster_size_ = runtime_.snapshot().getInteger(RuntimeMinClusterSize, min_cluster_size_);
+  
   resizePerPriorityState();
   if (locality_weighted_balancing_) {
     for (uint32_t priority = 0; priority < priority_set_.hostSetsPerPriority().size(); ++priority) {
@@ -477,6 +487,10 @@ void ZoneAwareLoadBalancerBase::regenerateLocalityRoutingStructures() {
   stats_.lb_recalculate_zone_structures_.inc();
   // resizePerPriorityState should ensure these stay in sync.
   ASSERT(per_priority_state_.size() == priority_set_.hostSetsPerPriority().size());
+
+  // Update cached runtime values for zone aware routing
+  cached_min_cluster_size_ = runtime_.snapshot().getInteger(RuntimeMinClusterSize, min_cluster_size_);
+  cached_zone_enabled_ = runtime_.snapshot().featureEnabled(RuntimeZoneEnabled, routing_enabled_);
 
   // We only do locality routing for P=0
   uint32_t priority = 0;
@@ -607,9 +621,8 @@ bool ZoneAwareLoadBalancerBase::earlyExitNonLocalityRouting() {
   }
 
   // Do not perform locality routing for small clusters.
-  const uint64_t min_cluster_size =
-      runtime_.snapshot().getInteger(RuntimeMinClusterSize, min_cluster_size_);
-  if (host_set.healthyHosts().size() < min_cluster_size) {
+  // Use cached min cluster size - updated by regenerateLocalityRoutingStructures()
+  if (host_set.healthyHosts().size() < cached_min_cluster_size_) {
     stats_.lb_zone_cluster_too_small_.inc();
     return true;
   }
@@ -637,8 +650,8 @@ HostSelectionResponse ZoneAwareLoadBalancerBase::chooseHost(LoadBalancerContext*
 }
 
 bool LoadBalancerBase::isHostSetInPanic(const HostSet& host_set) const {
-  uint64_t global_panic_threshold = std::min<uint64_t>(
-      100, runtime_.snapshot().getInteger(RuntimePanicThreshold, default_healthy_panic_percent_));
+  // Use cached panic threshold - updated by recalculatePerPriorityPanic()
+  const uint64_t global_panic_threshold = cached_panic_threshold_;
   const auto host_count = host_set.hosts().size() - host_set.excludedHosts().size();
   double healthy_percent =
       host_count == 0 ? 0.0 : 100.0 * host_set.healthyHosts().size() / host_count;
@@ -788,10 +801,16 @@ uint32_t ZoneAwareLoadBalancerBase::tryChooseLocalLocalityHosts(const HostSet& h
   // Bucket 2: [state.residual_capacity_[0], state.residual_capacity_[1] - 1]
   // ...
   // Bucket N: [state.residual_capacity_[N-2], state.residual_capacity_[N-1] - 1]
-  int i = 0;
-  while (threshold >= state.residual_capacity_[i]) {
-    i++;
-  }
+  // Original O(N) implementation:
+  // int i = 0;
+  // while (threshold >= state.residual_capacity_[i]) {
+  //   i++;
+  // }
+
+  // Optimized O(log N) binary search - finds first element > threshold
+  int i = std::upper_bound(state.residual_capacity_.begin(), 
+                          state.residual_capacity_.end(), 
+                          threshold) - state.residual_capacity_.begin();
 
   return i;
 }
@@ -805,6 +824,10 @@ ZoneAwareLoadBalancerBase::hostSourceToUse(LoadBalancerContext* context, uint64_
   auto& host_set = host_set_and_source.first;
   HostsSource hosts_source;
   hosts_source.priority_ = host_set.priority();
+
+  // Pre-calculate source types to avoid redundant calls
+  const auto non_locality_source_type = sourceType(host_availability);
+  const auto locality_source_type = localitySourceType(host_availability);
 
   // If the selected host set has insufficient healthy hosts, return all hosts (unless we should
   // fail traffic on panic, in which case return no host).
@@ -834,59 +857,41 @@ ZoneAwareLoadBalancerBase::hostSourceToUse(LoadBalancerContext* context, uint64_
     }
 
     if (locality.has_value()) {
-      auto source_type = localitySourceType(host_availability);
-      if (!source_type) {
+      if (!locality_source_type) {
         return absl::nullopt;
       }
-      hosts_source.source_type_ = source_type.value();
+      hosts_source.source_type_ = locality_source_type.value();
       hosts_source.locality_index_ = locality.value();
       return hosts_source;
     }
   }
 
-  // If we've latched that we can't do locality-based routing, return healthy or degraded hosts
-  // for the selected host set.
-  if (per_priority_state_[host_set.priority()]->locality_routing_state_ ==
-      LocalityRoutingState::NoLocalityRouting) {
-    auto source_type = sourceType(host_availability);
-    if (!source_type) {
-      return absl::nullopt;
-    }
-    hosts_source.source_type_ = source_type.value();
-    return hosts_source;
-  }
+  // Early return for cases that use non-locality routing
+  const bool use_non_locality_routing = 
+      (per_priority_state_[host_set.priority()]->locality_routing_state_ == 
+       LocalityRoutingState::NoLocalityRouting) ||
+      (!cached_zone_enabled_) ||
+      (isHostSetInPanic(localHostSet()) && !fail_traffic_on_panic_);
 
-  // Determine if the load balancer should do zone based routing for this pick.
-  if (!runtime_.snapshot().featureEnabled(RuntimeZoneEnabled, routing_enabled_)) {
-    auto source_type = sourceType(host_availability);
-    if (!source_type) {
-      return absl::nullopt;
-    }
-    hosts_source.source_type_ = source_type.value();
-    return hosts_source;
-  }
-
-  if (isHostSetInPanic(localHostSet())) {
-    stats_.lb_local_cluster_not_ok_.inc();
-    // If the local Envoy instances are in global panic, and we should not fail traffic, do
-    // not do locality based routing.
-    if (fail_traffic_on_panic_) {
-      return absl::nullopt;
-    } else {
-      auto source_type = sourceType(host_availability);
-      if (!source_type) {
+  if (use_non_locality_routing) {
+    if (isHostSetInPanic(localHostSet())) {
+      stats_.lb_local_cluster_not_ok_.inc();
+      if (fail_traffic_on_panic_) {
         return absl::nullopt;
       }
-      hosts_source.source_type_ = source_type.value();
-      return hosts_source;
     }
+    if (!non_locality_source_type) {
+      return absl::nullopt;
+    }
+    hosts_source.source_type_ = non_locality_source_type.value();
+    return hosts_source;
   }
 
-  auto source_type = localitySourceType(host_availability);
-  if (!source_type) {
+  // Use locality-based routing
+  if (!locality_source_type) {
     return absl::nullopt;
   }
-  hosts_source.source_type_ = source_type.value();
+  hosts_source.source_type_ = locality_source_type.value();
   hosts_source.locality_index_ = tryChooseLocalLocalityHosts(host_set);
   return hosts_source;
 }
@@ -1044,14 +1049,17 @@ bool EdfLoadBalancerBase::isSlowStartEnabled() const {
 
 bool EdfLoadBalancerBase::noHostsAreInSlowStart() const {
   if (!isSlowStartEnabled()) {
+    cached_no_hosts_in_slow_start_ = true;
     return true;
   }
+  
+  // Update cached value - this is called frequently so we cache the expensive time check
   auto current_time = time_source_.monotonicTime();
-  if (std::chrono::duration_cast<std::chrono::milliseconds>(
-          current_time - latest_host_added_time_) <= slow_start_window_) {
-    return false;
-  }
-  return true;
+  cached_no_hosts_in_slow_start_ = 
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          current_time - latest_host_added_time_) > slow_start_window_;
+  
+  return cached_no_hosts_in_slow_start_;
 }
 
 HostConstSharedPtr EdfLoadBalancerBase::peekAnotherHost(LoadBalancerContext* context) {

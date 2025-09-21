@@ -245,6 +245,10 @@ protected:
   std::vector<bool> per_priority_panic_;
   // The total count of healthy hosts across all priority levels.
   uint32_t total_healthy_hosts_;
+  
+  // Cached runtime values to avoid repeated runtime lookups
+  uint64_t cached_panic_threshold_{};
+  bool cached_zone_enabled_{true};
 
 private:
   Common::CallbackHandlePtr priority_update_cb_;
@@ -472,6 +476,9 @@ private:
   Common::CallbackHandlePtr priority_update_cb_;
   Common::CallbackHandlePtr local_priority_set_member_update_cb_handle_;
 
+  // Cached runtime values for zone aware routing
+  uint64_t cached_min_cluster_size_{};
+  
   // Config for zone aware routing.
   const uint64_t min_cluster_size_;
   const absl::optional<uint32_t> force_local_zone_min_size_;
@@ -565,6 +572,9 @@ protected:
   TimeSource& time_source_;
   MonotonicTime latest_host_added_time_;
   const double slow_start_min_weight_percent_;
+  
+  // Cached slow start state to avoid repeated calculations
+  mutable bool cached_no_hosts_in_slow_start_{true};
 };
 
 } // namespace Upstream
