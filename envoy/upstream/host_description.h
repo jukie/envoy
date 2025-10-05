@@ -85,6 +85,11 @@ public:
 
   // Returns an owning pointer to the current load metrics and clears the map.
   virtual StatMapPtr latch() PURE;
+
+  // Gets the current average value for a specific metric key without latching.
+  // Returns nullopt if the metric doesn't exist or has no data.
+  // This is used by ORCA-based load balancing to read metrics without clearing them.
+  virtual absl::optional<double> get(const absl::string_view key) const PURE;
 };
 
 /**

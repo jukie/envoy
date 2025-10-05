@@ -24,7 +24,7 @@ option (udpa.annotations.file_status).package_version_status = ACTIVE;
 message LocalityLbConfig {
   // Configuration for :ref:`zone aware routing
   // <arch_overview_load_balancing_zone_aware_routing>`.
-  // [#next-free-field: 7]
+  // [#next-free-field: 8]
   message ZoneAwareLbConfig {
     // Basis for computing per-locality percentages in zone-aware routing.
     enum LocalityBasis {
@@ -33,6 +33,24 @@ message LocalityLbConfig {
 
       // Use the weights of healthy hosts in each locality.
       HEALTHY_HOSTS_WEIGHT = 1;
+
+      // Use ORCA backend load metrics to make routing decisions based on upstream utilization.
+      // This mode aggregates ORCA load reports (CPU utilization, application utilization)
+      // across all hosts in each locality to determine actual backend utilization.
+      //
+      // Routing behavior:
+      // - Routes 100% locally (LocalityDirect) if local zone utilization is not significantly
+      //   higher than other zones (within locality_direct_threshold, default 5%)
+      // - Otherwise distributes traffic inversely proportional to utilization to equalize
+      //   load across zones (zones with lower utilization receive more traffic)
+      //
+      // This addresses the limitation of standard zone-aware routing which assumes evenly
+      // distributed incoming traffic. With ORCA, overloaded zones automatically send traffic
+      // to less-loaded zones to achieve equal utilization.
+      //
+      // Requires backends to emit ORCA load reports.
+      // See :ref:`ORCA load based config <envoy_v3_api_msg_extensions.load_balancing_policies.common.v3.LocalityLbConfig.ZoneAwareLbConfig.OrcaLoadBasedConfig>`
+      ORCA_LOAD = 2;
     }
 
     // Configures Envoy to always route requests to the local zone regardless of the
@@ -80,8 +98,214 @@ message LocalityLbConfig {
     // Determines how locality percentages are computed:
     // - HEALTHY_HOSTS_NUM: proportional to the count of healthy hosts.
     // - HEALTHY_HOSTS_WEIGHT: proportional to the weights of healthy hosts.
+    // - ORCA_LOAD: proportional to backend load metrics from ORCA reports.
     // Default value is HEALTHY_HOSTS_NUM if unset.
     LocalityBasis locality_basis = 6;
+
+    // Configuration for ORCA-based locality load balancing.
+    // Only used when locality_basis is set to ORCA_LOAD.
+    // [#next-free-field: 11]
+    message OrcaLoadBasedConfig {
+      // Specifies which ORCA utilization metrics to use for measuring backend load.
+      // Metrics are evaluated in priority order - the first valid metric is used.
+      // This mirrors the approach used by client-side weighted round robin.
+      message UtilizationMetrics {
+        // Custom utilization metric names to evaluate in priority order.
+        // These map to entries in the ``named_metrics`` map of ORCA load reports.
+        // Example: ["backend_queue_depth", "db_connection_pool_utilization", "memory_utilization"]
+        repeated string metric_names = 1;
+
+        // Whether to use application_utilization as the primary metric.
+        // If true, application_utilization is checked first before custom metrics.
+        // Default: true.
+        bool use_application_utilization = 2;
+
+        // Whether to use cpu_utilization as the final fallback metric.
+        // If true, cpu_utilization is used when no other metrics are available.
+        // Default: true.
+        bool use_cpu_utilization = 3;
+      }
+
+      // ORCA utilization metrics configuration.
+      // Defines the hierarchy of metrics to use for determining backend load.
+      // Default is to use application_utilization first, then cpu_utilization as fallback.
+      UtilizationMetrics utilization_metrics = 1;
+
+      // Penalty multiplier for error rate when calculating utilization.
+      // Higher values penalize endpoints with more errors more heavily.
+      // Formula: effective_utilization = base_utilization + (error_rate * error_utilization_penalty)
+      // Default: 1.0 (same penalty as client-side weighted round robin).
+      google.protobuf.DoubleValue error_utilization_penalty = 2;
+
+      // How often to refresh zone-level ORCA metrics weights.
+      // Aligns with client-side weighted round robin's weight_update_period.
+      // When zone metrics become stale (older than this period), they are recalculated
+      // on-demand during request routing. This lazy update strategy ensures metrics
+      // stay fresh during active traffic without requiring background timers.
+      // Defaults to 1 second. Values less than 100ms are capped at 100ms.
+      google.protobuf.Duration weight_update_period = 3;
+
+      // Minimum number of hosts in a locality that must be reporting ORCA data
+      // before the aggregated zone metrics are considered valid.
+      // If fewer hosts are reporting, the locality falls back to the configured
+      // ``fallback_basis`` for weight calculation.
+      // Default is 3 hosts.
+      google.protobuf.UInt32Value min_reporting_hosts_per_zone = 4
+          [(validate.rules).uint32 = {gte: 1}];
+
+      // The locality basis to use when ORCA data is insufficient or unavailable.
+      // This happens when:
+      // - Fewer than min_reporting_hosts_per_zone hosts are reporting ORCA data
+      // - ORCA data is stale or invalid
+      // - Hosts don't support ORCA reporting
+      // Default is HEALTHY_HOSTS_NUM.
+      LocalityBasis fallback_basis = 5;
+
+      // Threshold for LocalityDirect routing when using ORCA_LOAD.
+      // Routes 100% locally (LocalityDirect mode) if local zone utilization is not
+      // significantly higher than the least-utilized zone.
+      //
+      // Example with threshold of 0.05 (5%):
+      // - Local zone: 60% utilization
+      // - Zone A: 55% utilization (least-utilized)
+      // - Zone B: 70% utilization
+      // - Difference: 60% - 55% = 5% (within threshold) → Route 100% locally
+      //
+      // If local zone was 65% utilization:
+      // - Difference: 65% - 55% = 10% (exceeds threshold) → Distribute traffic
+      //
+      // Default: 0.05 (5%). Set to 0.0 to only route locally when local zone has
+      // the absolute lowest utilization.
+      type.v3.Percent locality_direct_threshold = 6;
+
+      // Exponential moving average (EMA) smoothing factor for zone metrics.
+      // When calculating zone-level ORCA metrics, use EMA to smooth rapid fluctuations:
+      //   new_avg = alpha × current_measurement + (1 - alpha) × previous_avg
+      //
+      // Higher values (closer to 1.0) respond faster to changes but are more sensitive to noise.
+      // Lower values (closer to 0.0) are more stable but slower to respond to real changes.
+      //
+      // Typical values:
+      //   0.3-0.5: Responsive to changes, some smoothing
+      //   0.1-0.2: Stable, dampens fluctuations (recommended)
+      //   0.0: No smoothing (use raw measurements)
+      //
+      // Default: 0.2 (20% weight to new measurements)
+      google.protobuf.DoubleValue zone_metrics_smoothing_factor = 7
+          [(validate.rules).double = {gte: 0.0, lte: 1.0}];
+
+      // Minimum time to wait before using newly calculated zone routing weights.
+      // This provides stability by preventing rapid changes in routing decisions.
+      // Aligns with client-side weighted round robin's blackout_period concept.
+      // Default: 10 seconds (same as CSWRR).
+      google.protobuf.Duration blackout_period = 8;
+
+      // Whether to enable out-of-band utilization reporting collection from endpoints.
+      // By default, per-request utilization reporting via LoadMetricStats is used.
+      // When enabled, endpoints can proactively send ORCA metrics on a periodic basis,
+      // reducing per-request overhead and providing more timely load information.
+      // Default: false (per-request mode).
+      google.protobuf.BoolValue enable_oob_load_report = 9;
+
+      // Load reporting interval to request from endpoints when using out-of-band reporting.
+      // Note that endpoints may not provide reports as frequently as requested.
+      // Only used when enable_oob_load_report is true.
+      // Default: 10 seconds (same as CSWRR).
+      google.protobuf.Duration oob_reporting_period = 10;
+
+      // If a zone has not received out-of-band ORCA metrics in this long,
+      // then we stop using the reported metrics and fall back to per-request
+      // LoadMetricStats or host counts. This ensures that we do not continue
+      // to use very stale metrics for routing decisions.
+      // Once we stop using stale metrics, if fresh OOB reports resume,
+      // the blackout_period applies before metrics are used again.
+      // Only used when enable_oob_load_report is true.
+      // Default: 3 minutes (same as CSWRR weight_expiration_period).
+      google.protobuf.Duration oob_expiration_period = 11;
+
+      // === OOB-First Mode Configuration ===
+      // These fields enable intelligent cross-zone probe elimination
+
+      // Whether to enable OOB-first mode that prioritizes cached metrics over probing.
+      // In OOB-first mode, cross-zone probes are only sent when absolutely necessary.
+      // Default: false (traditional probing behavior).
+      google.protobuf.BoolValue enable_oob_first_mode = 12;
+
+      // Strategy for handling missing or stale OOB data.
+      enum OobFallbackStrategy {
+        // Always fallback to cross-zone probing (traditional behavior)
+        PROBE_FALLBACK = 0;
+
+        // Use last known good metrics until they expire completely
+        USE_STALE_METRICS = 1;
+
+        // Use estimated metrics based on historical patterns
+        USE_ESTIMATED_METRICS = 2;
+
+        // Hybrid: try limited probing, then use stale/estimated
+        HYBRID_FALLBACK = 3;
+      }
+      OobFallbackStrategy oob_fallback_strategy = 13;
+
+      // Conditions that trigger cross-zone probing in OOB-first mode.
+      // Only used when enable_oob_first_mode is true.
+      message ProbeTriggers {
+        // Trigger probing if OOB data is missing for this duration
+        google.protobuf.Duration oob_missing_threshold = 1;
+
+        // Trigger probing if load variance between zones exceeds this percentage
+        // Value is 0.0 to 1.0 (e.g., 0.2 = 20% variance threshold)
+        google.protobuf.DoubleValue load_variance_threshold = 2;
+
+        // Trigger probing when a new zone is detected
+        bool new_zone_detected = 3;
+
+        // Maximum number of cross-zone probes allowed per minute
+        // Rate limiting to prevent probe storms
+        google.protobuf.UInt32Value max_probes_per_minute = 4;
+
+        // Only probe zones with significant traffic difference
+        google.protobuf.DoubleValue traffic_difference_threshold = 5;
+      }
+      ProbeTriggers probe_triggers = 14;
+
+      // Zone-level metrics aggregation configuration
+      message ZoneAggregationConfig {
+        // Whether to aggregate metrics at zone level instead of host level
+        bool enable_zone_aggregation = 1;
+
+        // Minimum number of hosts reporting in a zone for aggregation to be valid
+        google.protobuf.UInt32Value min_hosts_per_zone = 2;
+
+        // Aggregation method for zone metrics
+        enum AggregationMethod {
+          // Use average of all host metrics in zone
+          AVERAGE = 0;
+
+          // Use weighted average based on host capacity
+          WEIGHTED_AVERAGE = 1;
+
+          // Use maximum value (most conservative)
+          MAXIMUM = 2;
+
+          // Use minimum value (most optimistic)
+          MINIMUM = 3;
+        }
+        AggregationMethod aggregation_method = 3;
+
+        // Whether to prioritize local zone metrics in calculations
+        bool prioritize_local_zone = 4;
+
+        // Weight factor for local zone when prioritized (1.0 = normal, >1.0 = preferred)
+        google.protobuf.DoubleValue local_zone_weight = 5;
+      }
+      ZoneAggregationConfig zone_aggregation = 15;
+    }
+
+    // Configuration for ORCA-based load measurement.
+    // Only used when locality_basis is set to ORCA_LOAD.
+    // If locality_basis is ORCA_LOAD but this is not set, default values are used.
+    OrcaLoadBasedConfig orca_load_config = 7;
   }
 
   // Configuration for :ref:`locality weighted load balancing

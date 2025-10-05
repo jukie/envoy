@@ -26,6 +26,9 @@
 #include "source/common/upstream/load_balancer_context_base.h"
 #include "source/extensions/load_balancing_policies/common/locality_wrr.h"
 
+#include "absl/types/optional.h"
+#include "absl/status/status.h"
+
 namespace Envoy {
 namespace Upstream {
 
@@ -264,7 +267,8 @@ protected:
   ZoneAwareLoadBalancerBase(const PrioritySet& priority_set, const PrioritySet* local_priority_set,
                             ClusterLbStats& stats, Runtime::Loader& runtime,
                             Random::RandomGenerator& random, uint32_t healthy_panic_threshold,
-                            const absl::optional<LocalityLbConfig> locality_config);
+                            const absl::optional<LocalityLbConfig> locality_config,
+                            TimeSource& time_source);
 
   // When deciding which hosts to use on an LB decision, we need to know how to index into the
   // priority_set. This priority_set cursor is used by ZoneAwareLoadBalancerBase subclasses, e.g.
@@ -389,6 +393,7 @@ private:
    */
   bool earlyExitNonLocalityRouting();
 
+protected:
   /**
    * Try to select upstream hosts from the same locality.
    * @param host_set the last host set returned by chooseHostSet()
@@ -403,6 +408,15 @@ private:
   absl::FixedArray<LocalityPercentages>
   calculateLocalityPercentages(const HostsPerLocality& local_hosts_per_locality,
                                const HostsPerLocality& upstream_hosts_per_locality);
+
+  /**
+   * Calculate locality percentages for ORCA_LOAD mode.
+   * This uses a differential routing approach where routing decisions are based purely on
+   * upstream utilization to equalize load across zones.
+   */
+  absl::FixedArray<LocalityPercentages>
+  calculateLocalityPercentagesOrcaLoad(const HostsPerLocality& local_hosts_per_locality,
+                                       const HostsPerLocality& upstream_hosts_per_locality);
 
   /**
    * Regenerate locality aware routing structures for fast decisions on upstream locality selection.
@@ -447,6 +461,184 @@ private:
     return per_priority_state_[host_set.priority()]->locality_wrr_->chooseDegradedLocality();
   };
 
+  // ORCA-based zone metrics support
+  // Cached zone-level metrics aggregated from host ORCA reports
+  struct CachedZoneMetrics {
+    // Locality weight calculated from backend load (inverse of utilization)
+    // Higher weight = more capacity = route more traffic here
+    uint64_t locality_weight{0};
+
+    // Average utilization across reporting hosts in this zone (0.0-1.0)
+    double avg_utilization{0.0};
+
+    // Average CPU utilization across reporting hosts (0.0-1.0)
+    double avg_cpu{0.0};
+
+    // Number of hosts that reported ORCA data for this zone
+    uint32_t reporting_hosts{0};
+
+    // When these metrics were last updated
+    MonotonicTime last_updated;
+
+    // Whether these metrics are valid (enough hosts reporting)
+    bool is_valid{false};
+  };
+
+  // Host-attached LB policy data to receive ORCA reports directly from the router and cache
+  // the latest utilization values per host. This provides a push path complementing
+  // LoadMetricStats (which is pull-based and may be empty when first read).
+  struct OrcaHostLbPolicyData : public HostLbPolicyData {
+    absl::Status onOrcaLoadReport(const Upstream::OrcaLoadReport& report) override {
+      // Update atomics with latest values. Prefer application_utilization if > 0.
+      double app = report.application_utilization();
+      double cpu = report.cpu_utilization();
+      if (app > 0) {
+        last_app_utilization.store(app, std::memory_order_relaxed);
+      }
+      if (cpu > 0) {
+        last_cpu_utilization.store(cpu, std::memory_order_relaxed);
+      }
+      // Bump update marker to indicate we have received fresh ORCA data.
+      last_update_ns.fetch_add(1, std::memory_order_relaxed);
+      return absl::OkStatus();
+    }
+
+    // Update OOB reporting state when a periodic report is received
+    void updateOobReportingState(bool is_oob_report) {
+      if (is_oob_report) {
+        // Convert current time to nanoseconds for atomic storage
+        const uint64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        oob_last_update_ns.store(now_ns, std::memory_order_relaxed);
+        oob_reporting_active.store(true, std::memory_order_relaxed);
+      }
+    }
+
+    absl::optional<double> app() const {
+      const double v = last_app_utilization.load(std::memory_order_relaxed);
+      return v > 0 ? absl::make_optional(v) : absl::nullopt;
+    }
+    absl::optional<double> cpu() const {
+      const double v = last_cpu_utilization.load(std::memory_order_relaxed);
+      return v > 0 ? absl::make_optional(v) : absl::nullopt;
+    }
+
+    std::atomic<double> last_cpu_utilization{0.0};
+    std::atomic<double> last_app_utilization{0.0};
+    std::atomic<uint64_t> last_update_ns{0};
+
+    // Out-of-band (OOB) ORCA reporting fields
+    //
+    // These fields track the state of periodic OORCA reports when OOB reporting is enabled.
+    // They allow the load balancer to prefer fresh OOB data over per-request metrics
+    // while gracefully falling back when OOB data becomes stale.
+
+    /// Timestamp of the last OOB report received (nanoseconds since epoch)
+    /// Stored as atomic for thread-safe access between load balancer threads
+    /// Used to determine if OOB data has expired based on oob_expiration_period
+    std::atomic<uint64_t> oob_last_update_ns{0};
+
+    /// Whether this host has active OOB reporting enabled
+    /// - true: Host is sending OOB reports and data is considered fresh
+    /// - false: OOB reporting not active or data has expired
+    /// Updated atomically when OOB reports are received or expire
+    std::atomic<bool> oob_reporting_active{false};
+  };
+
+  // Update zone metrics for all host sets (called on-demand when stale)
+  void updateZoneMetricsOnMainThread();
+
+  // Check if zone metrics need updating and refresh if stale (lazy update)
+  void maybeUpdateZoneMetrics();
+
+  // OOB reporting timer management
+  void startOobExpirationTimer();
+  void onOobExpirationTimer();
+  void checkExpiredOobReports();
+
+  // OOB-first zone metrics cache operations
+  // Get zone metrics using OOB-first approach (prioritizes cached OOB data)
+  absl::optional<CachedZoneMetrics> getOobFirstZoneMetrics(
+      const envoy::config::core::v3::Locality& locality);
+
+  // Update OOB-first cache when new OOB data is received
+  void updateOobFirstCache(const envoy::config::core::v3::Locality& locality,
+                          const CachedZoneMetrics& metrics);
+
+  // Check if cross-zone probing is needed based on OOB-first strategy
+  bool needsCrossZoneProbing(const envoy::config::core::v3::Locality& locality,
+                           const CachedZoneMetrics& current_metrics);
+
+  // Perform intelligent cross-zone probe with rate limiting
+  bool performIntelligentProbe(const envoy::config::core::v3::Locality& locality,
+                              const HostVector& hosts);
+
+  // Aggregate OOB metrics at zone level (if enabled)
+  CachedZoneMetrics aggregateOobMetricsForZone(
+      const envoy::config::core::v3::Locality& locality,
+      const HostVector& hosts);
+
+  // Apply fallback strategy when OOB data is unavailable
+  absl::optional<CachedZoneMetrics> applyFallbackStrategy(
+      const envoy::config::core::v3::Locality& locality,
+      const HostVector& hosts);
+
+  // Reset probe rate limiting counters (called periodically)
+  void resetProbeRateCounters();
+
+  // Aggregate ORCA metrics for a specific host set
+  void aggregateZoneMetricsForHostSet(const HostSet& host_set);
+
+  // Calculate zone metrics from a vector of hosts in a locality
+  CachedZoneMetrics
+  calculateZoneMetricsFromHosts(const HostVector& hosts,
+                                const envoy::config::core::v3::Locality& locality);
+
+  // Get cached ORCA-based locality weight (hot-path, O(1) lookup)
+  uint64_t getCachedOrcaBasedLocalityWeight(const HostVector& locality_hosts,
+                                            const envoy::config::core::v3::Locality& locality);
+
+  // Extract utilization metric from a host's ORCA data (if available)
+  // Returns nullopt if the host doesn't have valid ORCA data
+  // Uses runtime type checking to avoid circular dependencies
+  absl::optional<double> getUtilizationFromHost(const Host& host) const;
+
+  // Calculate fallback weight when ORCA data is insufficient
+  uint64_t calculateFallbackLocalityWeight(const HostVector& locality_hosts,
+                                           const envoy::config::core::v3::Locality& locality) const;
+
+  // Helper functions for calculateLocalityPercentagesOrcaLoad
+
+  // Structure to hold utilization information for a locality
+  struct LocalityUtilizationInfo {
+    double utilization; // 0.0 to 1.0
+    double capacity;    // 1.0 - utilization
+    size_t num_hosts;
+    bool is_local;
+    bool is_valid; // true if we have valid ORCA data
+    const envoy::config::core::v3::Locality* locality;
+  };
+
+  // Collect utilization information for all upstream localities
+  std::vector<LocalityUtilizationInfo>
+  collectLocalityUtilizationInfo(const HostsPerLocality& upstream_hosts_per_locality,
+                                 const envoy::config::core::v3::Locality* local_locality_ptr,
+                                 double& local_utilization, double& min_other_utilization,
+                                 bool& found_local);
+
+  // Calculate routing weights based on inverse utilization for equal distribution
+  void
+  calculateInverseUtilizationWeights(const std::vector<LocalityUtilizationInfo>& locality_utils,
+                                     double& total_routing_weight, size_t& valid_localities);
+
+  // Generate final locality percentages from utilization information and routing weights
+  absl::FixedArray<LocalityPercentages>
+  generateLocalityPercentages(const std::vector<LocalityUtilizationInfo>& locality_utils,
+                              const HostsPerLocality& upstream_hosts_per_locality,
+                              double total_routing_weight, size_t valid_localities,
+                              double local_utilization, double min_other_utilization,
+                              bool found_local);
+
   // The set of local Envoy instances which are load balancing across priority_set_.
   const PrioritySet* local_priority_set_;
 
@@ -483,7 +675,136 @@ private:
   // If locality weight aware routing is enabled.
   const bool locality_weighted_balancing_ : 1;
 
+  // ORCA-based zone metrics cache and configuration
+  // Map from locality to cached zone metrics (updated on-demand when stale)
+  absl::flat_hash_map<envoy::config::core::v3::Locality, CachedZoneMetrics, LocalityHash,
+                      LocalityEqualTo>
+      cached_zone_metrics_;
+
+  // OOB-first zone metrics cache with intelligent probing
+  // This cache prioritizes OOB data and only falls back to cross-zone probing when necessary
+  struct OobFirstZoneMetrics {
+    // Latest OOB metrics received for this zone
+    CachedZoneMetrics oob_metrics;
+
+    // Last time we received OOB data for this zone
+    MonotonicTime last_oob_update{MonotonicTime::min()};
+
+    // Whether we have valid OOB data for this zone
+    bool has_valid_oob_data{false};
+
+    // Last time we had to cross-zone probe this zone
+    MonotonicTime last_probe_time{MonotonicTime::min()};
+
+    // Number of cross-zone probes sent to this zone (rate limiting)
+    uint32_t probes_sent_this_minute{0};
+
+    // Whether we're in probe cooldown after recent probing
+    bool in_probe_cooldown{false};
+  };
+
+  // OOB-first cache mapping
+  absl::flat_hash_map<envoy::config::core::v3::Locality, OobFirstZoneMetrics, LocalityHash,
+                      LocalityEqualTo>
+      oob_first_zone_cache_;
+
+  // Last time zone metrics were refreshed (for lazy updates)
+  MonotonicTime zone_metrics_last_refresh_{MonotonicTime::min()};
+
+  // How often to check if zone metrics need updating (default: 1 second)
+  // Metrics are refreshed on-demand in the hot path when stale
+  std::chrono::milliseconds zone_metrics_update_interval_{1000};
+
+  // Minimum hosts reporting ORCA before trusting zone metrics
+  uint32_t min_orca_reporting_hosts_{3};
+
+  // ORCA utilization metrics configuration (3-tier hierarchy like CSWRR)
+  std::vector<std::string> orca_utilization_metric_names_;
+  bool orca_use_application_utilization_{true};
+  bool orca_use_cpu_utilization_{true};
+
+  // Pre-computed metric keys to avoid string allocations in hot path
+  std::vector<std::string> orca_utilization_metric_keys_;
+
+  // Error utilization penalty multiplier (aligns with CSWRR)
+  double orca_error_utilization_penalty_{1.0};
+
+  // Fallback locality basis when ORCA data insufficient
+  LocalityLbConfig::ZoneAwareLbConfig::LocalityBasis orca_fallback_basis_{
+      LocalityLbConfig::ZoneAwareLbConfig::HEALTHY_HOSTS_NUM};
+
+  // Threshold for LocalityDirect routing with ORCA (percentage points, 0-100)
+  // Allows small differences in ORCA metrics without triggering cross-zone routing
+  uint32_t locality_direct_threshold_pct_{5}; // Default: 5%
+
+  // Exponential moving average smoothing factor for zone metrics (0.0-1.0)
+  // Higher = more responsive, Lower = more stable
+  // Default: 0.2 (20% new data, 80% history)
+  double zone_metrics_smoothing_factor_{0.2};
+
+  // Blackout period for zone routing weights (aligns with CSWRR)
+  // Prevents rapid changes in routing decisions for stability
+  std::chrono::milliseconds zone_routing_blackout_period_{10000}; // 10 seconds (same as CSWRR)
+
+  // Out-of-band (OOB) ORCA reporting configuration
+  //
+  // When enabled, backends can proactively send metrics on a periodic basis rather
+  // than only per-request. This reduces per-request overhead and provides more
+  // timely load information for zone-aware routing decisions.
+  //
+  // OOB reporting complements the standard per-request LoadMetricStats:
+  // - OOB data: Preferred when available and fresh (lower overhead)
+  // - Per-request: Fallback when OOB unavailable or expired
+
+  /// Whether OOB reporting is enabled via configuration
+  bool oob_enabled_{false};
+
+  /// How often to request OOB reports from backends (default: 10s, same as CSWRR)
+  /// Backends may not respect this exact interval but should report frequently
+  std::chrono::milliseconds oob_reporting_period_{10000};
+
+  /// How long before OOB metrics are considered stale (default: 3min, same as CSWRR)
+  /// After this period, zone routing falls back to per-request metrics
+  std::chrono::milliseconds oob_expiration_period_{180000};
+
+  /// Timer for periodic OOB metric expiration checks
+  /// TODO: Implementation pending dispatcher access in base class
+  Event::TimerPtr oob_expiration_timer_;
+
+  // OOB-first mode configuration
+  //
+  // When enabled, the load balancer prioritizes cached OOB metrics over cross-zone probing,
+  // only sending probes when absolutely necessary. This dramatically reduces cross-zone
+  // traffic and improves latency for zone-aware routing.
+
+  /// Whether OOB-first mode is enabled via configuration
+  bool oob_first_enabled_{false};
+
+  /// Strategy for handling missing or stale OOB data in OOB-first mode
+  LocalityLbConfig::ZoneAwareLbConfig::OrcaLoadBasedConfig::OobFallbackStrategy
+      oob_fallback_strategy_{LocalityLbConfig::ZoneAwareLbConfig::OrcaLoadBasedConfig::PROBE_FALLBACK};
+
+  /// Trigger conditions for cross-zone probing in OOB-first mode
+  LocalityLbConfig::ZoneAwareLbConfig::OrcaLoadBasedConfig::ProbeTriggers oob_probe_triggers_;
+
+  /// Zone-level aggregation configuration for OOB metrics
+  LocalityLbConfig::ZoneAwareLbConfig::OrcaLoadBasedConfig::ZoneAggregationConfig
+      oob_zone_aggregation_config_;
+
+  // Always-probe: if enabled, send a constant, low-percentage trickle of traffic cross-zone even
+  // when all zones have ORCA data and LocalityDirect would otherwise route 100% local. This keeps
+  // ORCA fresh and can help detect rapid capacity changes. Use sparingly in production.
+  // Controlled via runtime keys:
+  //  - upstream.zone_routing.orca_probe_always.enabled (default: 0)
+  //  - upstream.zone_routing.orca_probe_always.percent (0-100, default: 0)
+  bool orca_probe_always_enabled_{true};
+  uint32_t orca_probe_always_permyriad_{100};
+
+  // Time source for ORCA zone metrics timestamps and lazy updates
+  TimeSource& time_source_;
+
   friend class TestZoneAwareLoadBalancer;
+  friend class TestOrcaZoneAwareLoadBalancer;
 };
 
 /**

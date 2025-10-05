@@ -568,9 +568,10 @@ public:
   TestZoneAwareLb(const PrioritySet& priority_set, ClusterLbStats& lb_stats,
                   Runtime::Loader& runtime, Random::RandomGenerator& random,
                   uint32_t healthy_panic_threshold,
-                  absl::optional<LocalityLbConfig> locality_config)
+                  absl::optional<LocalityLbConfig> locality_config,
+                  TimeSource& time_source)
       : ZoneAwareLoadBalancerBase(priority_set, nullptr, lb_stats, runtime, random,
-                                  healthy_panic_threshold, locality_config) {}
+                                  healthy_panic_threshold, locality_config, time_source) {}
 
   HostConstSharedPtr chooseHostOnce(LoadBalancerContext*) override {
     return choose_host_once_host_;
@@ -584,8 +585,8 @@ public:
 class ZoneAwareLoadBalancerBaseTest : public LoadBalancerTestBase {
 public:
   envoy::config::cluster::v3::Cluster::CommonLbConfig common_config_;
-  TestZoneAwareLb lb_{priority_set_, stats_, runtime_, random_, 50, {}};
-  TestZoneAwareLoadBalancer lbx_{priority_set_, stats_, runtime_, random_, 50, {}};
+  TestZoneAwareLb lb_{priority_set_, stats_, runtime_, random_, 50, {}, simTime()};
+  TestZoneAwareLoadBalancer lbx_{priority_set_, stats_, runtime_, random_, 50, {}, simTime()};
 };
 
 // Tests the source type static methods in zone aware load balancer.

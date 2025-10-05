@@ -447,6 +447,22 @@ LoadMetricStats::StatMapPtr LoadMetricStatsImpl::latch() {
   return latched;
 }
 
+absl::optional<double> LoadMetricStatsImpl::get(const absl::string_view key) const {
+  absl::MutexLock lock(&mu_);
+  if (map_ == nullptr) {
+    return absl::nullopt;
+  }
+  auto it = map_->find(key);
+  if (it == map_->end()) {
+    return absl::nullopt;
+  }
+  // Return the average value for the metric
+  return it->second.num_requests_with_metric > 0
+             ? absl::make_optional(it->second.total_metric_value /
+                                   it->second.num_requests_with_metric)
+             : absl::nullopt;
+}
+
 absl::StatusOr<std::unique_ptr<HostDescriptionImpl>> HostDescriptionImpl::create(
     ClusterInfoConstSharedPtr cluster, const std::string& hostname,
     Network::Address::InstanceConstSharedPtr dest_address, MetadataConstSharedPtr endpoint_metadata,

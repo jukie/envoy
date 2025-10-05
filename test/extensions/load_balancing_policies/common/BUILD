@@ -139,3 +139,12 @@ envoy_cc_test(
         ":load_balancer_base_test_lib",
     ],
 )
+
+envoy_cc_test(
+    name = "orca_zone_routing_test",
+    srcs = ["orca_zone_routing_test.cc"],
+    deps = [
+        ":load_balancer_base_test_lib",
+        "@envoy_api//envoy/extensions/load_balancing_policies/common/v3:pkg_cc_proto",
+    ],
+)

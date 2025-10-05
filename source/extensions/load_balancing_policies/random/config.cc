@@ -18,7 +18,7 @@ TypedRandomLbConfig::TypedRandomLbConfig(const CommonLbConfigProto& common_lb_co
 Upstream::LoadBalancerPtr RandomCreator::operator()(
     Upstream::LoadBalancerParams params, OptRef<const Upstream::LoadBalancerConfig> lb_config,
     const Upstream::ClusterInfo& cluster_info, const Upstream::PrioritySet&,
-    Runtime::Loader& runtime, Envoy::Random::RandomGenerator& random, TimeSource&) {
+    Runtime::Loader& runtime, Envoy::Random::RandomGenerator& random, TimeSource& time_source) {
 
   const auto typed_lb_config = dynamic_cast<const TypedRandomLbConfig*>(lb_config.ptr());
   ASSERT(typed_lb_config != nullptr, "Invalid random load balancer config");
@@ -27,7 +27,7 @@ Upstream::LoadBalancerPtr RandomCreator::operator()(
       params.priority_set, params.local_priority_set, cluster_info.lbStats(), runtime, random,
       PROTOBUF_PERCENT_TO_ROUNDED_INTEGER_OR_DEFAULT(cluster_info.lbConfig(),
                                                      healthy_panic_threshold, 100, 50),
-      typed_lb_config->lb_config_);
+      typed_lb_config->lb_config_, time_source);
 }
 
 /**

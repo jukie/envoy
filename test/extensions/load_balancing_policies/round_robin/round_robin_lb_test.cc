@@ -746,6 +746,97 @@ TEST_P(RoundRobinLoadBalancerTest, ZoneAwareZonesMismatched) {
   EXPECT_EQ(2U, stats_.lb_zone_routing_cross_zone_.value());
 }
 
+TEST_P(RoundRobinLoadBalancerTest, ZoneAwareOrcaResidualFlips) {
+  if (&hostSet() == &failover_host_set_) {
+    return;
+  }
+
+  envoy::config::core::v3::Locality zone_a;
+  zone_a.set_zone("A");
+  envoy::config::core::v3::Locality zone_b;
+  zone_b.set_zone("B");
+
+  HostVectorSharedPtr hosts(new HostVector({makeTestHost(info_, "tcp://127.0.0.1:80", zone_a),
+                                            makeTestHost(info_, "tcp://127.0.0.1:81", zone_b)}));
+
+  HostsPerLocalitySharedPtr local_hpl =
+      makeHostsPerLocality({{makeTestHost(info_, "tcp://127.0.0.1:80", zone_a)}, {}}, true);
+
+  HostsPerLocalitySharedPtr up_equal =
+      makeHostsPerLocality({{makeTestHost(info_, "tcp://127.0.0.1:80", zone_a)},
+                            {makeTestHost(info_, "tcp://127.0.0.1:81", zone_b)}},
+                           true);
+  (*up_equal->get()[0][0]).loadMetricStats().add("cpu_utilization", 0.5);
+  (*up_equal->get()[1][0]).loadMetricStats().add("cpu_utilization", 0.5);
+
+  hostSet().hosts_ = *hosts;
+  hostSet().healthy_hosts_ = *hosts;
+  hostSet().healthy_hosts_per_locality_ = up_equal;
+
+  common_config_.mutable_healthy_panic_threshold()->set_value(50);
+  round_robin_lb_config_.mutable_locality_lb_config()
+      ->mutable_zone_aware_lb_config()
+      ->mutable_routing_enabled()
+      ->set_value(100);
+  round_robin_lb_config_.mutable_locality_lb_config()
+      ->mutable_zone_aware_lb_config()
+      ->mutable_min_cluster_size()
+      ->set_value(2);
+  round_robin_lb_config_.mutable_locality_lb_config()
+      ->mutable_zone_aware_lb_config()
+      ->set_locality_basis(EdfLoadBalancerBase::LocalityLbConfig::ZoneAwareLbConfig::ORCA_LOAD);
+  round_robin_lb_config_.mutable_locality_lb_config()
+      ->mutable_zone_aware_lb_config()
+      ->mutable_orca_load_config()
+      ->mutable_min_reporting_hosts_per_zone()
+      ->set_value(1);
+
+  init(true);
+  updateHosts(hosts, local_hpl);
+
+  EXPECT_CALL(runtime_.snapshot_, getInteger("upstream.healthy_panic_threshold", 50))
+      .WillRepeatedly(Return(50));
+  EXPECT_CALL(runtime_.snapshot_, featureEnabled("upstream.zone_routing.enabled", 100))
+      .WillRepeatedly(Return(true));
+  EXPECT_CALL(runtime_.snapshot_, getInteger("upstream.zone_routing.force_local_zone.min_size", 0))
+      .WillRepeatedly(Return(0));
+  EXPECT_CALL(runtime_.snapshot_, getInteger("upstream.zone_routing.min_cluster_size", 2))
+      .WillRepeatedly(Return(2));
+
+  // Equal capacity -> LocalityDirect: expect local zone (A)
+  {
+    auto pick = lb_->chooseHost(nullptr).host;
+    ASSERT_NE(nullptr, pick);
+    EXPECT_EQ(pick->locality().zone(), "A");
+  }
+
+  // Phase 2: skew capacity favoring B
+  HostsPerLocalitySharedPtr up_skew =
+      makeHostsPerLocality({{makeTestHost(info_, "tcp://127.0.0.1:80", zone_a)},
+                            {makeTestHost(info_, "tcp://127.0.0.1:81", zone_b)}},
+                           true);
+  (*up_skew->get()[0][0]).loadMetricStats().add("cpu_utilization", 0.8);
+  (*up_skew->get()[1][0]).loadMetricStats().add("cpu_utilization", 0.2);
+  hostSet().healthy_hosts_per_locality_ = up_skew;
+  updateHosts(hosts, local_hpl);
+
+  EXPECT_CALL(random_, random()).WillOnce(Return(9999)).WillOnce(Return(0)).WillOnce(Return(0));
+  {
+    auto pick = lb_->chooseHost(nullptr).host;
+    ASSERT_NE(nullptr, pick);
+    EXPECT_EQ(pick->locality().zone(), "B");
+  }
+
+  // Phase 3: back to equal
+  hostSet().healthy_hosts_per_locality_ = up_equal;
+  updateHosts(hosts, local_hpl);
+  {
+    auto pick = lb_->chooseHost(nullptr).host;
+    ASSERT_NE(nullptr, pick);
+    EXPECT_EQ(pick->locality().zone(), "A");
+  }
+}
+
 TEST_P(RoundRobinLoadBalancerTest, ZoneAwareResidualsMismatched) {
   if (&hostSet() == &failover_host_set_) { // P = 1 does not support zone-aware routing.
     return;

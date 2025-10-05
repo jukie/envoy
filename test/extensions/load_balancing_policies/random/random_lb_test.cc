@@ -16,7 +16,7 @@ class RandomLoadBalancerTest : public LoadBalancerTestBase {
 public:
   void init() {
     lb_ = std::make_shared<RandomLoadBalancer>(priority_set_, nullptr, stats_, runtime_, random_,
-                                               50, config_);
+                                               50, config_, simTime());
   }
 
   envoy::extensions::load_balancing_policies::random::v3::Random config_;

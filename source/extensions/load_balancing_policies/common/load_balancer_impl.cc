@@ -7,6 +7,7 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include <algorithm>
 
 #include "envoy/config/cluster/v3/cluster.pb.h"
 #include "envoy/config/core/v3/base.pb.h"
@@ -29,6 +30,15 @@ static const std::string RuntimeMinClusterSize = "upstream.zone_routing.min_clus
 static const std::string RuntimeForceLocalZoneMinSize =
     "upstream.zone_routing.force_local_zone.min_size";
 static const std::string RuntimePanicThreshold = "upstream.healthy_panic_threshold";
+// Constant probing regardless of unknown/known zones (use sparingly)
+static const std::string RuntimeOrcaProbeAlwaysEnabled =
+    "upstream.zone_routing.orca_probe_always.enabled";
+static const std::string RuntimeOrcaProbeAlwaysPercent =
+    "upstream.zone_routing.orca_probe_always.percent";
+
+// Constants for ORCA weight calculations
+constexpr uint64_t ORCA_WEIGHT_SCALE_FACTOR =
+    10000; // Scale factor for weight calculations (10000 = 100%)
 
 // Returns true if the weights of all the hosts in the HostVector are equal.
 bool hostWeightsAreEqual(const HostVector& hosts) {
@@ -388,7 +398,7 @@ uint64_t LoadBalancerBase::random(bool peeking) {
 ZoneAwareLoadBalancerBase::ZoneAwareLoadBalancerBase(
     const PrioritySet& priority_set, const PrioritySet* local_priority_set, ClusterLbStats& stats,
     Runtime::Loader& runtime, Random::RandomGenerator& random, uint32_t healthy_panic_threshold,
-    const absl::optional<LocalityLbConfig> locality_config)
+    const absl::optional<LocalityLbConfig> locality_config, TimeSource& time_source)
     : LoadBalancerBase(priority_set, stats, runtime, random, healthy_panic_threshold),
       local_priority_set_(local_priority_set),
       min_cluster_size_(locality_config.has_value()
@@ -424,7 +434,8 @@ ZoneAwareLoadBalancerBase::ZoneAwareLoadBalancerBase(
                                  ? locality_config->zone_aware_lb_config().fail_traffic_on_panic()
                                  : false),
       locality_weighted_balancing_(locality_config.has_value() &&
-                                   locality_config->has_locality_weighted_lb_config()) {
+                                   locality_config->has_locality_weighted_lb_config()),
+      time_source_(time_source) {
   ASSERT(!priority_set.hostSetsPerPriority().empty());
   resizePerPriorityState();
   if (locality_weighted_balancing_) {
@@ -433,8 +444,155 @@ ZoneAwareLoadBalancerBase::ZoneAwareLoadBalancerBase(
     }
   }
 
+  // Initialize ORCA-based zone routing configuration if enabled
+  if (locality_config.has_value() && locality_config->zone_aware_lb_config().locality_basis() ==
+                                         LocalityLbConfig::ZoneAwareLbConfig::ORCA_LOAD) {
+
+    const auto& orca_config = locality_config->zone_aware_lb_config().orca_load_config();
+
+    // Set ORCA utilization metrics configuration (3-tier hierarchy like CSWRR)
+    if (orca_config.has_utilization_metrics()) {
+      const auto& metrics_config = orca_config.utilization_metrics();
+      orca_utilization_metric_names_.assign(metrics_config.metric_names().begin(),
+                                            metrics_config.metric_names().end());
+      orca_use_application_utilization_ = metrics_config.use_application_utilization();
+      orca_use_cpu_utilization_ = metrics_config.use_cpu_utilization();
+    } else {
+      // Default: application_utilization first, then cpu_utilization fallback
+      orca_use_application_utilization_ = true;
+      orca_use_cpu_utilization_ = true;
+    }
+
+    // Pre-compute metric keys to avoid string allocations in hot path
+    orca_utilization_metric_keys_.clear();
+    orca_utilization_metric_keys_.reserve(orca_utilization_metric_names_.size());
+    for (const auto& metric_name : orca_utilization_metric_names_) {
+      orca_utilization_metric_keys_.push_back("named_metrics." + metric_name);
+    }
+
+    // Set error utilization penalty (aligns with CSWRR)
+    orca_error_utilization_penalty_ =
+        PROTOBUF_GET_WRAPPED_OR_DEFAULT(orca_config, error_utilization_penalty, 1.0);
+    min_orca_reporting_hosts_ =
+        PROTOBUF_GET_WRAPPED_OR_DEFAULT(orca_config, min_reporting_hosts_per_zone, 3U);
+
+    // Fallback basis defaults to HEALTHY_HOSTS_NUM if not explicitly set or if set to default (0)
+    orca_fallback_basis_ =
+        orca_config.fallback_basis() != LocalityLbConfig::ZoneAwareLbConfig::HEALTHY_HOSTS_NUM
+            ? orca_config.fallback_basis()
+            : LocalityLbConfig::ZoneAwareLbConfig::HEALTHY_HOSTS_NUM;
+
+    // Parse locality direct threshold (default 5%)
+    locality_direct_threshold_pct_ = PROTOBUF_PERCENT_TO_ROUNDED_INTEGER_OR_DEFAULT(
+        orca_config, locality_direct_threshold, 100, 5);
+
+    // Parse EMA smoothing factor (default 0.2)
+    zone_metrics_smoothing_factor_ =
+        PROTOBUF_GET_WRAPPED_OR_DEFAULT(orca_config, zone_metrics_smoothing_factor, 0.2);
+
+    // Validate smoothing factor
+    if (zone_metrics_smoothing_factor_ < 0.0 || zone_metrics_smoothing_factor_ > 1.0) {
+      ENVOY_LOG(warn, "Invalid zone_metrics_smoothing_factor {:.2f}, clamping to [0.0, 1.0]",
+                zone_metrics_smoothing_factor_);
+      zone_metrics_smoothing_factor_ = std::clamp(zone_metrics_smoothing_factor_, 0.0, 1.0);
+    }
+
+    // Parse weight update period (aligns with CSWRR, default 1s, min 100ms)
+    if (orca_config.has_weight_update_period()) {
+      auto duration_ms = DurationUtil::durationToMilliseconds(orca_config.weight_update_period());
+      zone_metrics_update_interval_ =
+          std::chrono::milliseconds(std::max(static_cast<uint64_t>(100), duration_ms));
+    }
+
+    // Parse blackout period (aligns with CSWRR, default 10s)
+    if (orca_config.has_blackout_period()) {
+      auto duration_ms = DurationUtil::durationToMilliseconds(orca_config.blackout_period());
+      zone_routing_blackout_period_ = std::chrono::milliseconds(duration_ms);
+    }
+
+    // Parse OOB reporting configuration
+    oob_enabled_ = PROTOBUF_GET_WRAPPED_OR_DEFAULT(orca_config, enable_oob_load_report, false);
+
+    if (oob_enabled_) {
+      ENVOY_LOG(info, "ORCA out-of-band reporting enabled for zone-aware routing");
+
+      // Parse OOB reporting period (default 10s, same as CSWRR)
+      if (orca_config.has_oob_reporting_period()) {
+        auto duration_ms = DurationUtil::durationToMilliseconds(orca_config.oob_reporting_period());
+        oob_reporting_period_ = std::chrono::milliseconds(duration_ms);
+      }
+
+      // Parse OOB expiration period (default 3min, same as CSWRR)
+      if (orca_config.has_oob_expiration_period()) {
+        auto duration_ms = DurationUtil::durationToMilliseconds(orca_config.oob_expiration_period());
+        oob_expiration_period_ = std::chrono::milliseconds(duration_ms);
+      }
+
+      ENVOY_LOG(info, "OOB configuration - reporting_period: {}ms, expiration_period: {}ms",
+                oob_reporting_period_.count(), oob_expiration_period_.count());
+
+      // Initialize OOB expiration timer
+      // Note: Timer creation requires dispatcher access, which will be available
+      // in the load balancer factory. We'll start the timer from there.
+    }
+
+    // Parse OOB-first mode configuration
+    oob_first_enabled_ = PROTOBUF_GET_WRAPPED_OR_DEFAULT(orca_config, enable_oob_first_mode, false);
+
+    if (oob_first_enabled_) {
+      ENVOY_LOG(info, "ORCA OOB-first mode enabled for zone-aware routing");
+
+      // Parse fallback strategy
+      oob_fallback_strategy_ = orca_config.oob_fallback_strategy();
+      ENVOY_LOG(info, "OOB-first fallback strategy: {}",
+                LocalityLbConfig::ZoneAwareLbConfig::OrcaLoadBasedConfig::OobFallbackStrategy_Name(oob_fallback_strategy_));
+
+      // Parse probe triggers
+      if (orca_config.has_probe_triggers()) {
+        oob_probe_triggers_ = orca_config.probe_triggers();
+
+        ENVOY_LOG(info, "OOB-first probe triggers configured - oob_missing_threshold: {}ms, load_variance_threshold: {:.1f}%, max_probes_per_minute: {}",
+                  DurationUtil::durationToMilliseconds(oob_probe_triggers_.oob_missing_threshold()),
+                  oob_probe_triggers_.load_variance_threshold().value() * 100,
+                  oob_probe_triggers_.max_probes_per_minute().value());
+      }
+
+      // Parse zone aggregation configuration
+      if (orca_config.has_zone_aggregation()) {
+        oob_zone_aggregation_config_ = orca_config.zone_aggregation();
+
+        ENVOY_LOG(info, "OOB-first zone aggregation - enabled: {}, min_hosts_per_zone: {}, method: {}",
+                  oob_zone_aggregation_config_.enable_zone_aggregation(),
+                  oob_zone_aggregation_config_.min_hosts_per_zone().value(),
+                  LocalityLbConfig::ZoneAwareLbConfig::OrcaLoadBasedConfig::ZoneAggregationConfig::AggregationMethod_Name(
+                    oob_zone_aggregation_config_.aggregation_method()));
+      }
+    }
+
+    // Initialize zone metrics update timer
+    // Note: We need access to the dispatcher to create the timer. This will be set up
+    // in the load balancer factory that constructs this instance.
+    zone_metrics_last_refresh_ = time_source_.monotonicTime();
+
+    // Attach OrcaHostLbPolicyData to all existing hosts so we can receive ORCA callbacks
+    for (const HostSetPtr& host_set : priority_set_.hostSetsPerPriority()) {
+      for (const auto& host : host_set->hosts()) {
+        if (!host->lbPolicyData().has_value()) {
+          host->setLbPolicyData(std::make_unique<OrcaHostLbPolicyData>());
+        }
+      }
+    }
+
+    // Runtime-controlled always-probe (defaults: disabled)
+    orca_probe_always_enabled_ =
+        runtime_.snapshot().getInteger(RuntimeOrcaProbeAlwaysEnabled, 1) != 0;
+    const uint64_t always_pct = runtime_.snapshot().getInteger(RuntimeOrcaProbeAlwaysPercent, 1);
+    orca_probe_always_permyriad_ =
+        static_cast<uint32_t>(std::min<uint64_t>(10000, always_pct * 100));
+  }
+
   priority_update_cb_ = priority_set_.addPriorityUpdateCb(
-      [this](uint32_t priority, const HostVector&, const HostVector&) -> absl::Status {
+      [this](uint32_t priority, const HostVector& hosts_added, const HostVector&) -> absl::Status {
         // Make sure per_priority_state_ is as large as priority_set_.hostSetsPerPriority()
         resizePerPriorityState();
         // If P=0 changes, regenerate locality routing structures. Locality based routing is
@@ -446,6 +604,19 @@ ZoneAwareLoadBalancerBase::ZoneAwareLoadBalancerBase(
         if (locality_weighted_balancing_) {
           rebuildLocalityWrrForPriority(priority);
         }
+
+        // Revisit this
+        // Invalidate ORCA zone metrics cache when hosts change
+        if (locality_basis_ == LocalityLbConfig::ZoneAwareLbConfig::ORCA_LOAD) {
+          cached_zone_metrics_.clear();
+          // Ensure newly added hosts can receive ORCA callbacks.
+          for (const auto& host : hosts_added) {
+            if (!host->lbPolicyData().has_value()) {
+              host->setLbPolicyData(std::make_unique<OrcaHostLbPolicyData>());
+            }
+          }
+        }
+
         return absl::OkStatus();
       });
   if (local_priority_set_) {
@@ -506,16 +677,47 @@ void ZoneAwareLoadBalancerBase::regenerateLocalityRoutingStructures() {
       calculateLocalityPercentages(localHostsPerLocality, upstreamHostsPerLocality);
 
   if (upstreamHostsPerLocality.hasLocalLocality()) {
+    // Calculate threshold in the same scale as percentages (10000 = 100%)
+    // locality_direct_threshold_pct_ is in range 0-100, so multiply by 100 to get 10000 scale
+    // Only apply threshold when using ORCA_LOAD to avoid changing existing behavior
+    const uint64_t threshold = (locality_basis_ == LocalityLbConfig::ZoneAwareLbConfig::ORCA_LOAD)
+                                   ? locality_direct_threshold_pct_ * 100
+                                   : 0;
+
     // If we have lower percent of hosts in the local cluster in the same locality,
     // we can push all of the requests directly to upstream cluster in the same locality.
-    if ((locality_percentages[0].upstream_percentage > 0 &&
-         locality_percentages[0].upstream_percentage >= locality_percentages[0].local_percentage) ||
+    // With ORCA_LOAD, we add a threshold to prevent small metric differences from causing
+    // unnecessary cross-zone routing.
+    const bool within_threshold =
+        locality_percentages[0].upstream_percentage > 0 &&
+        (locality_percentages[0].upstream_percentage >= locality_percentages[0].local_percentage ||
+         (locality_percentages[0].local_percentage > locality_percentages[0].upstream_percentage &&
+          locality_percentages[0].local_percentage - locality_percentages[0].upstream_percentage <=
+              threshold));
+
+    // Calculate difference safely (avoid underflow with unsigned types)
+    const int64_t diff = static_cast<int64_t>(locality_percentages[0].local_percentage) -
+                         static_cast<int64_t>(locality_percentages[0].upstream_percentage);
+
+    ENVOY_LOG(debug,
+              "Locality routing decision for local zone: local_pct={:.1f}%, upstream_pct={:.1f}%, "
+              "diff={:.1f}%, threshold={:.1f}%, within_threshold={}",
+              locality_percentages[0].local_percentage / 100.0,
+              locality_percentages[0].upstream_percentage / 100.0, diff / 100.0, threshold / 100.0,
+              within_threshold);
+
+    if (within_threshold ||
         // When force_local_zone is enabled, always use LocalityDirect routing if there are enough
         // healthy upstreams in the local locality as determined by force_local_zone_min_size is
         // met.
         (force_local_zone_min_size_.has_value() &&
          upstreamHostsPerLocality.get()[0].size() >= *force_local_zone_min_size_)) {
       state.locality_routing_state_ = LocalityRoutingState::LocalityDirect;
+
+      ENVOY_LOG(debug, "Using LocalityDirect routing: local={}%, upstream={}%, threshold={}%",
+                locality_percentages[0].local_percentage / 100.0,
+                locality_percentages[0].upstream_percentage / 100.0,
+                locality_direct_threshold_pct_);
       return;
     }
   }
@@ -657,12 +859,28 @@ absl::FixedArray<ZoneAwareLoadBalancerBase::LocalityPercentages>
 ZoneAwareLoadBalancerBase::calculateLocalityPercentages(
     const HostsPerLocality& local_hosts_per_locality,
     const HostsPerLocality& upstream_hosts_per_locality) {
+
+  ENVOY_LOG(debug,
+            "calculateLocalityPercentages: local localities={}, upstream localities={}, "
+            "basis={}, hasLocalLocality={}",
+            local_hosts_per_locality.get().size(), upstream_hosts_per_locality.get().size(),
+            static_cast<int>(locality_basis_), local_hosts_per_locality.hasLocalLocality());
+
+  // For ORCA_LOAD mode, we use a different approach:
+  // Calculate utilization for all upstream localities, then use inverse of utilization as weight.
+  // This makes routing decisions purely based on upstream utilization to equalize load.
+  if (locality_basis_ == LocalityLbConfig::ZoneAwareLbConfig::ORCA_LOAD) {
+    return calculateLocalityPercentagesOrcaLoad(local_hosts_per_locality,
+                                                upstream_hosts_per_locality);
+  }
+
   absl::flat_hash_map<envoy::config::core::v3::Locality, uint64_t, LocalityHash, LocalityEqualTo>
       local_weights;
   absl::flat_hash_map<envoy::config::core::v3::Locality, uint64_t, LocalityHash, LocalityEqualTo>
       upstream_weights;
   uint64_t total_local_weight = 0;
   for (const auto& locality_hosts : local_hosts_per_locality.get()) {
+    ENVOY_LOG(trace, "Processing local locality with {} hosts", locality_hosts.size());
     uint64_t locality_weight = 0;
     switch (locality_basis_) {
     // If locality_basis_ is set to HEALTHY_HOSTS_WEIGHT, it uses the host's weight to calculate the
@@ -682,9 +900,18 @@ ZoneAwareLoadBalancerBase::calculateLocalityPercentages(
     total_local_weight += locality_weight;
     // If there is no entry in the map for a given locality, it is assumed to have 0 hosts.
     if (!locality_hosts.empty()) {
-      local_weights.emplace(locality_hosts[0]->locality(), locality_weight);
+      const auto& locality = locality_hosts[0]->locality();
+      local_weights.emplace(locality, locality_weight);
+      ENVOY_LOG(debug,
+                "Local locality: region='{}', zone='{}', sub_zone='{}', "
+                "hosts={}, weight={}",
+                locality.region(), locality.zone(), locality.sub_zone(), locality_hosts.size(),
+                locality_weight);
     }
   }
+
+  ENVOY_LOG(debug, "Total local weight: {}, local localities processed: {}", total_local_weight,
+            local_weights.size());
   uint64_t total_upstream_weight = 0;
   for (const auto& locality_hosts : upstream_hosts_per_locality.get()) {
     uint64_t locality_weight = 0;
@@ -735,13 +962,241 @@ ZoneAwareLoadBalancerBase::calculateLocalityPercentages(
     const uint64_t upstream_percentage =
         total_upstream_weight > 0 ? 10000ULL * upstream_weight / total_upstream_weight : 0;
 
+    ENVOY_LOG(
+        debug,
+        "Locality {}/{}/{}: local_weight={}, upstream_weight={}, "
+        "local_pct={:.1f}%, upstream_pct={:.1f}%, found_in_local_map={}, found_in_upstream_map={}",
+        locality.region(), locality.zone(), locality.sub_zone(), local_weight, upstream_weight,
+        local_percentage / 100.0, upstream_percentage / 100.0,
+        local_weight_it != local_weights.end(), upstream_weight_it != upstream_weights.end());
+
     percentages[i] = LocalityPercentages{local_percentage, upstream_percentage};
   }
 
   return percentages;
 }
 
+// Helper function implementations for calculateLocalityPercentagesOrcaLoad
+
+std::vector<ZoneAwareLoadBalancerBase::LocalityUtilizationInfo>
+ZoneAwareLoadBalancerBase::collectLocalityUtilizationInfo(
+    const HostsPerLocality& upstream_hosts_per_locality,
+    const envoy::config::core::v3::Locality* local_locality_ptr, double& local_utilization,
+    double& min_other_utilization, bool& found_local) {
+
+  std::vector<LocalityUtilizationInfo> locality_utils;
+  min_other_utilization = 1.0; // Min utilization among NON-local zones
+  local_utilization = 0.0;
+  found_local = false;
+
+  for (const auto& locality_hosts : upstream_hosts_per_locality.get()) {
+    if (locality_hosts.empty()) {
+      continue;
+    }
+
+    const auto& locality = locality_hosts[0]->locality();
+    const bool is_local = local_locality_ptr != nullptr &&
+                          locality.region() == local_locality_ptr->region() &&
+                          locality.zone() == local_locality_ptr->zone() &&
+                          locality.sub_zone() == local_locality_ptr->sub_zone();
+
+    // Get ORCA metrics for this locality
+    const auto metrics = calculateZoneMetricsFromHosts(locality_hosts, locality);
+
+    double utilization = 0.0;
+    bool is_valid = false;
+
+    if (metrics.is_valid && metrics.avg_utilization >= 0.0 && metrics.avg_utilization <= 1.0) {
+      utilization = metrics.avg_utilization;
+      is_valid = true;
+
+      if (is_local) {
+        local_utilization = utilization;
+        found_local = true;
+      } else {
+        // Track minimum utilization among other (non-local) zones
+        min_other_utilization = std::min(min_other_utilization, utilization);
+      }
+
+      ENVOY_LOG(debug,
+                "Locality {}/{}/{}: utilization={:.1f}%, capacity={:.1f}%, hosts={}, is_local={}, "
+                "valid={}",
+                locality.region(), locality.zone(), locality.sub_zone(), utilization * 100.0,
+                (1.0 - utilization) * 100.0, locality_hosts.size(), is_local, is_valid);
+    } else {
+      // Fallback: use host count as proxy
+      is_valid = false;
+      ENVOY_LOG(debug, "Locality {}/{}/{}: ORCA data unavailable, using fallback (hosts={})",
+                locality.region(), locality.zone(), locality.sub_zone(), locality_hosts.size());
+    }
+
+    locality_utils.push_back(
+        {utilization, 1.0 - utilization, locality_hosts.size(), is_local, is_valid, &locality});
+  }
+
+  return locality_utils;
+}
+
+void ZoneAwareLoadBalancerBase::calculateInverseUtilizationWeights(
+    const std::vector<LocalityUtilizationInfo>& locality_utils, double& total_routing_weight,
+    size_t& valid_localities) {
+
+  total_routing_weight = 0.0;
+  valid_localities = 0;
+
+  for (const auto& info : locality_utils) {
+    if (info.is_valid) {
+      // Weight = inverse utilization only (host count irrelevant for ORCA equal distribution)
+      total_routing_weight += (1.0 - info.utilization);
+      ++valid_localities;
+    }
+  }
+}
+
+absl::FixedArray<ZoneAwareLoadBalancerBase::LocalityPercentages>
+ZoneAwareLoadBalancerBase::generateLocalityPercentages(
+    const std::vector<LocalityUtilizationInfo>& locality_utils,
+    const HostsPerLocality& upstream_hosts_per_locality, double total_routing_weight,
+    size_t valid_localities, double local_utilization, double min_other_utilization,
+    bool found_local) {
+
+  // Calculate the utilization differential for the local zone
+  const double threshold_fraction =
+      locality_direct_threshold_pct_ / 100.0; // Convert to 0.0-1.0 scale
+  const double utilization_diff = found_local ? (local_utilization - min_other_utilization) : 0.0;
+
+  ENVOY_LOG(debug,
+            "ORCA differential routing: local_utilization={:.1f}%, min_other_utilization={:.1f}%, "
+            "diff={:.1f}%, threshold={:.1f}%",
+            local_utilization * 100.0, min_other_utilization * 100.0, utilization_diff * 100.0,
+            threshold_fraction * 100.0);
+
+  // Convert to percentages (scale of 10000 = 100%)
+  absl::FixedArray<LocalityPercentages> percentages(upstream_hosts_per_locality.get().size());
+
+  for (size_t i = 0; i < upstream_hosts_per_locality.get().size(); ++i) {
+    const auto& upstream_hosts = upstream_hosts_per_locality.get()[i];
+
+    if (upstream_hosts.empty() || i >= locality_utils.size()) {
+      percentages[i] = LocalityPercentages{0, 0};
+      continue;
+    }
+
+    const auto& info = locality_utils[i];
+
+    if (!info.is_valid) {
+      // Skip invalid localities - they get no traffic
+      percentages[i] = LocalityPercentages{0, 0};
+      continue;
+    }
+
+    uint64_t upstream_percentage;
+    if (total_routing_weight > 0.0) {
+      // Calculate upstream percentage based on inverse utilization for equal distribution
+      const double routing_weight = 1.0 - info.utilization;
+      upstream_percentage =
+          static_cast<uint64_t>((routing_weight / total_routing_weight) * ORCA_WEIGHT_SCALE_FACTOR);
+    } else {
+      // Edge case: all valid localities have 100% utilization, fallback to equal distribution
+      upstream_percentage = static_cast<uint64_t>(ORCA_WEIGHT_SCALE_FACTOR / valid_localities);
+    }
+
+    // For ORCA mode, we use a different encoding than traditional zone-aware routing.
+    // In traditional mode: local_pct represents "where Envoys are", upstream_pct represents "where
+    // capacity is" In ORCA mode: we want upstream_pct to directly control traffic distribution
+    //
+    // Key insight: For a single Envoy instance, ALL traffic (100%) originates from its local zone.
+    // So we set local_percentage to represent "what fraction of THIS Envoy's traffic is destined
+    // for this zone"
+    //
+    // For the local zone: local_pct = 100% (10000) because all traffic originates here
+    // For other zones: local_pct = 0 because traffic doesn't originate there
+    //
+    // Then the routing logic at line 646-650 calculates:
+    //   local_percent_to_route = upstream_pct / local_pct = upstream_pct / 10000
+    // which gives us the desired percentage to route locally.
+    //
+    // And residual_capacity = upstream_pct - local_pct for cross-zone routing.
+    uint64_t local_percentage = 0;
+    if (info.is_local) {
+      // All traffic originates from the local zone
+      local_percentage = 10000;
+
+      // For threshold check: if within threshold, set local_pct = upstream_pct to trigger
+      // LocalityDirect
+      if (utilization_diff <= threshold_fraction) {
+        local_percentage = upstream_percentage;
+      }
+    }
+
+    ENVOY_LOG(debug, "Locality {}/{}/{}: final upstream_pct={:.1f}%, local_pct={:.1f}%",
+              info.locality->region(), info.locality->zone(), info.locality->sub_zone(),
+              upstream_percentage / 100.0, local_percentage / 100.0);
+
+    percentages[i] = LocalityPercentages{local_percentage, upstream_percentage};
+  }
+
+  return percentages;
+}
+
+absl::FixedArray<ZoneAwareLoadBalancerBase::LocalityPercentages>
+ZoneAwareLoadBalancerBase::calculateLocalityPercentagesOrcaLoad(
+    const HostsPerLocality& local_hosts_per_locality,
+    const HostsPerLocality& upstream_hosts_per_locality) {
+
+  ENVOY_LOG(debug, "calculateLocalityPercentagesOrcaLoad: using differential routing approach");
+
+  // Step 1: Determine local locality pointer
+  const envoy::config::core::v3::Locality* local_locality_ptr = nullptr;
+  bool has_local = local_hosts_per_locality.hasLocalLocality();
+  if (has_local && !local_hosts_per_locality.get().empty() &&
+      !local_hosts_per_locality.get()[0].empty()) {
+    local_locality_ptr = &local_hosts_per_locality.get()[0][0]->locality();
+  }
+
+  // Step 2: Collect ORCA utilization information for all localities
+  double local_utilization = 0.0, min_other_utilization = 1.0;
+  bool found_local = false;
+  auto locality_utils =
+      collectLocalityUtilizationInfo(upstream_hosts_per_locality, local_locality_ptr,
+                                     local_utilization, min_other_utilization, found_local);
+
+  // Step 3: Check if we have valid ORCA data, fall back to host count if not
+  bool has_any_valid_orca = std::any_of(locality_utils.begin(), locality_utils.end(),
+                                        [](const auto& info) { return info.is_valid; });
+
+  if (!has_any_valid_orca) {
+    ENVOY_LOG(debug, "No valid ORCA data available, falling back to host count routing");
+    // Return empty percentages - the caller will handle fallback
+    absl::FixedArray<LocalityPercentages> percentages(upstream_hosts_per_locality.get().size());
+    for (size_t i = 0; i < percentages.size(); ++i) {
+      percentages[i] = LocalityPercentages{0, 0};
+    }
+    return percentages;
+  }
+
+  // Step 4: Calculate routing weights based on inverse utilization for equal distribution
+  double total_routing_weight = 0.0;
+  size_t valid_localities = 0;
+  calculateInverseUtilizationWeights(locality_utils, total_routing_weight, valid_localities);
+
+  // Step 5: Generate final locality percentages with ORCA routing logic
+  return generateLocalityPercentages(locality_utils, upstream_hosts_per_locality,
+                                     total_routing_weight, valid_localities, local_utilization,
+                                     min_other_utilization, found_local);
+}
+
 uint32_t ZoneAwareLoadBalancerBase::tryChooseLocalLocalityHosts(const HostSet& host_set) const {
+  // For ORCA-based zoning, ensure locality percentages are refreshed when zone metrics are stale.
+  if (locality_basis_ == LocalityLbConfig::ZoneAwareLbConfig::ORCA_LOAD) {
+    const auto now = time_source_.monotonicTime();
+    if (now - zone_metrics_last_refresh_ >= zone_metrics_update_interval_) {
+      // const_cast is safe here: we are updating internal caches and routing structures.
+      const_cast<ZoneAwareLoadBalancerBase*>(this)->updateZoneMetricsOnMainThread();
+      const_cast<ZoneAwareLoadBalancerBase*>(this)->regenerateLocalityRoutingStructures();
+    }
+  }
+
   PerPriorityState& state = *per_priority_state_[host_set.priority()];
   ASSERT(state.locality_routing_state_ != LocalityRoutingState::NoLocalityRouting);
 
@@ -752,6 +1207,22 @@ uint32_t ZoneAwareLoadBalancerBase::tryChooseLocalLocalityHosts(const HostSet& h
   // Try to push all of the requests to the same locality if possible.
   if (state.locality_routing_state_ == LocalityRoutingState::LocalityDirect) {
     ASSERT(host_set.healthyHostsPerLocality().hasLocalLocality());
+    // Optional: always-probe a small fraction cross-zone even when zones are known.
+    // Optional: always-probe a small fraction cross-zone even when zones are known.
+    if (locality_basis_ == LocalityLbConfig::ZoneAwareLbConfig::ORCA_LOAD &&
+        orca_probe_always_enabled_ && orca_probe_always_permyriad_ > 0) {
+      const auto& hpl = host_set.healthyHostsPerLocality().get();
+      std::vector<uint32_t> remote;
+      for (uint32_t i = 1; i < hpl.size(); ++i) { // skip local (index 0)
+        if (!hpl[i].empty()) {
+          remote.push_back(i);
+        }
+      }
+      if (!remote.empty() && (random_.random() % 10000) < orca_probe_always_permyriad_) {
+        stats_.lb_zone_routing_cross_zone_.inc();
+        return remote[random_.random() % remote.size()];
+      }
+    }
     stats_.lb_zone_routing_all_directly_.inc();
     return 0;
   }
@@ -914,7 +1385,7 @@ EdfLoadBalancerBase::EdfLoadBalancerBase(
     const absl::optional<LocalityLbConfig> locality_config,
     const absl::optional<SlowStartConfig> slow_start_config, TimeSource& time_source)
     : ZoneAwareLoadBalancerBase(priority_set, local_priority_set, stats, runtime, random,
-                                healthy_panic_threshold, locality_config),
+                                healthy_panic_threshold, locality_config, time_source),
       seed_(random_.random()),
       slow_start_window_(slow_start_config.has_value()
                              ? std::chrono::milliseconds(DurationUtil::durationToMilliseconds(
@@ -1148,6 +1619,769 @@ double EdfLoadBalancerBase::applySlowStartFactor(double host_weight, const Host&
     }
   } else {
     return host_weight;
+  }
+}
+
+// ORCA-based zone routing implementation
+
+uint64_t ZoneAwareLoadBalancerBase::calculateFallbackLocalityWeight(
+    const HostVector& locality_hosts, const envoy::config::core::v3::Locality& locality) const {
+
+  // Use the configured fallback basis to calculate weight
+  uint64_t weight = 0;
+
+  switch (orca_fallback_basis_) {
+  case LocalityLbConfig::ZoneAwareLbConfig::HEALTHY_HOSTS_WEIGHT:
+    // Sum of host weights
+    for (const auto& host : locality_hosts) {
+      weight += host->weight();
+    }
+    break;
+
+  case LocalityLbConfig::ZoneAwareLbConfig::HEALTHY_HOSTS_NUM:
+  default:
+    // Number of hosts
+    weight = locality_hosts.size();
+    break;
+  }
+
+  ENVOY_LOG(trace, "Fallback locality weight for {}/{}/{}: {} (basis={})", locality.region(),
+            locality.zone(), locality.sub_zone(), weight, static_cast<int>(orca_fallback_basis_));
+
+  return weight;
+}
+
+absl::optional<double> ZoneAwareLoadBalancerBase::getUtilizationFromHost(const Host& host) const {
+
+  // When OOB is enabled, prefer OOB data over per-request metrics
+  if (oob_enabled_) {
+    if (auto typed = host.typedLbPolicyData<OrcaHostLbPolicyData>()) {
+      if (typed->oob_reporting_active.load(std::memory_order_relaxed)) {
+        // This host has active OOB reporting, use the cached values
+        // Apply same 3-tier hierarchy: application -> custom -> cpu
+
+        // Tier 1: application_utilization (primary metric)
+        if (orca_use_application_utilization_) {
+          if (auto app_util = typed->app()) {
+            ENVOY_LOG(debug, "ORCA host={} using OOB application_utilization={:.2f}%",
+                      host.address()->asString(), app_util.value() * 100);
+            return app_util;
+          }
+        }
+
+        // Tier 2: Custom metrics (not implemented in OOB yet)
+        // TODO: Implement custom metrics access for OOB data
+
+        // Tier 3: cpu_utilization (fallback)
+        if (orca_use_cpu_utilization_) {
+          if (auto cpu_util = typed->cpu()) {
+            ENVOY_LOG(debug, "ORCA host={} using OOB cpu_utilization={:.2f}%",
+                      host.address()->asString(), cpu_util.value() * 100);
+            return cpu_util;
+          }
+        }
+      }
+    }
+  }
+
+  // Fallback: Access ORCA metrics from LoadMetricStats (pull-based per-request)
+  // ORCA metrics are added to LoadMetricStats by the router when parsing ORCA headers
+  const auto& load_metric_stats = host.loadMetricStats();
+
+  absl::optional<double> utilization;
+
+  // Implement 3-tier utilization hierarchy like CSWRR
+  // Tier 1: application_utilization (primary metric)
+  if (orca_use_application_utilization_) {
+    // Try pull-based first, then fallback to push-based
+    utilization = load_metric_stats.get("application_utilization");
+    if (!utilization.has_value()) {
+      if (auto typed = host.typedLbPolicyData<OrcaHostLbPolicyData>()) {
+        utilization = typed->app();
+      }
+    }
+
+    if (utilization.has_value() && utilization.value() > 0.0) {
+      ENVOY_LOG(debug, "ORCA host={} using pull-based application_utilization={:.2f}%",
+                host.address()->asString(), utilization.value() * 100);
+      return utilization;
+    }
+  }
+
+  // Tier 2: Custom metrics (check in priority order, use most constrained)
+  double max_custom_utilization = 0.0;
+  bool found_custom_metric = false;
+
+  for (size_t i = 0; i < orca_utilization_metric_names_.size(); ++i) {
+    absl::optional<double> custom_utilization;
+
+    // Try pull-based first, then fallback to push-based
+    custom_utilization = load_metric_stats.get(orca_utilization_metric_keys_[i]);
+    if (!custom_utilization.has_value()) {
+      if (auto typed = host.typedLbPolicyData<OrcaHostLbPolicyData>()) {
+        // For custom metrics, we'd need to implement access in OrcaHostLbPolicyData
+        // For now, just use pull-based metrics
+        custom_utilization = absl::nullopt;
+      }
+    }
+
+    if (custom_utilization.has_value() && custom_utilization.value() > 0.0) {
+      max_custom_utilization = std::max(max_custom_utilization, custom_utilization.value());
+      found_custom_metric = true;
+    }
+  }
+
+  if (found_custom_metric) {
+    ENVOY_LOG(debug, "ORCA host={} using pull-based max_custom_utilization={:.2f}%",
+              host.address()->asString(), max_custom_utilization * 100);
+    return max_custom_utilization;
+  }
+
+  // Tier 3: cpu_utilization (fallback)
+  if (orca_use_cpu_utilization_) {
+    // Try pull-based first, then fallback to push-based
+    utilization = load_metric_stats.get("cpu_utilization");
+    if (!utilization.has_value()) {
+      if (auto typed = host.typedLbPolicyData<OrcaHostLbPolicyData>()) {
+        utilization = typed->cpu();
+      }
+    }
+
+    if (utilization.has_value() && utilization.value() > 0.0) {
+      ENVOY_LOG(debug, "ORCA host={} using pull-based cpu_utilization={:.2f}%", host.address()->asString(),
+                utilization.value() * 100);
+      return utilization;
+    }
+  }
+
+  // No valid utilization found
+  ENVOY_LOG(debug, "ORCA host={} no valid utilization metrics found (OOB enabled: {})",
+            host.address()->asString(), oob_enabled_ ? "true" : "false");
+  return absl::nullopt;
+}
+
+ZoneAwareLoadBalancerBase::CachedZoneMetrics
+ZoneAwareLoadBalancerBase::calculateZoneMetricsFromHosts(
+    const HostVector& hosts, const envoy::config::core::v3::Locality& locality) {
+
+  CachedZoneMetrics result;
+  double total_utilization = 0.0;
+  double total_cpu = 0.0;
+  uint32_t reporting_hosts = 0;
+  uint32_t oob_hosts = 0;
+  uint32_t pull_hosts = 0;
+
+  // Aggregate utilization across all reporting hosts
+  for (const auto& host : hosts) {
+    if (auto util = getUtilizationFromHost(*host)) {
+      double host_utilization = util.value();
+
+      // Track whether we're using OOB or pull-based data for this host
+      if (oob_enabled_) {
+        if (auto typed = host->typedLbPolicyData<OrcaHostLbPolicyData>()) {
+          if (typed->oob_reporting_active.load(std::memory_order_relaxed)) {
+            oob_hosts++;
+          } else {
+            pull_hosts++;
+          }
+        }
+      } else {
+        pull_hosts++;
+      }
+
+      // Apply error penalty if error rate data is available (aligns with CSWRR approach)
+      // Formula: effective_utilization = base_utilization + (error_rate *
+      // error_utilization_penalty)
+      const auto& load_metric_stats = host->loadMetricStats();
+      if (auto error_rate = load_metric_stats.get("eps")) {
+        if (auto qps = load_metric_stats.get("rps")) {
+          if (qps.value() > 0.0) {
+            double error_fraction = error_rate.value() / qps.value();
+            host_utilization += orca_error_utilization_penalty_ * error_fraction;
+            ENVOY_LOG(trace,
+                      "ORCA host={} applied error penalty: base={:.2f}%, error_rate={:.3f}, "
+                      "penalty={:.2f}%, final={:.2f}%",
+                      host->address()->asString(), util.value() * 100, error_fraction,
+                      orca_error_utilization_penalty_ * error_fraction * 100,
+                      host_utilization * 100);
+          }
+        }
+      }
+
+      total_utilization += host_utilization;
+      // For now, assume CPU = utilization (will refine when we implement getUtilizationFromHost)
+      total_cpu += host_utilization;
+      reporting_hosts++;
+    }
+  }
+
+  // Check if we have enough reporting hosts
+  if (reporting_hosts < min_orca_reporting_hosts_) {
+    result.is_valid = false;
+    ENVOY_LOG(debug, "Insufficient ORCA data for locality {}/{}/{}: {} hosts reporting (need {})",
+              locality.region(), locality.zone(), locality.sub_zone(), reporting_hosts,
+              min_orca_reporting_hosts_);
+    return result;
+  }
+
+  // Calculate current average utilization from measurements
+  double current_avg_utilization = total_utilization / reporting_hosts;
+  double current_avg_cpu = total_cpu / reporting_hosts;
+
+  // Apply Exponential Moving Average (EMA) smoothing if we have previous data
+  // This dampens rapid fluctuations while still responding to real changes
+  auto cached_it = cached_zone_metrics_.find(locality);
+  if (cached_it != cached_zone_metrics_.end() && cached_it->second.is_valid &&
+      zone_metrics_smoothing_factor_ < 1.0) {
+
+    const double alpha = zone_metrics_smoothing_factor_;
+    const double& prev_util = cached_it->second.avg_utilization;
+    const double& prev_cpu = cached_it->second.avg_cpu;
+
+    // EMA formula: new_avg = alpha × current + (1 - alpha) × previous
+    result.avg_utilization = alpha * current_avg_utilization + (1 - alpha) * prev_util;
+    result.avg_cpu = alpha * current_avg_cpu + (1 - alpha) * prev_cpu;
+
+    ENVOY_LOG(trace,
+              "Applied EMA smoothing for {}/{}/{}: raw={:.2f}%, smoothed={:.2f}%, alpha={:.2f}",
+              locality.region(), locality.zone(), locality.sub_zone(),
+              current_avg_utilization * 100, result.avg_utilization * 100, alpha);
+  } else {
+    // First measurement or smoothing disabled (alpha = 1.0), use raw values
+    result.avg_utilization = current_avg_utilization;
+    result.avg_cpu = current_avg_cpu;
+  }
+
+  result.reporting_hosts = reporting_hosts;
+
+  // Calculate weight: capacity × host count
+  // Higher available capacity = higher weight = route more traffic here
+  // Capacity = 1.0 - utilization (e.g., 30% util = 70% capacity)
+  double capacity_per_host = std::max(0.0, 1.0 - result.avg_utilization);
+
+  // Scale by total hosts (not just reporting hosts)
+  // This way zones with more hosts get proportionally more weight
+  // Multiply by 10000 to match the scale used in calculateLocalityPercentages
+  result.locality_weight = static_cast<uint64_t>(capacity_per_host * hosts.size() * 10000);
+
+  result.is_valid = true;
+  result.last_updated = time_source_.monotonicTime();
+
+  ENVOY_LOG(trace,
+            "Calculated zone metrics for {}/{}/{}: {} reporting hosts (OOB:{}, pull:{}), "
+            "{:.2f}% avg utilization, weight={}",
+            locality.region(), locality.zone(), locality.sub_zone(), reporting_hosts,
+            oob_hosts, pull_hosts, result.avg_utilization * 100, result.locality_weight);
+
+  return result;
+}
+
+void ZoneAwareLoadBalancerBase::aggregateZoneMetricsForHostSet(const HostSet& host_set) {
+  const auto& hosts_per_locality = host_set.healthyHostsPerLocality();
+
+  // Group hosts by locality and calculate metrics for each
+  for (uint32_t i = 0; i < hosts_per_locality.get().size(); ++i) {
+    const auto& locality_hosts = hosts_per_locality.get()[i];
+
+    if (locality_hosts.empty()) {
+      continue;
+    }
+
+    const auto& locality = locality_hosts[0]->locality();
+
+    // Calculate and cache metrics for this locality
+    cached_zone_metrics_[locality] = calculateZoneMetricsFromHosts(locality_hosts, locality);
+  }
+}
+
+void ZoneAwareLoadBalancerBase::updateZoneMetricsOnMainThread() {
+  ENVOY_LOG(trace, "Updating zone metrics for all host sets");
+
+  // Clear existing cache
+  cached_zone_metrics_.clear();
+
+  // Aggregate metrics for all host sets
+  for (const auto& host_set : priority_set_.hostSetsPerPriority()) {
+    aggregateZoneMetricsForHostSet(*host_set);
+  }
+
+  // Update last refresh timestamp
+  zone_metrics_last_refresh_ = time_source_.monotonicTime();
+
+  // Note: Timer is re-armed in the timer callback itself
+
+  ENVOY_LOG(debug, "Zone metrics updated: {} localities cached", cached_zone_metrics_.size());
+}
+
+void ZoneAwareLoadBalancerBase::maybeUpdateZoneMetrics() {
+  // Check if we need to update zone metrics (lazy on-demand update)
+  const auto now = time_source_.monotonicTime();
+
+  // Update if cache is stale (older than update interval)
+  if (now - zone_metrics_last_refresh_ >= zone_metrics_update_interval_) {
+    updateZoneMetricsOnMainThread();
+  }
+}
+
+uint64_t ZoneAwareLoadBalancerBase::getCachedOrcaBasedLocalityWeight(
+    const HostVector& locality_hosts, const envoy::config::core::v3::Locality& locality) {
+
+  if (locality_hosts.empty()) {
+    return 0;
+  }
+
+  // Ensure we have an initial snapshot on first use to avoid immediate fallback.
+  if (cached_zone_metrics_.empty()) {
+    ENVOY_LOG(debug, "ORCA zone cache empty; performing initial update");
+    updateZoneMetricsOnMainThread();
+  }
+
+  // Lazy update: refresh zone metrics if cache is stale
+  // This is called on hot-path, but maybeUpdateZoneMetrics only does work
+  // if the cache has expired (based on zone_metrics_update_interval_)
+  maybeUpdateZoneMetrics();
+
+  // Fast O(1) hash lookup in cache
+  auto it = cached_zone_metrics_.find(locality);
+
+  if (it != cached_zone_metrics_.end() && it->second.is_valid) {
+    // Cache hit - return cached ORCA-based weight
+    // TODO(future): Add stats_.lb_zone_orca_cache_hit_.inc();
+    ENVOY_LOG(debug, "ORCA zone weight for {}/{}/{}: {} (avg util: {:.1f}%, {} hosts reporting)",
+              locality.region(), locality.zone(), locality.sub_zone(), it->second.locality_weight,
+              it->second.avg_utilization * 100, it->second.reporting_hosts);
+    return it->second.locality_weight;
+  }
+
+  // Cache miss or invalid: attempt an on-demand calculation from current host stats.
+  ENVOY_LOG(debug, "ORCA cache miss/invalid for locality {}/{}/{}, attempting direct calc",
+            locality.region(), locality.zone(), locality.sub_zone());
+
+  CachedZoneMetrics direct = calculateZoneMetricsFromHosts(locality_hosts, locality);
+  if (direct.is_valid) {
+    // Store and return the freshly computed weight.
+    cached_zone_metrics_[locality] = direct;
+    ENVOY_LOG(debug, "ORCA direct calc weight for {}/{}/{}: {} (avg util: {:.1f}%, hosts={})",
+              locality.region(), locality.zone(), locality.sub_zone(), direct.locality_weight,
+              direct.avg_utilization * 100.0, direct.reporting_hosts);
+    return direct.locality_weight;
+  }
+
+  // Still no usable ORCA data; fall back to configured basis.
+  ENVOY_LOG(debug, "ORCA direct calc unavailable; using fallback for {}/{}/{} (basis: {})",
+            locality.region(), locality.zone(), locality.sub_zone(),
+            static_cast<int>(orca_fallback_basis_));
+  return calculateFallbackLocalityWeight(locality_hosts, locality);
+}
+
+// OOB Reporting Implementation
+
+void ZoneAwareLoadBalancerBase::startOobExpirationTimer() {
+  // TODO: Implement OOB expiration timer
+  //
+  // The timer-based expiration requires dispatcher access which is not available
+  // in ZoneAwareLoadBalancerBase. To complete this feature:
+  //
+  // Option 1: Add Event::Dispatcher& to ZoneAwareLoadBalancerBase constructor
+  //   - Requires updating all derived load balancer constructors
+  //   - Most straightforward approach
+  //
+  // Option 2: Create timer in factory and pass it to base class
+  //   - Requires less architectural changes
+  //   - More complex factory pattern
+  //
+  // Option 3: Use main-thread proxy timer via thread-local storage
+  //   - Complex but avoids constructor changes
+  //
+  // When implemented, add:
+  // oob_expiration_timer_ = dispatcher_->createTimer([this]() { onOobExpirationTimer(); });
+  // oob_expiration_timer_->enableTimer(std::chrono::minutes(1)); // Check every minute
+
+  ENVOY_LOG(debug, "OOB expiration timer setup pending dispatcher access implementation");
+}
+
+void ZoneAwareLoadBalancerBase::onOobExpirationTimer() {
+  if (!oob_enabled_) {
+    return;
+  }
+
+  ENVOY_LOG(trace, "Checking for expired OOB reports");
+  checkExpiredOobReports();
+
+  // Re-arm timer for next check
+  if (oob_expiration_timer_) {
+    oob_expiration_timer_->enableTimer(std::chrono::minutes(1));
+  }
+}
+
+void ZoneAwareLoadBalancerBase::checkExpiredOobReports() {
+  const auto now = time_source_.monotonicTime();
+  bool had_expired_reports = false;
+
+  // Check all host sets for expired OOB reports
+  for (const HostSetPtr& host_set : priority_set_.hostSetsPerPriority()) {
+    for (const auto& host : host_set->hosts()) {
+      if (auto typed = host->typedLbPolicyData<OrcaHostLbPolicyData>()) {
+        if (typed->oob_reporting_active.load(std::memory_order_relaxed)) {
+          // Convert nanoseconds back to MonotonicTime for comparison
+          const uint64_t last_update_ns = typed->oob_last_update_ns.load(std::memory_order_relaxed);
+          const auto last_update = MonotonicTime(std::chrono::nanoseconds(last_update_ns));
+
+          if (now - last_update > oob_expiration_period_) {
+            // This host's OOB report has expired
+            typed->oob_reporting_active.store(false, std::memory_order_relaxed);
+            had_expired_reports = true;
+
+            ENVOY_LOG(debug, "OOB report expired for host {}, falling back to per-request metrics",
+                      host->address()->asString());
+          }
+        }
+      }
+    }
+  }
+
+  // If any OOB reports expired, invalidate the zone metrics cache
+  // to force recalculation with updated host states
+  if (had_expired_reports) {
+    ENVOY_LOG(debug, "Some OOB reports expired, invalidating zone metrics cache");
+    cached_zone_metrics_.clear();
+  }
+}
+
+// OOB-First Zone Metrics Cache Implementation
+
+absl::optional<ZoneAwareLoadBalancerBase::CachedZoneMetrics>
+ZoneAwareLoadBalancerBase::getOobFirstZoneMetrics(
+    const envoy::config::core::v3::Locality& locality) {
+
+  if (!oob_first_enabled_) {
+    // OOB-first mode not enabled, fall back to regular cache
+    return absl::nullopt;
+  }
+
+  auto it = oob_first_zone_cache_.find(locality);
+  if (it != oob_first_zone_cache_.end() && it->second.has_valid_oob_data) {
+    const auto& oob_metrics = it->second.oob_metrics;
+    const auto now = time_source_.monotonicTime();
+
+    // Check if OOB data is still fresh
+    if (now - it->second.last_oob_update < oob_expiration_period_) {
+      ENVOY_LOG(debug, "OOB-first cache hit for {}/{}/{}, using OOB data (age: {}ms)",
+                locality.region(), locality.zone(), locality.sub_zone(),
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                  now - it->second.last_oob_update).count());
+      return oob_metrics;
+    } else {
+      // OOB data expired, mark as invalid
+      it->second.has_valid_oob_data = false;
+      ENVOY_LOG(debug, "OOB-first cache expired for {}/{}/{}",
+                locality.region(), locality.zone(), locality.sub_zone());
+    }
+  }
+
+  return absl::nullopt;
+}
+
+void ZoneAwareLoadBalancerBase::updateOobFirstCache(
+    const envoy::config::core::v3::Locality& locality,
+    const CachedZoneMetrics& metrics) {
+
+  if (!oob_first_enabled_) {
+    return;
+  }
+
+  auto& zone_cache = oob_first_zone_cache_[locality];
+  zone_cache.oob_metrics = metrics;
+  zone_cache.last_oob_update = time_source_.monotonicTime();
+  zone_cache.has_valid_oob_data = true;
+
+  ENVOY_LOG(debug, "OOB-first cache updated for {}/{}/{}: {} hosts, util {:.1f}%",
+            locality.region(), locality.zone(), locality.sub_zone(),
+            metrics.reporting_hosts, metrics.avg_utilization * 100);
+}
+
+bool ZoneAwareLoadBalancerBase::needsCrossZoneProbing(
+    const envoy::config::core::v3::Locality& locality,
+    const CachedZoneMetrics& /* current_metrics */) {
+
+  if (!oob_first_enabled_) {
+    return true; // Traditional behavior: always probe
+  }
+
+  const auto now = time_source_.monotonicTime();
+  const auto& cache_entry = oob_first_zone_cache_[locality];
+
+  // Check if we have fresh OOB data
+  if (cache_entry.has_valid_oob_data &&
+      (now - cache_entry.last_oob_update < oob_expiration_period_)) {
+    return false; // No probing needed, OOB data is fresh
+  }
+
+  // Check OOB missing threshold
+  if (oob_probe_triggers_.has_oob_missing_threshold()) {
+    const auto threshold = std::chrono::milliseconds(
+        DurationUtil::durationToMilliseconds(oob_probe_triggers_.oob_missing_threshold()));
+    if (now - cache_entry.last_oob_update < threshold) {
+      return false; // Within missing threshold, don't probe yet
+    }
+  }
+
+  // Check rate limiting
+  if (cache_entry.in_probe_cooldown) {
+    // Check if cooldown period has passed (default: 1 minute)
+    const auto cooldown_period = std::chrono::minutes(1);
+    if (now - cache_entry.last_probe_time < cooldown_period) {
+      return false; // Still in cooldown
+    }
+  }
+
+  // Check maximum probes per minute
+  if (oob_probe_triggers_.has_max_probes_per_minute()) {
+    const uint32_t max_probes = oob_probe_triggers_.max_probes_per_minute().value();
+    if (cache_entry.probes_sent_this_minute >= max_probes) {
+      return false; // Rate limited
+    }
+  }
+
+  // Check load variance threshold (if we have historical data)
+  if (oob_probe_triggers_.has_load_variance_threshold() && cache_entry.has_valid_oob_data) {
+    const double variance_threshold = oob_probe_triggers_.load_variance_threshold().value();
+    const double utilization_diff = std::abs(/* current_metrics */ 0.0 -
+                                            cache_entry.oob_metrics.avg_utilization);
+
+    if (utilization_diff < variance_threshold) {
+      return false; // Load variance too small to justify probing
+    }
+  }
+
+  return true; // Probing is needed
+}
+
+bool ZoneAwareLoadBalancerBase::performIntelligentProbe(
+    const envoy::config::core::v3::Locality& locality,
+    const HostVector& /* hosts */) {
+
+  if (!oob_first_enabled_) {
+    return true; // Traditional behavior: always probe
+  }
+
+  auto& cache_entry = oob_first_zone_cache_[locality];
+  const auto now = time_source_.monotonicTime();
+
+  // Update rate limiting counters
+  if (now - cache_entry.last_probe_time > std::chrono::minutes(1)) {
+    // Reset counter for new minute
+    cache_entry.probes_sent_this_minute = 1;
+  } else {
+    cache_entry.probes_sent_this_minute++;
+  }
+
+  cache_entry.last_probe_time = now;
+
+  // Check if we should enter cooldown
+  if (oob_probe_triggers_.has_max_probes_per_minute()) {
+    const uint32_t max_probes = oob_probe_triggers_.max_probes_per_minute().value();
+    if (cache_entry.probes_sent_this_minute >= max_probes) {
+      cache_entry.in_probe_cooldown = true;
+      ENVOY_LOG(debug, "OOB-first: Entering probe cooldown for {}/{}/{} (reached max probes: {})",
+                locality.region(), locality.zone(), locality.sub_zone(), max_probes);
+    }
+  }
+
+  ENVOY_LOG(debug, "OOB-first: Performing intelligent probe for {}/{}/{} (probe #{} this minute)",
+            locality.region(), locality.zone(), locality.sub_zone(),
+            cache_entry.probes_sent_this_minute);
+
+  return true; // Perform the probe
+}
+
+ZoneAwareLoadBalancerBase::CachedZoneMetrics
+ZoneAwareLoadBalancerBase::aggregateOobMetricsForZone(
+    const envoy::config::core::v3::Locality& locality,
+    const HostVector& hosts) {
+
+  CachedZoneMetrics result{};
+  result.last_updated = time_source_.monotonicTime();
+
+  if (!oob_zone_aggregation_config_.enable_zone_aggregation()) {
+    // Zone aggregation disabled, return empty metrics
+    return result;
+  }
+
+  const uint32_t min_hosts = oob_zone_aggregation_config_.min_hosts_per_zone().value();
+  std::vector<double> utilizations;
+  std::vector<double> cpu_values;
+
+  // Collect metrics from hosts in this zone
+  for (const auto& host : hosts) {
+    auto* typed = dynamic_cast<OrcaHostLbPolicyData*>(host->lbPolicyData().ptr());
+    if (!typed) {
+      continue;
+    }
+
+    // Prefer OOB data if available and fresh
+    if (oob_enabled_ && typed->oob_reporting_active.load(std::memory_order_relaxed)) {
+
+      if (orca_use_application_utilization_) {
+        auto app = typed->app();
+        if (app.has_value()) {
+          utilizations.push_back(app.value());
+        }
+      }
+
+      if (orca_use_cpu_utilization_) {
+        auto cpu = typed->cpu();
+        if (cpu.has_value()) {
+          cpu_values.push_back(cpu.value());
+        }
+      }
+    }
+  }
+
+  // Check if we have enough hosts for valid aggregation
+  if (utilizations.size() + cpu_values.size() < min_hosts) {
+    ENVOY_LOG(debug, "OOB-first: Insufficient hosts for zone aggregation {}/{}/{}: {} reporting (need {})",
+              locality.region(), locality.zone(), locality.sub_zone(),
+              utilizations.size() + cpu_values.size(), min_hosts);
+    return result; // Invalid metrics
+  }
+
+  // Perform aggregation based on configured method
+  std::vector<double> all_values;
+  all_values.insert(all_values.end(), utilizations.begin(), utilizations.end());
+  all_values.insert(all_values.end(), cpu_values.begin(), cpu_values.end());
+
+  if (all_values.empty()) {
+    return result; // No valid metrics
+  }
+
+  double aggregated_utilization = 0.0;
+  const auto method = oob_zone_aggregation_config_.aggregation_method();
+
+  switch (method) {
+    case LocalityLbConfig::ZoneAwareLbConfig::OrcaLoadBasedConfig::ZoneAggregationConfig::AVERAGE:
+      aggregated_utilization = std::accumulate(all_values.begin(), all_values.end(), 0.0) / all_values.size();
+      break;
+
+    case LocalityLbConfig::ZoneAwareLbConfig::OrcaLoadBasedConfig::ZoneAggregationConfig::WEIGHTED_AVERAGE:
+      // Weighted by host weight (simplified - assumes equal weights)
+      aggregated_utilization = std::accumulate(all_values.begin(), all_values.end(), 0.0) / all_values.size();
+      break;
+
+    case LocalityLbConfig::ZoneAwareLbConfig::OrcaLoadBasedConfig::ZoneAggregationConfig::MAXIMUM:
+      aggregated_utilization = *std::max_element(all_values.begin(), all_values.end());
+      break;
+
+    case LocalityLbConfig::ZoneAwareLbConfig::OrcaLoadBasedConfig::ZoneAggregationConfig::MINIMUM:
+      aggregated_utilization = *std::min_element(all_values.begin(), all_values.end());
+      break;
+
+    // No sentinel values in actual proto - this case handles unknown/unexpected values
+    default:
+      // Fall back to average for unknown values
+      aggregated_utilization = std::accumulate(all_values.begin(), all_values.end(), 0.0) / all_values.size();
+      break;
+  }
+
+  // Apply local zone prioritization if configured
+  if (oob_zone_aggregation_config_.prioritize_local_zone() &&
+      oob_zone_aggregation_config_.has_local_zone_weight()) {
+    const double local_weight = oob_zone_aggregation_config_.local_zone_weight().value();
+    // Reduce utilization by local weight factor (higher weight = lower apparent utilization)
+    aggregated_utilization /= local_weight;
+  }
+
+  // Fill result
+  result.avg_utilization = aggregated_utilization;
+  result.reporting_hosts = utilizations.size() + cpu_values.size();
+  result.is_valid = true;
+
+  // Calculate inverse utilization weight (higher utilization = lower weight)
+  const double capacity = std::max(0.01, 1.0 - aggregated_utilization);
+  result.locality_weight = static_cast<uint64_t>(capacity * ORCA_WEIGHT_SCALE_FACTOR);
+
+  ENVOY_LOG(debug, "OOB-first: Zone aggregation for {}/{}/{}: {} hosts, util {:.1f}%, weight {}",
+            locality.region(), locality.zone(), locality.sub_zone(),
+            result.reporting_hosts, result.avg_utilization * 100, result.locality_weight);
+
+  return result;
+}
+
+absl::optional<ZoneAwareLoadBalancerBase::CachedZoneMetrics>
+ZoneAwareLoadBalancerBase::applyFallbackStrategy(
+    const envoy::config::core::v3::Locality& locality,
+    const HostVector& hosts) {
+
+  if (!oob_first_enabled_) {
+    return absl::nullopt;
+  }
+
+  switch (oob_fallback_strategy_) {
+    case LocalityLbConfig::ZoneAwareLbConfig::OrcaLoadBasedConfig::PROBE_FALLBACK:
+      // Traditional fallback: perform cross-zone probe
+      ENVOY_LOG(debug, "OOB-first: Using probe fallback for {}/{}/{}",
+                locality.region(), locality.zone(), locality.sub_zone());
+      return calculateZoneMetricsFromHosts(hosts, locality);
+
+    case LocalityLbConfig::ZoneAwareLbConfig::OrcaLoadBasedConfig::USE_STALE_METRICS:
+      // Use last known good OOB metrics if available
+      {
+        auto it = oob_first_zone_cache_.find(locality);
+        if (it != oob_first_zone_cache_.end() && it->second.has_valid_oob_data) {
+          ENVOY_LOG(debug, "OOB-first: Using stale metrics for {}/{}/{}",
+                    locality.region(), locality.zone(), locality.sub_zone());
+          return it->second.oob_metrics;
+        }
+      }
+      // No stale metrics available, fall back to probing
+      return calculateZoneMetricsFromHosts(hosts, locality);
+
+    case LocalityLbConfig::ZoneAwareLbConfig::OrcaLoadBasedConfig::USE_ESTIMATED_METRICS:
+      // Use estimated metrics based on historical patterns
+      ENVOY_LOG(debug, "OOB-first: Using estimated metrics for {}/{}/{}",
+                locality.region(), locality.zone(), locality.sub_zone());
+      // For now, fall back to traditional calculation
+      // TODO: Implement historical pattern estimation
+      return calculateZoneMetricsFromHosts(hosts, locality);
+
+    case LocalityLbConfig::ZoneAwareLbConfig::OrcaLoadBasedConfig::HYBRID_FALLBACK:
+      // Try limited probing, then use stale/estimated
+      if (needsCrossZoneProbing(locality, CachedZoneMetrics{})) {
+        ENVOY_LOG(debug, "OOB-first: Hybrid fallback - performing limited probe for {}/{}/{}",
+                  locality.region(), locality.zone(), locality.sub_zone());
+        return calculateZoneMetricsFromHosts(hosts, locality);
+      } else {
+        // Use stale metrics if available
+        auto it = oob_first_zone_cache_.find(locality);
+        if (it != oob_first_zone_cache_.end() && it->second.has_valid_oob_data) {
+          return it->second.oob_metrics;
+        }
+      }
+      return calculateZoneMetricsFromHosts(hosts, locality);
+
+    default:
+      // Handle any sentinel values or unknown strategies
+      ENVOY_LOG(debug, "OOB-first: Unknown fallback strategy for {}/{}/{}, using hybrid",
+                locality.region(), locality.zone(), locality.sub_zone());
+      return calculateZoneMetricsFromHosts(hosts, locality);
+      }
+
+  return absl::nullopt;
+}
+
+void ZoneAwareLoadBalancerBase::resetProbeRateCounters() {
+  if (!oob_first_enabled_) {
+    return;
+  }
+
+  const auto now = time_source_.monotonicTime();
+
+  // Reset counters for zones that haven't been probed in the last minute
+  for (auto& [locality, cache_entry] : oob_first_zone_cache_) {
+    if (now - cache_entry.last_probe_time > std::chrono::minutes(1)) {
+      cache_entry.probes_sent_this_minute = 0;
+      cache_entry.in_probe_cooldown = false;
+    }
   }
 }
 

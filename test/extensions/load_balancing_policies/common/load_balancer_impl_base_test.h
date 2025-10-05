@@ -54,15 +54,36 @@ public:
   TestZoneAwareLoadBalancer(const PrioritySet& priority_set, ClusterLbStats& lb_stats,
                             Runtime::Loader& runtime, Random::RandomGenerator& random,
                             uint32_t healthy_panic_threshold,
-                            absl::optional<LocalityLbConfig> locality_config)
+                            absl::optional<LocalityLbConfig> locality_config,
+                            TimeSource& time_source)
       : ZoneAwareLoadBalancerBase(priority_set, nullptr, lb_stats, runtime, random,
-                                  healthy_panic_threshold, locality_config) {}
+                                  healthy_panic_threshold, locality_config, time_source) {}
+
+  // Optional constructor that wires a local priority set for tests that exercise
+  // locality-aware routing paths directly.
+  TestZoneAwareLoadBalancer(const PrioritySet& priority_set, const PrioritySet* local_priority_set,
+                            ClusterLbStats& lb_stats, Runtime::Loader& runtime,
+                            Random::RandomGenerator& random, uint32_t healthy_panic_threshold,
+                            absl::optional<LocalityLbConfig> locality_config,
+                            TimeSource& time_source)
+      : ZoneAwareLoadBalancerBase(priority_set, local_priority_set, lb_stats, runtime, random,
+                                  healthy_panic_threshold, locality_config, time_source) {}
   void runInvalidLocalitySourceType() {
     localitySourceType(static_cast<LoadBalancerBase::HostAvailability>(123));
   }
   void runInvalidSourceType() { sourceType(static_cast<LoadBalancerBase::HostAvailability>(123)); }
   HostConstSharedPtr chooseHostOnce(LoadBalancerContext*) override { PANIC("not implemented"); }
   HostConstSharedPtr peekAnotherHost(LoadBalancerContext*) override { PANIC("not implemented"); }
+
+  // Expose percentages calculation for testing.
+  using ZoneAwareLoadBalancerBase::calculateLocalityPercentages;
+  using ZoneAwareLoadBalancerBase::hostSourceToUse;
+  using ZoneAwareLoadBalancerBase::regenerateLocalityRoutingStructures;
+
+  // Minimal wrapper to exercise tryChooseLocalLocalityHosts in tests.
+  uint32_t callTryChooseLocalLocalityHosts(const HostSet& host_set) const {
+    return tryChooseLocalLocalityHosts(host_set);
+  }
 };
 
 struct LoadBalancerTestParam {

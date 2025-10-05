@@ -112,9 +112,10 @@ class LoadMetricStatsImpl : public LoadMetricStats {
 public:
   void add(const absl::string_view key, double value) override;
   StatMapPtr latch() override;
+  absl::optional<double> get(const absl::string_view key) const override;
 
 private:
-  absl::Mutex mu_;
+  mutable absl::Mutex mu_;
   StatMapPtr map_ ABSL_GUARDED_BY(mu_);
 };
 

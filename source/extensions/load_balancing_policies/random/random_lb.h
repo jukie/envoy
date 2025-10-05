@@ -13,10 +13,11 @@ public:
   RandomLoadBalancer(
       const PrioritySet& priority_set, const PrioritySet* local_priority_set, ClusterLbStats& stats,
       Runtime::Loader& runtime, Random::RandomGenerator& random, uint32_t healthy_panic_threshold,
-      const envoy::extensions::load_balancing_policies::random::v3::Random& random_config)
+      const envoy::extensions::load_balancing_policies::random::v3::Random& random_config,
+      TimeSource& time_source)
       : ZoneAwareLoadBalancerBase(
             priority_set, local_priority_set, stats, runtime, random, healthy_panic_threshold,
-            LoadBalancerConfigHelper::localityLbConfigFromProto(random_config)) {}
+            LoadBalancerConfigHelper::localityLbConfigFromProto(random_config), time_source) {}
 
   // Upstream::ZoneAwareLoadBalancerBase
   HostConstSharedPtr chooseHostOnce(LoadBalancerContext* context) override;
