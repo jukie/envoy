@@ -2,6 +2,9 @@
 #include "source/extensions/load_balancing_policies/round_robin/round_robin_lb.h"
 
 #include "test/extensions/load_balancing_policies/common/load_balancer_impl_base_test.h"
+#include "test/mocks/stream_info/mocks.h"
+
+#include "xds/data/orca/v3/orca_load_report.pb.h"
 
 namespace Envoy {
 namespace Upstream {
@@ -9,6 +12,8 @@ namespace {
 
 using testing::Return;
 using testing::ReturnRef;
+
+using ZoneAwareHostLbPolicyData = ZoneAwareLoadBalancerBase::ZoneAwareHostLbPolicyData;
 
 class RoundRobinLoadBalancerTest : public LoadBalancerTestBase {
 public:
@@ -157,6 +162,219 @@ TEST_P(FailoverTest, PriorityUpdatesWithLocalHostSetDisableOnPanic) {
   host_set_.healthy_hosts_ = {};
   host_set_.runCallbacks({}, {});
   EXPECT_EQ(tertiary_host_set_.hosts_[0], lb_->chooseHost(nullptr).host);
+}
+
+TEST_P(RoundRobinLoadBalancerTest, OrcaLocalityPrefersLocalCapacity) {
+  envoy::config::core::v3::Locality zone_a;
+  zone_a.set_zone("zone_a");
+  envoy::config::core::v3::Locality zone_b;
+  zone_b.set_zone("zone_b");
+
+  HostVectorSharedPtr upstream_hosts(new HostVector{
+      makeTestHost(info_, "tcp://10.0.0.1:80", zone_a),
+      makeTestHost(info_, "tcp://10.0.0.2:80", zone_b)});
+  HostsPerLocalitySharedPtr upstream_per_locality =
+      makeHostsPerLocality({{(*upstream_hosts)[0]}, {(*upstream_hosts)[1]}});
+  hostSet().hosts_ = *upstream_hosts;
+  hostSet().healthy_hosts_ = *upstream_hosts;
+  hostSet().healthy_hosts_per_locality_ = upstream_per_locality;
+
+  auto* zone_config = round_robin_lb_config_.mutable_locality_lb_config()
+                          ->mutable_zone_aware_lb_config();
+  zone_config->set_locality_basis(
+      envoy::extensions::load_balancing_policies::common::v3::LocalityLbConfig::ZoneAwareLbConfig::ORCA_UTILIZATION);
+  zone_config->mutable_orca_min_reported_endpoints()->set_value(1);
+
+  init(true);
+
+  HostVectorSharedPtr local_hosts(new HostVector{
+      makeTestHost(info_, "tcp://127.0.0.1:1000", zone_a),
+      makeTestHost(info_, "tcp://127.0.0.1:2000", zone_b)});
+  HostsPerLocalitySharedPtr local_per_locality =
+      makeHostsPerLocality({{(*local_hosts)[0]}, {(*local_hosts)[1]}});
+
+  // Attach ORCA policy data to all hosts since they're created after load balancer initialization
+  for (const auto& host : *upstream_hosts) {
+    host->setLbPolicyData(std::make_unique<ZoneAwareHostLbPolicyData>(std::vector<std::string>()));
+  }
+  for (const auto& host : *local_hosts) {
+    host->setLbPolicyData(std::make_unique<ZoneAwareHostLbPolicyData>(std::vector<std::string>()));
+  }
+
+  updateHosts(local_hosts, local_per_locality);
+
+  StreamInfo::MockStreamInfo stream_info;
+  xds::data::orca::v3::OrcaLoadReport low_utilization;
+  low_utilization.set_application_utilization(0.1);
+  xds::data::orca::v3::OrcaLoadReport high_utilization;
+  high_utilization.set_application_utilization(0.9);
+
+  auto apply_report = [&](const HostSharedPtr& host,
+                          const xds::data::orca::v3::OrcaLoadReport& report) {
+    auto policy_data = host->typedLbPolicyData<ZoneAwareHostLbPolicyData>();
+    ASSERT_TRUE(policy_data.has_value());
+    EXPECT_TRUE(policy_data->onOrcaLoadReport(report, stream_info).ok());
+  };
+
+  for (const auto& host : upstream_per_locality->get()[0]) {
+    apply_report(host, low_utilization);
+  }
+  for (const auto& host : upstream_per_locality->get()[1]) {
+    apply_report(host, high_utilization);
+  }
+
+  auto& local_host_set = *local_priority_set_->hostSetsPerPriority()[0];
+  for (const auto& host : local_host_set.healthyHostsPerLocality().get()[0]) {
+    apply_report(host, low_utilization);
+  }
+  for (const auto& host : local_host_set.healthyHostsPerLocality().get()[1]) {
+    apply_report(host, high_utilization);
+  }
+
+  EXPECT_CALL(runtime_.snapshot_, getInteger("upstream.zone_routing.min_cluster_size", 6))
+      .WillRepeatedly(Return(1));
+  EXPECT_CALL(runtime_.snapshot_, getInteger("upstream.zone_routing.force_local_zone.min_size", 0))
+      .WillRepeatedly(Return(0));
+  EXPECT_CALL(runtime_.snapshot_, featureEnabled("upstream.zone_routing.enabled", 100))
+      .WillRepeatedly(Return(true));
+  EXPECT_CALL(runtime_.snapshot_, getInteger("upstream.healthy_panic_threshold", 50))
+      .WillRepeatedly(Return(50));
+
+  EXPECT_EQ(upstream_per_locality->get()[0][0], lb_->chooseHost(nullptr).host);
+}
+
+TEST_P(RoundRobinLoadBalancerTest, OrcaLocalityRoutesResidualWhenLocalSaturated) {
+  envoy::config::core::v3::Locality zone_a;
+  zone_a.set_zone("zone_a");
+  envoy::config::core::v3::Locality zone_b;
+  zone_b.set_zone("zone_b");
+
+  HostVectorSharedPtr upstream_hosts(new HostVector{
+      makeTestHost(info_, "tcp://10.0.0.1:80", zone_a),
+      makeTestHost(info_, "tcp://10.0.0.2:80", zone_b)});
+  HostsPerLocalitySharedPtr upstream_per_locality =
+      makeHostsPerLocality({{(*upstream_hosts)[0]}, {(*upstream_hosts)[1]}});
+  hostSet().hosts_ = *upstream_hosts;
+  hostSet().healthy_hosts_ = *upstream_hosts;
+  hostSet().healthy_hosts_per_locality_ = upstream_per_locality;
+
+  auto* zone_config = round_robin_lb_config_.mutable_locality_lb_config()
+                          ->mutable_zone_aware_lb_config();
+  zone_config->set_locality_basis(
+      envoy::extensions::load_balancing_policies::common::v3::LocalityLbConfig::ZoneAwareLbConfig::ORCA_UTILIZATION);
+  zone_config->mutable_orca_min_reported_endpoints()->set_value(1);
+
+  init(true);
+
+  HostVectorSharedPtr local_hosts(new HostVector{
+      makeTestHost(info_, "tcp://127.0.0.1:1000", zone_a),
+      makeTestHost(info_, "tcp://127.0.0.1:2000", zone_b)});
+  HostsPerLocalitySharedPtr local_per_locality =
+      makeHostsPerLocality({{(*local_hosts)[0]}, {(*local_hosts)[1]}});
+
+  // Attach ORCA policy data to all hosts since they're created after load balancer initialization
+  for (const auto& host : *upstream_hosts) {
+    host->setLbPolicyData(std::make_unique<ZoneAwareHostLbPolicyData>(std::vector<std::string>()));
+  }
+  for (const auto& host : *local_hosts) {
+    host->setLbPolicyData(std::make_unique<ZoneAwareHostLbPolicyData>(std::vector<std::string>()));
+  }
+
+  updateHosts(local_hosts, local_per_locality);
+
+  StreamInfo::MockStreamInfo stream_info;
+  xds::data::orca::v3::OrcaLoadReport saturated_utilization;
+  saturated_utilization.set_application_utilization(1.0);
+  xds::data::orca::v3::OrcaLoadReport available_utilization;
+  available_utilization.set_application_utilization(0.1);
+
+  auto apply_report = [&](const HostSharedPtr& host,
+                          const xds::data::orca::v3::OrcaLoadReport& report) {
+    auto policy_data = host->typedLbPolicyData<ZoneAwareHostLbPolicyData>();
+    ASSERT_TRUE(policy_data.has_value());
+    EXPECT_TRUE(policy_data->onOrcaLoadReport(report, stream_info).ok());
+  };
+
+  for (const auto& host : upstream_per_locality->get()[0]) {
+    apply_report(host, saturated_utilization);
+  }
+  for (const auto& host : upstream_per_locality->get()[1]) {
+    apply_report(host, available_utilization);
+  }
+
+  auto& local_host_set = *local_priority_set_->hostSetsPerPriority()[0];
+  for (const auto& host : local_host_set.healthyHostsPerLocality().get()[0]) {
+    apply_report(host, saturated_utilization);
+  }
+  for (const auto& host : local_host_set.healthyHostsPerLocality().get()[1]) {
+    apply_report(host, available_utilization);
+  }
+
+  EXPECT_CALL(runtime_.snapshot_, getInteger("upstream.zone_routing.min_cluster_size", 6))
+      .WillRepeatedly(Return(1));
+  EXPECT_CALL(runtime_.snapshot_, getInteger("upstream.zone_routing.force_local_zone.min_size", 0))
+      .WillRepeatedly(Return(0));
+  EXPECT_CALL(runtime_.snapshot_, featureEnabled("upstream.zone_routing.enabled", 100))
+      .WillRepeatedly(Return(true));
+  EXPECT_CALL(runtime_.snapshot_, getInteger("upstream.healthy_panic_threshold", 50))
+      .WillRepeatedly(Return(50));
+
+  EXPECT_CALL(random_, random()).WillOnce(Return(0)).WillOnce(Return(0)).WillRepeatedly(Return(0));
+  EXPECT_EQ(upstream_per_locality->get()[1][0], lb_->chooseHost(nullptr).host);
+}
+
+TEST_P(RoundRobinLoadBalancerTest, OrcaEvenSplitFallback) {
+  envoy::config::core::v3::Locality zone_a;
+  zone_a.set_zone("zone_a");
+  envoy::config::core::v3::Locality zone_b;
+  zone_b.set_zone("zone_b");
+
+  HostVectorSharedPtr upstream_hosts(new HostVector{
+      makeTestHost(info_, "tcp://10.0.0.1:80", zone_a),
+      makeTestHost(info_, "tcp://10.0.0.2:80", zone_b)});
+  HostsPerLocalitySharedPtr upstream_per_locality =
+      makeHostsPerLocality({{(*upstream_hosts)[0]}, {(*upstream_hosts)[1]}});
+  hostSet().hosts_ = *upstream_hosts;
+  hostSet().healthy_hosts_ = *upstream_hosts;
+  hostSet().healthy_hosts_per_locality_ = upstream_per_locality;
+
+  auto* zone_config = round_robin_lb_config_.mutable_locality_lb_config()
+                          ->mutable_zone_aware_lb_config();
+  zone_config->set_locality_basis(
+      envoy::extensions::load_balancing_policies::common::v3::LocalityLbConfig::ZoneAwareLbConfig::ORCA_UTILIZATION);
+  zone_config->mutable_orca_min_reported_endpoints()->set_value(2);
+  zone_config->set_orca_fallback(
+      envoy::extensions::load_balancing_policies::common::v3::LocalityLbConfig::ZoneAwareLbConfig::EVEN_SPLIT);
+
+  init(true);
+
+  HostVectorSharedPtr local_hosts(new HostVector{
+      makeTestHost(info_, "tcp://127.0.0.1:1000", zone_a),
+      makeTestHost(info_, "tcp://127.0.0.1:2000", zone_b)});
+  HostsPerLocalitySharedPtr local_per_locality =
+      makeHostsPerLocality({{(*local_hosts)[0]}, {(*local_hosts)[1]}});
+
+  // Attach ORCA policy data to all hosts since they're created after load balancer initialization
+  for (const auto& host : *upstream_hosts) {
+    host->setLbPolicyData(std::make_unique<ZoneAwareHostLbPolicyData>(std::vector<std::string>()));
+  }
+  for (const auto& host : *local_hosts) {
+    host->setLbPolicyData(std::make_unique<ZoneAwareHostLbPolicyData>(std::vector<std::string>()));
+  }
+
+  updateHosts(local_hosts, local_per_locality);
+
+  EXPECT_CALL(runtime_.snapshot_, getInteger("upstream.zone_routing.min_cluster_size", 6))
+      .WillRepeatedly(Return(1));
+  EXPECT_CALL(runtime_.snapshot_, getInteger("upstream.zone_routing.force_local_zone.min_size", 0))
+      .WillRepeatedly(Return(0));
+  EXPECT_CALL(runtime_.snapshot_, featureEnabled("upstream.zone_routing.enabled", 100))
+      .WillRepeatedly(Return(true));
+  EXPECT_CALL(runtime_.snapshot_, getInteger("upstream.healthy_panic_threshold", 50))
+      .WillRepeatedly(Return(50));
+
+  EXPECT_CALL(random_, random()).WillOnce(Return(6000)).WillOnce(Return(0)).WillRepeatedly(Return(0));
+  EXPECT_EQ(upstream_per_locality->get()[1][0], lb_->chooseHost(nullptr).host);
 }
 
 // Test extending the priority set.

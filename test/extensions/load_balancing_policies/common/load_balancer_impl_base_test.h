@@ -63,6 +63,19 @@ public:
   void runInvalidSourceType() { sourceType(static_cast<LoadBalancerBase::HostAvailability>(123)); }
   HostConstSharedPtr chooseHostOnce(LoadBalancerContext*) override { PANIC("not implemented"); }
   HostConstSharedPtr peekAnotherHost(LoadBalancerContext*) override { PANIC("not implemented"); }
+
+  std::vector<std::pair<uint64_t, uint64_t>>
+  evaluateLocalityPercentages(const HostsPerLocality& local_hosts_per_locality,
+                              const HostsPerLocality& upstream_hosts_per_locality) {
+    auto percentages =
+        calculateLocalityPercentages(local_hosts_per_locality, upstream_hosts_per_locality);
+    std::vector<std::pair<uint64_t, uint64_t>> result;
+    result.reserve(percentages.size());
+    for (const auto& value : percentages) {
+      result.emplace_back(value.local_percentage, value.upstream_percentage);
+    }
+    return result;
+  }
 };
 
 struct LoadBalancerTestParam {

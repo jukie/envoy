@@ -570,6 +570,72 @@ message Cluster {
       option (udpa.annotations.versioning).previous_message_type =
           "envoy.api.v2.Cluster.CommonLbConfig.ZoneAwareLbConfig";
 
+      // Strategy used to collapse per-endpoint utilization into a locality-wide signal when using
+      // ORCA_UTILIZATION locality basis.
+      enum OrcaAggregation {
+        // Default value; equivalent to AVERAGE.
+        AGGREGATION_UNSPECIFIED = 0;
+
+        // Average of the reported utilization metrics across endpoints in the locality.
+        AVERAGE = 1;
+
+        // Maximum reported utilization value across endpoints in the locality.
+        MAX = 2;
+      }
+
+      // Fallback behavior when insufficient ORCA data is available when using ORCA_UTILIZATION
+      // locality basis.
+      enum OrcaFallback {
+        // Default value; equivalent to LEGACY_LOCALITY_PERCENTAGE.
+        FALLBACK_UNSPECIFIED = 0;
+
+        // Use the existing zone-aware percentages derived from host counts or weights.
+        LEGACY_LOCALITY_PERCENTAGE = 1;
+
+        // Evenly split traffic across all available localities until ORCA data becomes available.
+        EVEN_SPLIT = 2;
+      }
+
+      // List of metric names that should be read from the ORCA reports when computing utilization
+      // with ORCA_UTILIZATION locality basis. If empty, the :ref:`application_utilization
+      // <envoy_v3_api_field_.xds.data.orca.v3.OrcaLoadReport.application_utilization>` metric
+      // is used.
+      repeated string orca_metrics = 4;
+
+      // Aggregation strategy applied to the utilization metrics reported by endpoints in the
+      // locality when using ORCA_UTILIZATION locality basis. Defaults to AVERAGE when unset or set
+      // to AGGREGATION_UNSPECIFIED.
+      OrcaAggregation orca_aggregation = 5;
+
+      // Optional exponential-weighted smoothing window applied to the aggregated utilization
+      // signal when using ORCA_UTILIZATION locality basis. If unset, no additional smoothing is
+      // applied beyond the cadence of incoming ORCA reports.
+      google.protobuf.Duration orca_smoothing_window = 6;
+
+      // Minimum number of endpoints in the locality that must have fresh ORCA data before the
+      // aggregated utilization is considered valid when using ORCA_UTILIZATION locality basis.
+      // When this threshold is not met the configured fallback behavior is used. If unset, the
+      // default requires at least one report.
+      google.protobuf.UInt32Value orca_min_reported_endpoints = 7;
+
+      // Percentage of requests that should be proactively sampled across non-local localities to
+      // keep ORCA utilization data fresh even when the preferred locality has sufficient capacity
+      // when using ORCA_UTILIZATION locality basis. Values are in whole percentages (0-100).
+      // Defaults to 1% when unset.
+      type.v3.Percent orca_probe_residual_percent = 8;
+
+      // Fallback policy used when not enough ORCA data is available for a locality when using
+      // ORCA_UTILIZATION locality basis. Defaults to LEGACY_LOCALITY_PERCENTAGE when unset or
+      // FALLBACK_UNSPECIFIED.
+      OrcaFallback orca_fallback = 9;
+
+      // Threshold that controls when traffic should spill from the local locality to remote
+      // localities based on ORCA-reported utilization when using ORCA_UTILIZATION locality basis.
+      // If the difference between local and remote utilization exceeds this value, Envoy spills
+      // traffic to that remote locality. Once the difference falls within the threshold, routing
+      // returns to local-only. Defaults to 0%.
+      type.v3.Percent orca_spillover_threshold = 10;
+
       // Configures percentage of requests that will be considered for zone aware routing
       // if zone aware routing is configured. If not specified, the default is 100%.
       // * :ref:`runtime values <config_cluster_manager_cluster_runtime_zone_routing>`.

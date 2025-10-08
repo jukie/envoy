@@ -118,6 +118,7 @@ envoy_cc_test_library(
         "//test/common/upstream:utility_lib",
         "//test/mocks:common_lib",
         "//test/mocks/runtime:runtime_mocks",
+        "//test/mocks/stream_info:stream_info_mocks",
         "//test/mocks/upstream:cluster_info_mocks",
         "//test/mocks/upstream:host_mocks",
         "//test/mocks/upstream:host_set_mocks",
@@ -128,6 +129,7 @@ envoy_cc_test_library(
         "//test/test_common:test_runtime_lib",
         "@envoy_api//envoy/config/cluster/v3:pkg_cc_proto",
         "@envoy_api//envoy/config/core/v3:pkg_cc_proto",
+        "@com_github_cncf_xds//xds/data/orca/v3:pkg_cc_proto",
     ],
 )
 

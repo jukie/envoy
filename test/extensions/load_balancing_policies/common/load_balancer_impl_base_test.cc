@@ -3,6 +3,11 @@
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 
+#include "test/common/upstream/utility.h"
+#include "test/mocks/stream_info/mocks.h"
+
+#include "xds/data/orca/v3/orca_load_report.pb.h"
+
 namespace Envoy {
 namespace Upstream {
 namespace {
@@ -590,9 +595,13 @@ public:
 
 // Tests the source type static methods in zone aware load balancer.
 TEST_F(ZoneAwareLoadBalancerBaseTest, SourceTypeMethods) {
-  { EXPECT_ENVOY_BUG(lbx_.runInvalidLocalitySourceType(), "unexpected locality source type enum"); }
+  {
+    EXPECT_ENVOY_BUG(lbx_.runInvalidLocalitySourceType(), "unexpected locality source type enum");
+  }
 
-  { EXPECT_ENVOY_BUG(lbx_.runInvalidSourceType(), "unexpected source type enum"); }
+  {
+    EXPECT_ENVOY_BUG(lbx_.runInvalidSourceType(), "unexpected source type enum");
+  }
 }
 
 TEST_F(ZoneAwareLoadBalancerBaseTest, BaseMethods) {
@@ -600,6 +609,146 @@ TEST_F(ZoneAwareLoadBalancerBaseTest, BaseMethods) {
   std::vector<uint8_t> hash_key;
   auto mock_host = std::make_shared<NiceMock<MockHost>>();
   EXPECT_FALSE(lb_.selectExistingConnection(nullptr, *mock_host, hash_key).has_value());
+}
+
+TEST_F(ZoneAwareLoadBalancerBaseTest, OrcaLocalityPercentagesReflectUtilization) {
+  envoy::extensions::load_balancing_policies::common::v3::LocalityLbConfig locality_config;
+  auto* zone_config = locality_config.mutable_zone_aware_lb_config();
+  zone_config->set_locality_basis(
+      envoy::extensions::load_balancing_policies::common::v3::LocalityLbConfig::ZoneAwareLbConfig::ORCA_UTILIZATION);
+  zone_config->mutable_orca_min_reported_endpoints()->set_value(1);
+
+  TestZoneAwareLoadBalancer lb(priority_set_, stats_, runtime_, random_, 50, locality_config);
+
+  envoy::config::core::v3::Locality zone_a;
+  zone_a.set_zone("zone_a");
+  envoy::config::core::v3::Locality zone_b;
+  zone_b.set_zone("zone_b");
+
+  auto upstream_a1 = makeTestHost(info_, "tcp://10.0.0.1:80", zone_a);
+  auto upstream_a2 = makeTestHost(info_, "tcp://10.0.0.2:80", zone_a);
+  auto upstream_b1 = makeTestHost(info_, "tcp://10.0.1.1:80", zone_b);
+  auto upstream_b2 = makeTestHost(info_, "tcp://10.0.1.2:80", zone_b);
+
+  auto local_a1 = makeTestHost(info_, "tcp://127.0.0.1:1000", zone_a);
+  auto local_a2 = makeTestHost(info_, "tcp://127.0.0.1:1001", zone_a);
+  auto local_b1 = makeTestHost(info_, "tcp://127.0.0.1:2000", zone_b);
+  auto local_b2 = makeTestHost(info_, "tcp://127.0.0.1:2001", zone_b);
+
+  HostsPerLocalitySharedPtr upstream_hosts =
+      makeHostsPerLocality({{upstream_a1, upstream_a2}, {upstream_b1, upstream_b2}});
+  HostsPerLocalitySharedPtr local_hosts =
+      makeHostsPerLocality({{local_a1, local_a2}, {local_b1, local_b2}});
+
+  std::vector<HostSharedPtr> all_hosts = {upstream_a1, upstream_a2, upstream_b1, upstream_b2,
+                                          local_a1,    local_a2,    local_b1,    local_b2};
+
+  for (const auto& host : all_hosts) {
+    host->setLbPolicyData(std::make_unique<ZoneAwareLoadBalancerBase::ZoneAwareHostLbPolicyData>(
+        std::vector<std::string>()));
+  }
+
+  xds::data::orca::v3::OrcaLoadReport high_utilization;
+  high_utilization.set_application_utilization(0.9);
+  xds::data::orca::v3::OrcaLoadReport low_utilization;
+  low_utilization.set_application_utilization(0.1);
+  StreamInfo::MockStreamInfo stream_info;
+
+  for (const auto& host : {upstream_a1, upstream_a2, local_a1, local_a2}) {
+    auto policy_data =
+        host->typedLbPolicyData<ZoneAwareLoadBalancerBase::ZoneAwareHostLbPolicyData>();
+    ASSERT_TRUE(policy_data.has_value());
+    EXPECT_TRUE(policy_data->onOrcaLoadReport(high_utilization, stream_info).ok());
+  }
+  for (const auto& host : {upstream_b1, upstream_b2, local_b1, local_b2}) {
+    auto policy_data =
+        host->typedLbPolicyData<ZoneAwareLoadBalancerBase::ZoneAwareHostLbPolicyData>();
+    ASSERT_TRUE(policy_data.has_value());
+    EXPECT_TRUE(policy_data->onOrcaLoadReport(low_utilization, stream_info).ok());
+  }
+
+  const auto percentages = lb.evaluateLocalityPercentages(*local_hosts, *upstream_hosts);
+  ASSERT_EQ(percentages.size(), 2);
+
+  EXPECT_EQ(percentages[0].second + percentages[1].second, 10000);
+  EXPECT_EQ(percentages[0].first + percentages[1].first, 10000);
+  EXPECT_LT(percentages[0].second, percentages[1].second);
+  EXPECT_LT(percentages[0].first, percentages[1].first);
+  EXPECT_EQ(percentages[0].second, 1000);
+  EXPECT_EQ(percentages[1].second, 9000);
+}
+
+TEST_F(ZoneAwareLoadBalancerBaseTest, OrcaFallsBackWithoutReports) {
+  envoy::extensions::load_balancing_policies::common::v3::LocalityLbConfig locality_config;
+  auto* zone_config = locality_config.mutable_zone_aware_lb_config();
+  zone_config->set_locality_basis(
+      envoy::extensions::load_balancing_policies::common::v3::LocalityLbConfig::ZoneAwareLbConfig::ORCA_UTILIZATION);
+  zone_config->mutable_orca_min_reported_endpoints()->set_value(1);
+
+  TestZoneAwareLoadBalancer lb(priority_set_, stats_, runtime_, random_, 50, locality_config);
+
+  envoy::config::core::v3::Locality zone_a;
+  zone_a.set_zone("zone_a");
+  envoy::config::core::v3::Locality zone_b;
+  zone_b.set_zone("zone_b");
+
+  auto upstream_a = makeTestHost(info_, "tcp://10.0.0.1:80", zone_a);
+  auto upstream_b = makeTestHost(info_, "tcp://10.0.1.1:80", zone_b);
+  auto local_a = makeTestHost(info_, "tcp://127.0.0.1:1000", zone_a);
+  auto local_b = makeTestHost(info_, "tcp://127.0.0.1:2000", zone_b);
+
+  HostsPerLocalitySharedPtr upstream_hosts = makeHostsPerLocality({{upstream_a}, {upstream_b}});
+  HostsPerLocalitySharedPtr local_hosts = makeHostsPerLocality({{local_a}, {local_b}});
+
+  const auto percentages = lb.evaluateLocalityPercentages(*local_hosts, *upstream_hosts);
+  ASSERT_EQ(percentages.size(), 2);
+  EXPECT_EQ(percentages[0].second, 5000);
+  EXPECT_EQ(percentages[1].second, 5000);
+  EXPECT_EQ(percentages[0].first, 5000);
+  EXPECT_EQ(percentages[1].first, 5000);
+}
+
+TEST_F(ZoneAwareLoadBalancerBaseTest, OrcaFallbackEvenSplit) {
+  envoy::extensions::load_balancing_policies::common::v3::LocalityLbConfig locality_config;
+  auto* zone_config = locality_config.mutable_zone_aware_lb_config();
+  zone_config->set_locality_basis(
+      envoy::extensions::load_balancing_policies::common::v3::LocalityLbConfig::ZoneAwareLbConfig::ORCA_UTILIZATION);
+  zone_config->mutable_orca_min_reported_endpoints()->set_value(2);
+  zone_config->set_orca_fallback(
+      envoy::extensions::load_balancing_policies::common::v3::LocalityLbConfig::ZoneAwareLbConfig::EVEN_SPLIT);
+
+  TestZoneAwareLoadBalancer lb(priority_set_, stats_, runtime_, random_, 50, locality_config);
+
+  envoy::config::core::v3::Locality zone_a;
+  zone_a.set_zone("zone_a");
+  envoy::config::core::v3::Locality zone_b;
+  zone_b.set_zone("zone_b");
+  envoy::config::core::v3::Locality zone_c;
+  zone_c.set_zone("zone_c");
+
+  auto upstream_a = makeTestHost(info_, "tcp://10.0.0.1:80", zone_a);
+  auto upstream_b = makeTestHost(info_, "tcp://10.0.1.1:80", zone_b);
+  auto upstream_c = makeTestHost(info_, "tcp://10.0.2.1:80", zone_c);
+
+  auto local_a = makeTestHost(info_, "tcp://127.0.0.1:1000", zone_a);
+  auto local_b = makeTestHost(info_, "tcp://127.0.0.1:2000", zone_b);
+
+  HostsPerLocalitySharedPtr upstream_hosts =
+      makeHostsPerLocality({{upstream_a}, {upstream_b}, {upstream_c}});
+  HostsPerLocalitySharedPtr local_hosts = makeHostsPerLocality({{local_a}, {local_b}});
+
+  const auto percentages = lb.evaluateLocalityPercentages(*local_hosts, *upstream_hosts);
+  ASSERT_EQ(percentages.size(), 3);
+
+  EXPECT_EQ(percentages[0].second + percentages[1].second + percentages[2].second, 10000);
+  EXPECT_EQ(percentages[0].second, 3334);
+  EXPECT_EQ(percentages[1].second, 3333);
+  EXPECT_EQ(percentages[2].second, 3333);
+
+  EXPECT_EQ(percentages[0].first + percentages[1].first + percentages[2].first, 10000);
+  EXPECT_EQ(percentages[0].first, 5000);
+  EXPECT_EQ(percentages[1].first, 5000);
+  EXPECT_EQ(percentages[2].first, 0);
 }
 
 } // namespace

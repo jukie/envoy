@@ -24,7 +24,7 @@ option (udpa.annotations.file_status).package_version_status = ACTIVE;
 message LocalityLbConfig {
   // Configuration for :ref:`zone aware routing
   // <arch_overview_load_balancing_zone_aware_routing>`.
-  // [#next-free-field: 7]
+  // [#next-free-field: 8]
   message ZoneAwareLbConfig {
     // Basis for computing per-locality percentages in zone-aware routing.
     enum LocalityBasis {
@@ -33,6 +33,9 @@ message LocalityLbConfig {
 
       // Use the weights of healthy hosts in each locality.
       HEALTHY_HOSTS_WEIGHT = 1;
+
+      // Use ORCA utilization metrics to compute locality percentages.
+      ORCA_UTILIZATION = 2;
     }
 
     // Configures Envoy to always route requests to the local zone regardless of the
@@ -77,11 +80,84 @@ message LocalityLbConfig {
 
     ForceLocalZone force_local_zone = 5;
 
+    // Strategy used to collapse per-endpoint utilization into a locality-wide signal when using
+    // ORCA_UTILIZATION locality basis.
+    enum OrcaAggregation {
+      // Default value; equivalent to AVERAGE.
+      AGGREGATION_UNSPECIFIED = 0;
+
+      // Average of the reported utilization metrics across endpoints in the locality.
+      AVERAGE = 1;
+
+      // Maximum reported utilization value across endpoints in the locality.
+      MAX = 2;
+    }
+
+    // Fallback behavior when insufficient ORCA data is available when using ORCA_UTILIZATION
+    // locality basis.
+    enum OrcaFallback {
+      // Default value; equivalent to LEGACY_LOCALITY_PERCENTAGE.
+      FALLBACK_UNSPECIFIED = 0;
+
+      // Use the existing zone-aware percentages derived from host counts or weights.
+      LEGACY_LOCALITY_PERCENTAGE = 1;
+
+      // Evenly split traffic across all available localities until ORCA data becomes available.
+      EVEN_SPLIT = 2;
+    }
+
     // Determines how locality percentages are computed:
     // - HEALTHY_HOSTS_NUM: proportional to the count of healthy hosts.
     // - HEALTHY_HOSTS_WEIGHT: proportional to the weights of healthy hosts.
+    // - ORCA_UTILIZATION: proportional to ORCA-reported utilization metrics.
     // Default value is HEALTHY_HOSTS_NUM if unset.
     LocalityBasis locality_basis = 6;
+
+    // List of metric names that should be read from the ORCA reports when computing utilization
+    // with ORCA_UTILIZATION locality basis. If empty, the :ref:`application_utilization
+    // <envoy_v3_api_field_.xds.data.orca.v3.OrcaLoadReport.application_utilization>` metric is
+    // used.
+    repeated string orca_metrics = 7;
+
+    // Aggregation strategy applied to the utilization metrics reported by endpoints in the
+    // locality when using ORCA_UTILIZATION locality basis. Defaults to AVERAGE when unset or set
+    // to AGGREGATION_UNSPECIFIED.
+    OrcaAggregation orca_aggregation = 8;
+
+    // Optional exponential-weighted smoothing window applied to the aggregated utilization
+    // signal when using ORCA_UTILIZATION locality basis. If unset, no additional smoothing is
+    // applied beyond the cadence of incoming ORCA reports.
+    google.protobuf.Duration orca_smoothing_window = 9;
+
+    // Minimum number of endpoints in the locality that must have fresh ORCA data before the
+    // aggregated utilization is considered valid when using ORCA_UTILIZATION locality basis.
+    // When this threshold is not met the configured fallback behavior is used. If unset, the
+    // default requires at least one report.
+    google.protobuf.UInt32Value orca_min_reported_endpoints = 10;
+
+    // Percentage of requests that should be proactively sampled across non-local localities to
+    // keep ORCA utilization data fresh even when the preferred locality has sufficient capacity
+    // when using ORCA_UTILIZATION locality basis. Values are in whole percentages (0-100).
+    // Defaults to 1% when unset.
+    type.v3.Percent orca_probe_residual_percent = 11;
+
+    // Fallback policy used when not enough ORCA data is available for a locality when using
+    // ORCA_UTILIZATION locality basis. Defaults to LEGACY_LOCALITY_PERCENTAGE when unset or
+    // FALLBACK_UNSPECIFIED.
+    OrcaFallback orca_fallback = 12;
+
+    // Threshold that controls when traffic should spill from the local locality to remote
+    // localities based on ORCA-reported utilization when using ORCA_UTILIZATION locality basis.
+    // If the difference between local and remote utilization exceeds this value, Envoy spills
+    // traffic to that remote locality. Once the difference falls within the threshold, routing
+    // returns to local-only. Defaults to 0%.
+    type.v3.Percent orca_spillover_threshold = 13;
+
+    // Interval for background updates to ORCA-based locality routing calculations when using
+    // ORCA_UTILIZATION locality basis. This controls how frequently the locality routing
+    // structures are recalculated based on the latest ORCA utilization data. If unset,
+    // defaults to 1 second.
+    google.protobuf.Duration orca_update_interval = 14;
   }
 
   // Configuration for :ref:`locality weighted load balancing
