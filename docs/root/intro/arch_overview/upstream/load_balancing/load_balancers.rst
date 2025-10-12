@@ -156,3 +156,117 @@ Random
 The random load balancer selects a random available host. The random load balancer generally performs
 better than round robin if no health checking policy is configured. Random selection avoids bias
 towards the host in the set that comes after a failed host.
+
+.. _arch_overview_load_balancing_types_wrr_locality:
+
+Weighted Round Robin Locality
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+The Weighted Round Robin Locality (WrrLocality) load balancer implements a two-tier load balancing
+strategy that combines locality-aware routing with dynamic endpoint weighting based on ORCA
+(Open Request Cost Aggregation) load reports.
+
+**Architecture Overview**
+
+WrrLocality uses a hierarchical selection model:
+
+1. **Locality Selection**: Selects localities in a round-robin fashion, potentially weighted by EDS
+2. **Endpoint Selection**: Within the selected locality, uses a configured endpoint-picking policy
+   (e.g., round-robin, least-request) to choose the specific endpoint
+
+This two-tier approach provides both locality-aware routing for geographic/zone distribution
+and dynamic endpoint selection based on real-time load metrics.
+
+**Dynamic Weight Calculation**
+
+Endpoints receive weights based on ORCA load reports from backend servers. The weight calculation
+follows this general principle:
+
+```
+weight = qps / utilization
+```
+
+Where:
+- **qps**: Queries per second or request rate
+- **utilization**: CPU, memory, or custom application metrics from ORCA reports
+
+The load balancer includes several timing and threshold mechanisms:
+
+- **Blackout Period**: Ignores initial ORCA reports to allow backends to warm up (default: 10 seconds)
+- **Weight Expiration**: Resets weights if ORCA reports stop arriving (default: 180 seconds)
+- **Weight Update Period**: Frequency of weight updates and worker thread refresh (default: 1 second)
+- **Minimum Weight**: Ensures all endpoints receive some minimum traffic (default: 1)
+- **Default Weight**: Hosts without valid ORCA reports receive the average weight of hosts with valid reports
+
+**Configuration**
+
+WrrLocality requires ClientSideWeightedRoundRobin as the endpoint picking policy to provide
+ORCA weight calculation parameters. The following example shows a complete configuration:
+
+.. validated-code-block:: yaml
+  :type-name: envoy.extensions.load_balancing_policies.wrr_locality.v3.WrrLocality
+
+  load_balancing_policy:
+    policies:
+    - typed_extension_config:
+        name: envoy.load_balancing_policies.wrr_locality
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.load_balancing_policies.wrr_locality.v3.WrrLocality
+          endpoint_picking_policy:
+            policies:
+            - typed_extension_config:
+                name: envoy.load_balancing_policies.client_side_weighted_round_robin
+                typed_config:
+                  "@type": type.googleapis.com/envoy.extensions.load_balancing_policies.client_side_weighted_round_robin.v3.ClientSideWeightedRoundRobin
+                  # Timing parameters for weight updates
+                  blackout_period: 10s         # Ignore initial ORCA reports during warm-up
+                  weight_expiration_period: 180s  # Expire weights if no reports received
+                  weight_update_period: 1s     # Frequency of weight updates
+                  # Optional: Custom metrics for utilization calculation
+                  metric_names_for_computing_utilization:
+                  - "named_metrics.custom_backend_load"
+                  # Optional: Error rate penalty factor
+                  error_utilization_penalty: 1.0
+          locality_lb_config:
+            # Optional: Zone-aware routing configuration
+            zone_aware_lb_config:
+              routing_enabled:
+                default_value: 100
+              min_cluster_size: 6
+          slow_start_config:
+            # Optional: Gradual traffic ramping for new endpoints
+            slow_start_window: 30s
+
+**Use Cases**
+
+WrrLocality is particularly useful in scenarios where:
+
+- Geographic or zone-based locality routing is required
+- Backend servers have heterogeneous capacity or load characteristics
+- Real-time load feedback via ORCA is available
+- Both locality distribution and per-endpoint load balancing are important
+
+**Threading Model**
+
+WrrLocality follows Envoy's thread-aware load balancing pattern:
+
+- **Main Thread**: Coordinates weight updates and configuration changes
+- **Worker Threads**: Each maintains local load balancer state for actual request routing
+- **Thread-Safe Updates**: Atomic operations ensure consistent weight updates across threads
+
+**Metrics**
+
+WrrLocality inherits metrics from both locality-based load balancing and the configured
+endpoint-picking policy. No additional metrics are currently specific to the WrrLocality policy.
+
+**Requirements**
+
+- Backends must send ORCA load reports for dynamic weight calculation
+- Endpoint picking policy must be ClientSideWeightedRoundRobin
+- At least one ORCA metric (CPU, memory, or custom) must be available
+
+**Limitations**
+
+- Weight updates have inherent propagation delays between threads (controlled by weight_update_period)
+- Initial weight computation may take time due to blackout periods
+- Endpoints without valid ORCA reports receive the average weight of reporting endpoints
