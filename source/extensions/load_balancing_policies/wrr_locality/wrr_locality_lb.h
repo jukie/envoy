@@ -39,6 +39,10 @@ namespace WrrLocality {
 
 using OrcaLoadReportProto = xds::data::orca::v3::OrcaLoadReport;
 
+// Name of the ClientSideWeightedRoundRobin policy used for ORCA parameter extraction
+inline constexpr absl::string_view kClientSideWrrPolicyName =
+    "envoy.load_balancing_policies.client_side_weighted_round_robin";
+
 // Default configuration values for weight update timing.
 constexpr std::chrono::milliseconds kDefaultBlackoutPeriod{10000};
 constexpr std::chrono::milliseconds kDefaultWeightExpirationPeriod{180000};

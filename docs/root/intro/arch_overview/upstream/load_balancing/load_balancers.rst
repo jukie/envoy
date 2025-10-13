@@ -171,29 +171,30 @@ strategy that combines locality-aware routing with dynamic endpoint weighting ba
 WrrLocality uses a hierarchical selection model:
 
 1. **Locality Selection**: Selects localities in a round-robin fashion, potentially weighted by EDS
-2. **Endpoint Selection**: Within the selected locality, uses a configured endpoint-picking policy
-   (e.g., round-robin, least-request) to choose the specific endpoint
+2. **Endpoint Selection**: Within the selected locality, endpoints are selected using weighted
+   round-robin, where weights are dynamically calculated from ORCA load reports
 
 This two-tier approach provides both locality-aware routing for geographic/zone distribution
-and dynamic endpoint selection based on real-time load metrics.
+and dynamic endpoint weighting based on real-time load metrics.
 
 **Dynamic Weight Calculation**
 
 Endpoints receive weights based on ORCA load reports from backend servers. The weight calculation
-follows this general principle:
+formula is::
 
-```
-weight = qps / utilization
-```
+  weight = qps / (utilization + eps/qps * error_utilization_penalty)
 
 Where:
-- **qps**: Queries per second or request rate
+
+- **qps**: Queries per second (request rate) - all requests count regardless of result
+- **eps**: Errors per second - only failed requests count
 - **utilization**: CPU, memory, or custom application metrics from ORCA reports
+- **error_utilization_penalty**: Multiplier for adjusting weights based on error rate (default: 1.0)
 
 The load balancer includes several timing and threshold mechanisms:
 
 - **Blackout Period**: Ignores initial ORCA reports to allow backends to warm up (default: 10 seconds)
-- **Weight Expiration**: Resets weights if ORCA reports stop arriving (default: 180 seconds)
+- **Weight Expiration**: Resets weights if ORCA reports stop arriving (default: 3 minutes)
 - **Weight Update Period**: Frequency of weight updates and worker thread refresh (default: 1 second)
 - **Minimum Weight**: Ensures all endpoints receive some minimum traffic (default: 1)
 - **Default Weight**: Hosts without valid ORCA reports receive the average weight of hosts with valid reports
@@ -220,7 +221,7 @@ ORCA weight calculation parameters. The following example shows a complete confi
                   "@type": type.googleapis.com/envoy.extensions.load_balancing_policies.client_side_weighted_round_robin.v3.ClientSideWeightedRoundRobin
                   # Timing parameters for weight updates
                   blackout_period: 10s         # Ignore initial ORCA reports during warm-up
-                  weight_expiration_period: 180s  # Expire weights if no reports received
+                  weight_expiration_period: 3m    # Expire weights if no reports received
                   weight_update_period: 1s     # Frequency of weight updates
                   # Optional: Custom metrics for utilization calculation
                   metric_names_for_computing_utilization:
@@ -233,10 +234,7 @@ ORCA weight calculation parameters. The following example shows a complete confi
               routing_enabled:
                 default_value: 100
               min_cluster_size: 6
-          slow_start_config:
-            # Optional: Gradual traffic ramping for new endpoints
-            slow_start_window: 30s
-
+          
 **Use Cases**
 
 WrrLocality is particularly useful in scenarios where:
@@ -270,3 +268,4 @@ endpoint-picking policy. No additional metrics are currently specific to the Wrr
 - Weight updates have inherent propagation delays between threads (controlled by weight_update_period)
 - Initial weight computation may take time due to blackout periods
 - Endpoints without valid ORCA reports receive the average weight of reporting endpoints
+- **ORCA Header Forwarding**: Envoy forwards ORCA response headers/trailers from upstream clusters to downstream clients. If downstream clients are also configured with WrrLocality or ClientSideWeightedRoundRobin, they will perform load balancing based on the upstream weights, potentially causing cascading weight calculations. To prevent this, use the :ref:`header_mutation filter <envoy_v3_api_msg_extensions.filters.http.header_mutation.v3.HeaderMutation>` to remove ORCA headers from responses.

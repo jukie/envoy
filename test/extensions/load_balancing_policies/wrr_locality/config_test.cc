@@ -33,8 +33,7 @@ TEST_F(WrrLocalityConfigTest, BasicTranslation) {
   envoy::extensions::load_balancing_policies::wrr_locality::v3::WrrLocality typed_config;
   typed_config.mutable_locality_lb_config()->mutable_zone_aware_lb_config()->set_fail_traffic_on_panic(
       true);
-  typed_config.mutable_slow_start_config()->mutable_slow_start_window()->set_seconds(5);
-
+  
   auto* policy = typed_config.mutable_endpoint_picking_policy()->add_policies();
   policy->mutable_typed_extension_config()->set_name(
       "envoy.load_balancing_policies.client_side_weighted_round_robin");

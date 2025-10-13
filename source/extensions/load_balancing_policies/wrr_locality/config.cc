@@ -32,8 +32,7 @@ Factory::loadConfig(Server::Configuration::ServerFactoryContext& context,
   // This is required to extract ORCA weight calculation parameters.
   bool has_client_side_wrr = false;
   for (const auto& policy : typed_config.endpoint_picking_policy().policies()) {
-    if (policy.typed_extension_config().name() ==
-        "envoy.load_balancing_policies.client_side_weighted_round_robin") {
+    if (policy.typed_extension_config().name() == kClientSideWrrPolicyName) {
       has_client_side_wrr = true;
       break;
     }

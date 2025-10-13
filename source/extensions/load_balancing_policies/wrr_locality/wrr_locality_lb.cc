@@ -21,9 +21,6 @@ namespace WrrLocality {
 
 namespace {
 
-constexpr absl::string_view kClientSideWrrPolicyName =
-    "envoy.load_balancing_policies.client_side_weighted_round_robin";
-
 envoy::extensions::load_balancing_policies::client_side_weighted_round_robin::v3::
     ClientSideWeightedRoundRobin
 unwrapClientSideConfig(const envoy::config::cluster::v3::LoadBalancingPolicy& policy) {
@@ -53,10 +50,7 @@ WrrLocalityLbConfig::WrrLocalityLbConfig(
   if (lb_config.has_locality_lb_config()) {
     *round_robin_config_.mutable_locality_lb_config() = lb_config.locality_lb_config();
   }
-  if (lb_config.has_slow_start_config()) {
-    *round_robin_config_.mutable_slow_start_config() = lb_config.slow_start_config();
-  }
-
+  
   const envoy::extensions::load_balancing_policies::client_side_weighted_round_robin::v3::
       ClientSideWeightedRoundRobin endpoint_config =
           unwrapClientSideConfig(lb_config.endpoint_picking_policy());

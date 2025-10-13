@@ -24,9 +24,6 @@ message WrrLocality {
   config.cluster.v3.LoadBalancingPolicy endpoint_picking_policy = 1
       [(validate.rules).message = {required: true}];
 
-  // Configuration for slow start mode applied to the endpoint picking policy.
-  envoy.extensions.load_balancing_policies.common.v3.SlowStartConfig slow_start_config = 2;
-
   // Configuration for locality weighting and zone-aware routing.
   envoy.extensions.load_balancing_policies.common.v3.LocalityLbConfig locality_lb_config = 3;
 }
