@@ -11,12 +11,14 @@
 #include "envoy/common/callback.h"
 #include "envoy/common/random_generator.h"
 #include "envoy/config/cluster/v3/cluster.pb.h"
+#include "envoy/config/core/v3/base.pb.h"
 #include "envoy/extensions/load_balancing_policies/least_request/v3/least_request.pb.h"
 #include "envoy/extensions/load_balancing_policies/random/v3/random.pb.h"
 #include "envoy/extensions/load_balancing_policies/round_robin/v3/round_robin.pb.h"
 #include "envoy/runtime/runtime.h"
 #include "envoy/stream_info/stream_info.h"
 #include "envoy/upstream/load_balancer.h"
+#include "envoy/upstream/locality.h"
 #include "envoy/upstream/upstream.h"
 
 #include "source/common/protobuf/utility.h"
@@ -404,11 +406,6 @@ private:
   calculateLocalityPercentages(const HostsPerLocality& local_hosts_per_locality,
                                const HostsPerLocality& upstream_hosts_per_locality);
 
-  /**
-   * Regenerate locality aware routing structures for fast decisions on upstream locality selection.
-   */
-  void regenerateLocalityRoutingStructures();
-
   HostSet& localHostSet() const { return *local_priority_set_->hostSetsPerPriority()[0]; }
 
   static absl::optional<HostsSource::SourceType>
@@ -472,6 +469,17 @@ private:
   Common::CallbackHandlePtr priority_update_cb_;
   Common::CallbackHandlePtr local_priority_set_member_update_cb_handle_;
 
+  /**
+   * Update stored LRS reported fractions from the local priority set.
+   * Called on EDS update when LRS_REPORTED_RATE mode is active.
+   */
+  void updateLrsReportedFractions();
+
+  /**
+   * @return true if LRS fractions are stale (never received or past staleness threshold).
+   */
+  bool isLrsFractionsStale() const;
+
   // Config for zone aware routing.
   const uint64_t min_cluster_size_;
   const absl::optional<uint32_t> force_local_zone_min_size_;
@@ -484,6 +492,22 @@ private:
   const bool locality_weighted_balancing_ : 1;
 
   friend class TestZoneAwareLoadBalancer;
+
+protected:
+  /**
+   * Regenerate locality aware routing structures for fast decisions on upstream locality selection.
+   */
+  void regenerateLocalityRoutingStructures();
+
+  // LRS_REPORTED_RATE mode: stored control-plane-provided traffic fractions per locality.
+  // Values are in basis points (0-10000, where 10000 = 100%).
+  absl::flat_hash_map<envoy::config::core::v3::Locality, uint64_t, LocalityHash, LocalityEqualTo>
+      lrs_reported_fractions_;
+
+  // LRS fractions staleness tracking. Set to true when fractions have never been received
+  // or when they are considered stale. Cleared when valid fractions are extracted from EDS.
+  // Timer-based staleness will be added when the full LRS integration is wired.
+  bool lrs_fractions_stale_{true};
 };
 
 /**
