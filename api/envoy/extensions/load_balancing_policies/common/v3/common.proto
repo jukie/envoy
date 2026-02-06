@@ -24,7 +24,7 @@ option (udpa.annotations.file_status).package_version_status = ACTIVE;
 message LocalityLbConfig {
   // Configuration for :ref:`zone aware routing
   // <arch_overview_load_balancing_zone_aware_routing>`.
-  // [#next-free-field: 7]
+  // [#next-free-field: 8]
   message ZoneAwareLbConfig {
     // Basis for computing per-locality percentages in zone-aware routing.
     enum LocalityBasis {
@@ -33,6 +33,22 @@ message LocalityLbConfig {
 
       // Use the weights of healthy hosts in each locality.
       HEALTHY_HOSTS_WEIGHT = 1;
+
+      // Use traffic distribution fractions provided by the control plane via EDS.
+      // The control plane aggregates LRS data from all Envoy instances to compute
+      // per-locality traffic fractions and pushes them back via the
+      // ``observed_traffic_fraction`` field in ``LocalityLbEndpoints``.
+      //
+      // When this mode is active:
+      //
+      // - ``local_percentage`` in zone-aware routing uses control-plane fractions
+      //   instead of host counts.
+      // - ``upstream_percentage`` continues to use host counts/weights (capacity-based).
+      // - Falls back to ``HEALTHY_HOSTS_NUM`` behavior if fractions are not available or stale.
+      //
+      // This preserves zone-aware routing semantics (local preference, spillover)
+      // while using globally accurate traffic distribution data.
+      LRS_REPORTED_RATE = 2;
     }
 
     // Configures Envoy to always route requests to the local zone regardless of the
@@ -80,8 +96,43 @@ message LocalityLbConfig {
     // Determines how locality percentages are computed:
     // - HEALTHY_HOSTS_NUM: proportional to the count of healthy hosts.
     // - HEALTHY_HOSTS_WEIGHT: proportional to the weights of healthy hosts.
+    // - LRS_REPORTED_RATE: uses control-plane-provided traffic fractions.
     // Default value is HEALTHY_HOSTS_NUM if unset.
     LocalityBasis locality_basis = 6;
+
+    // Configuration for ``LRS_REPORTED_RATE`` locality basis mode.
+    // Only used when ``locality_basis`` is set to ``LRS_REPORTED_RATE``.
+    message LrsRateConfig {
+      // Maximum age of control-plane-provided traffic fractions before they
+      // are considered stale and the load balancer falls back to host counts.
+      // Staleness is measured from the time the fractions were last received
+      // via EDS update.
+      //
+      // Default: 60s. Should be set to 2-3x the expected EDS push interval
+      // to tolerate occasional delayed updates without triggering fallback.
+      google.protobuf.Duration staleness_threshold = 1
+          [(validate.rules).duration = {gte {seconds: 5}, lte {seconds: 600}}];
+
+      // Source of traffic fraction data.
+      enum FractionSource {
+        // Read from ``observed_traffic_fraction`` field in ``LocalityLbEndpoints`` (EDS).
+        // This is the recommended source.
+        EDS_FIELD = 0;
+
+        // Read from locality metadata under the key
+        // ``envoy.lb.observed_traffic_fraction``. This is a transitional mechanism
+        // for control planes that cannot yet produce the new EDS proto field.
+        LOCALITY_METADATA = 1;
+      }
+
+      // Where to read traffic fraction data from.
+      // Default: ``EDS_FIELD``.
+      FractionSource fraction_source = 2;
+    }
+
+    // Configuration for LRS_REPORTED_RATE locality basis mode.
+    // Only used when ``locality_basis`` is set to ``LRS_REPORTED_RATE``.
+    LrsRateConfig lrs_rate_config = 7;
   }
 
   // Configuration for :ref:`locality weighted load balancing

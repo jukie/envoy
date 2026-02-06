@@ -160,7 +160,7 @@ message LedsClusterLocalityConfig {
 // A group of endpoints belonging to a Locality.
 // One can have multiple LocalityLbEndpoints for a locality, but only if
 // they have different priorities.
-// [#next-free-field: 10]
+// [#next-free-field: 11]
 message LocalityLbEndpoints {
   option (udpa.annotations.versioning).previous_message_type =
       "envoy.api.v2.endpoint.LocalityLbEndpoints";
@@ -226,4 +226,26 @@ message LocalityLbEndpoints {
   // to determine where to route the requests.
   // [#not-implemented-hide:]
   google.protobuf.UInt32Value proximity = 6;
+
+  // Control-plane-observed traffic fraction for this locality.
+  //
+  // Represents the fraction of total fleet inbound traffic observed at this
+  // locality, as computed by the control plane from aggregated LRS data.
+  //
+  // Value is in basis points: 0-10000, where 10000 = 100%.
+  // For example, if the control plane observes that zone-a handles 35% of
+  // total inbound traffic, this field would be set to 3500 for zone-a's
+  // locality in the local cluster's EDS response.
+  //
+  // Used by zone-aware routing when ``locality_basis`` is set to ``LRS_REPORTED_RATE``
+  // in ``ZoneAwareLbConfig``. Ignored otherwise.
+  //
+  // If not set, the load balancer falls back to host-count-based
+  // percentage computation for this locality.
+  //
+  // This field is typically set on the **local cluster** (the cluster
+  // representing the Envoy fleet itself), not the upstream service cluster.
+  // Zone-aware routing uses local cluster fractions to determine how much
+  // traffic stays local vs spills to other zones.
+  google.protobuf.UInt32Value observed_traffic_fraction = 10;
 }

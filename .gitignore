@@ -129,3 +129,9 @@ mobile/*.tulsiconf-user
 mobile/tulsi-workspace
 test/extensions/dynamic_modules/test_data/rust/Cargo.lock
 .devcontainer/Dockerfile
+
+# Gas Town (added by gt)
+.runtime/
+.claude/
+.logs/
+.beads/
