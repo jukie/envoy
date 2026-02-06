@@ -30,6 +30,12 @@ static const std::string RuntimeForceLocalZoneMinSize =
     "upstream.zone_routing.force_local_zone.min_size";
 static const std::string RuntimePanicThreshold = "upstream.healthy_panic_threshold";
 
+// LRS_REPORTED_RATE enum value for LocalityBasis. This constant is defined here to allow
+// the C++ logic to compile before the proto enum extension lands (being done in a parallel
+// change). Once the proto change merges, this should be replaced with
+// static_cast<LocalityLbConfig::ZoneAwareLbConfig::LocalityBasis>(LRS_REPORTED_RATE_VALUE).
+constexpr int LRS_REPORTED_RATE_VALUE = 2;
+
 // Returns true if the weights of all the hosts in the HostVector are equal.
 bool hostWeightsAreEqual(const HostVector& hosts) {
   if (hosts.size() <= 1) {
@@ -439,6 +445,11 @@ ZoneAwareLoadBalancerBase::ZoneAwareLoadBalancerBase(
         // If P=0 changes, regenerate locality routing structures. Locality based routing is
         // disabled at all other levels.
         if (local_priority_set_ && priority == 0) {
+          // In LRS_REPORTED_RATE mode, extract fractions from the local cluster's EDS
+          // metadata before regenerating routing structures.
+          if (static_cast<int>(locality_basis_) == LRS_REPORTED_RATE_VALUE) {
+            updateLrsReportedFractions();
+          }
           regenerateLocalityRoutingStructures();
         }
 
@@ -455,6 +466,11 @@ ZoneAwareLoadBalancerBase::ZoneAwareLoadBalancerBase(
     local_priority_set_member_update_cb_handle_ = local_priority_set_->addPriorityUpdateCb(
         [this](uint32_t priority, const HostVector&, const HostVector&) {
           ASSERT(priority == 0);
+          // In LRS_REPORTED_RATE mode, extract fractions from the local cluster's EDS
+          // metadata before regenerating routing structures.
+          if (static_cast<int>(locality_basis_) == LRS_REPORTED_RATE_VALUE) {
+            updateLrsReportedFractions();
+          }
           // If the set of local Envoys changes, regenerate routing for P=0 as it does priority
           // based routing.
           regenerateLocalityRoutingStructures();
@@ -569,6 +585,40 @@ void ZoneAwareLoadBalancerBase::regenerateLocalityRoutingStructures() {
   }
 }
 
+void ZoneAwareLoadBalancerBase::updateLrsReportedFractions() {
+  lrs_reported_fractions_.clear();
+  const auto& local_hosts_per_locality = localHostSet().healthyHostsPerLocality().get();
+  for (const auto& locality_hosts : local_hosts_per_locality) {
+    if (!locality_hosts.empty()) {
+      const auto& locality = locality_hosts[0]->locality();
+      // Look for observed_traffic_fraction in the host's metadata under the
+      // "envoy.lb" filter metadata key. This is a transitional delivery mechanism;
+      // the canonical path will read from the EDS observed_traffic_fraction proto field
+      // once the proto changes land.
+      const auto& metadata = locality_hosts[0]->metadata();
+      if (metadata) {
+        const auto filter_it = metadata->filter_metadata().find("envoy.lb");
+        if (filter_it != metadata->filter_metadata().end()) {
+          const auto& fields = filter_it->second.fields();
+          const auto field_it = fields.find("observed_traffic_fraction");
+          if (field_it != fields.end() &&
+              field_it->second.kind_case() == google::protobuf::Value::kNumberValue) {
+            uint64_t fraction = static_cast<uint64_t>(field_it->second.number_value());
+            if (fraction > 0) {
+              lrs_reported_fractions_[locality] = fraction;
+            }
+          }
+        }
+      }
+    }
+  }
+  if (!lrs_reported_fractions_.empty()) {
+    lrs_fractions_stale_ = false;
+  }
+}
+
+bool ZoneAwareLoadBalancerBase::isLrsFractionsStale() const { return lrs_fractions_stale_; }
+
 void ZoneAwareLoadBalancerBase::resizePerPriorityState() {
   const uint32_t size = priority_set_.hostSetsPerPriority().size();
   while (per_priority_state_.size() < size) {
@@ -658,23 +708,41 @@ ZoneAwareLoadBalancerBase::calculateLocalityPercentages(
       local_weights;
   absl::flat_hash_map<envoy::config::core::v3::Locality, uint64_t, LocalityHash, LocalityEqualTo>
       upstream_weights;
+  const bool is_lrs_reported_rate =
+      static_cast<int>(locality_basis_) == LRS_REPORTED_RATE_VALUE;
+
   uint64_t total_local_weight = 0;
   for (const auto& locality_hosts : local_hosts_per_locality.get()) {
     uint64_t locality_weight = 0;
-    switch (locality_basis_) {
-    // If locality_basis_ is set to HEALTHY_HOSTS_WEIGHT, it uses the host's weight to calculate the
-    // locality percentage.
-    case LocalityLbConfig::ZoneAwareLbConfig::HEALTHY_HOSTS_WEIGHT:
-      for (const auto& host : locality_hosts) {
-        locality_weight += host->weight();
+    if (is_lrs_reported_rate) {
+      // LRS_REPORTED_RATE: use control-plane-provided traffic fractions for local percentages.
+      if (!locality_hosts.empty()) {
+        const auto& locality = locality_hosts[0]->locality();
+        auto it = lrs_reported_fractions_.find(locality);
+        if (it != lrs_reported_fractions_.end() && !isLrsFractionsStale()) {
+          // Use control-plane-provided fraction (stored as basis points, 0-10000).
+          locality_weight = it->second;
+        } else {
+          // Fallback: use host count when no LRS data or data is stale.
+          locality_weight = locality_hosts.size();
+        }
       }
-      break;
-    // By default it uses the number of healthy hosts in the locality.
-    case LocalityLbConfig::ZoneAwareLbConfig::HEALTHY_HOSTS_NUM:
-      locality_weight = locality_hosts.size();
-      break;
-    default:
-      PANIC_DUE_TO_CORRUPT_ENUM;
+    } else {
+      switch (locality_basis_) {
+      // If locality_basis_ is set to HEALTHY_HOSTS_WEIGHT, it uses the host's weight to calculate
+      // the locality percentage.
+      case LocalityLbConfig::ZoneAwareLbConfig::HEALTHY_HOSTS_WEIGHT:
+        for (const auto& host : locality_hosts) {
+          locality_weight += host->weight();
+        }
+        break;
+      // By default it uses the number of healthy hosts in the locality.
+      case LocalityLbConfig::ZoneAwareLbConfig::HEALTHY_HOSTS_NUM:
+        locality_weight = locality_hosts.size();
+        break;
+      default:
+        PANIC_DUE_TO_CORRUPT_ENUM;
+      }
     }
     total_local_weight += locality_weight;
     // If there is no entry in the map for a given locality, it is assumed to have 0 hosts.
@@ -685,20 +753,26 @@ ZoneAwareLoadBalancerBase::calculateLocalityPercentages(
   uint64_t total_upstream_weight = 0;
   for (const auto& locality_hosts : upstream_hosts_per_locality.get()) {
     uint64_t locality_weight = 0;
-    switch (locality_basis_) {
-    // If locality_basis_ is set to HEALTHY_HOSTS_WEIGHT, it uses the host's weight to calculate the
-    // locality percentage.
-    case LocalityLbConfig::ZoneAwareLbConfig::HEALTHY_HOSTS_WEIGHT:
-      for (const auto& host : locality_hosts) {
-        locality_weight += host->weight();
-      }
-      break;
-    // By default it uses the number of healthy hosts in the locality.
-    case LocalityLbConfig::ZoneAwareLbConfig::HEALTHY_HOSTS_NUM:
+    // For LRS_REPORTED_RATE, upstream always uses host counts (capacity-based).
+    // LRS_REPORTED_RATE only affects the local (demand) side.
+    if (is_lrs_reported_rate) {
       locality_weight = locality_hosts.size();
-      break;
-    default:
-      PANIC_DUE_TO_CORRUPT_ENUM;
+    } else {
+      switch (locality_basis_) {
+      // If locality_basis_ is set to HEALTHY_HOSTS_WEIGHT, it uses the host's weight to calculate
+      // the locality percentage.
+      case LocalityLbConfig::ZoneAwareLbConfig::HEALTHY_HOSTS_WEIGHT:
+        for (const auto& host : locality_hosts) {
+          locality_weight += host->weight();
+        }
+        break;
+      // By default it uses the number of healthy hosts in the locality.
+      case LocalityLbConfig::ZoneAwareLbConfig::HEALTHY_HOSTS_NUM:
+        locality_weight = locality_hosts.size();
+        break;
+      default:
+        PANIC_DUE_TO_CORRUPT_ENUM;
+      }
     }
     total_upstream_weight += locality_weight;
     // If there is no entry in the map for a given locality, it is assumed to have 0 hosts.
