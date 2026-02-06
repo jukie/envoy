@@ -602,6 +602,736 @@ TEST_F(ZoneAwareLoadBalancerBaseTest, BaseMethods) {
   EXPECT_FALSE(lb_.selectExistingConnection(nullptr, *mock_host, hash_key).has_value());
 }
 
+using LocalityLbConfig =
+    envoy::extensions::load_balancing_policies::common::v3::LocalityLbConfig;
+
+// Zone-aware load balancer with local priority set support for LRS_REPORTED_RATE testing.
+// Unlike TestZoneAwareLb, this LB's chooseHostOnce goes through hostSourceToUse()
+// to exercise the full zone-aware routing path including LRS fraction handling.
+class TestZoneAwareLbWithLocal : public ZoneAwareLoadBalancerBase {
+public:
+  TestZoneAwareLbWithLocal(const PrioritySet& priority_set,
+                           const PrioritySet* local_priority_set, ClusterLbStats& lb_stats,
+                           Runtime::Loader& runtime, Random::RandomGenerator& random,
+                           uint32_t healthy_panic_threshold,
+                           absl::optional<LocalityLbConfig> locality_config)
+      : ZoneAwareLoadBalancerBase(priority_set, local_priority_set, lb_stats, runtime, random,
+                                  healthy_panic_threshold, locality_config) {}
+
+  HostConstSharedPtr chooseHostOnce(LoadBalancerContext* context) override {
+    const absl::optional<HostsSource> hosts_source = hostSourceToUse(context, random(false));
+    if (!hosts_source) {
+      return nullptr;
+    }
+    const auto& hosts = hostSourceToHosts(*hosts_source);
+    if (hosts.empty()) {
+      return nullptr;
+    }
+    return hosts[random_.random() % hosts.size()];
+  }
+  HostConstSharedPtr peekAnotherHost(LoadBalancerContext*) override { PANIC("not implemented"); }
+
+  // Expose protected members for testing.
+  void setLrsReportedFraction(const envoy::config::core::v3::Locality& locality,
+                              uint64_t fraction) {
+    lrs_reported_fractions_[locality] = fraction;
+  }
+  void clearLrsReportedFractions() { lrs_reported_fractions_.clear(); }
+  void setLrsFractionsStale(bool stale) { lrs_fractions_stale_ = stale; }
+  bool getLrsFractionsStale() const { return lrs_fractions_stale_; }
+  void regenerateRouting() { regenerateLocalityRoutingStructures(); }
+};
+
+// Test fixture for LRS_REPORTED_RATE zone-aware routing tests.
+class LrsReportedRateTest : public Event::TestUsingSimulatedTime, public testing::Test {
+protected:
+  LrsReportedRateTest()
+      : stat_names_(stats_store_.symbolTable()), stats_(stat_names_, *stats_store_.rootScope()) {
+    zone_a_.set_zone("A");
+    zone_b_.set_zone("B");
+    zone_c_.set_zone("C");
+  }
+
+  // Create a locality config with LRS_REPORTED_RATE mode.
+  LocalityLbConfig makeLrsLocalityConfig(uint64_t min_cluster_size = 1) {
+    LocalityLbConfig config;
+    auto* za = config.mutable_zone_aware_lb_config();
+    za->mutable_routing_enabled()->set_value(100);
+    za->mutable_min_cluster_size()->set_value(min_cluster_size);
+    za->set_locality_basis(static_cast<LocalityLbConfig::ZoneAwareLbConfig::LocalityBasis>(2));
+    return config;
+  }
+
+  // Initialize the LB with given upstream and local host configurations.
+  void init(HostVectorSharedPtr upstream_hosts,
+            HostsPerLocalitySharedPtr upstream_hosts_per_locality,
+            HostVectorSharedPtr local_hosts,
+            HostsPerLocalitySharedPtr local_hosts_per_locality,
+            uint64_t min_cluster_size = 1) {
+    local_priority_set_ = std::make_shared<PrioritySetImpl>();
+    local_priority_set_->getOrCreateHostSet(0);
+
+    host_set_.healthy_hosts_ = *upstream_hosts;
+    host_set_.hosts_ = *upstream_hosts;
+    host_set_.healthy_hosts_per_locality_ = upstream_hosts_per_locality;
+
+    LocalityLbConfig config = makeLrsLocalityConfig(min_cluster_size);
+    lb_ = std::make_unique<TestZoneAwareLbWithLocal>(priority_set_, local_priority_set_.get(),
+                                                     stats_, runtime_, random_, 50, config);
+
+    // Update local priority set to trigger regenerateLocalityRoutingStructures.
+    local_priority_set_->updateHosts(
+        0,
+        updateHostsParams(local_hosts, local_hosts_per_locality,
+                          std::make_shared<const HealthyHostVector>(*local_hosts),
+                          local_hosts_per_locality),
+        {}, empty_host_vector_, empty_host_vector_, random_.random(), absl::nullopt);
+  }
+
+  using ZoneAwareLbConfig = LocalityLbConfig::ZoneAwareLbConfig;
+
+  Stats::IsolatedStoreImpl stats_store_;
+  ClusterLbStatNames stat_names_;
+  ClusterLbStats stats_;
+  NiceMock<Runtime::MockLoader> runtime_;
+  NiceMock<Random::MockRandomGenerator> random_;
+  NiceMock<MockPrioritySet> priority_set_;
+  MockHostSet& host_set_ = *priority_set_.getMockHostSet(0);
+  std::shared_ptr<MockClusterInfo> info_{new NiceMock<MockClusterInfo>()};
+  std::shared_ptr<PrioritySetImpl> local_priority_set_;
+  std::unique_ptr<TestZoneAwareLbWithLocal> lb_;
+  HostVector empty_host_vector_;
+
+  envoy::config::core::v3::Locality zone_a_;
+  envoy::config::core::v3::Locality zone_b_;
+  envoy::config::core::v3::Locality zone_c_;
+};
+
+// When LRS_REPORTED_RATE is configured but no fractions have been set,
+// the LB should fall back to host count behavior (same as HEALTHY_HOSTS_NUM).
+TEST_F(LrsReportedRateTest, FallsBackToHostCountWhenNoFractions) {
+  // 3 zones: A(3 local, 3 upstream), B(5 local, 5 upstream), C(2 local, 2 upstream)
+  HostVectorSharedPtr upstream_hosts(
+      new HostVector({makeTestHost(info_, "tcp://127.0.0.1:80", zone_a_),
+                      makeTestHost(info_, "tcp://127.0.0.1:81", zone_a_),
+                      makeTestHost(info_, "tcp://127.0.0.1:82", zone_a_),
+                      makeTestHost(info_, "tcp://127.0.0.1:83", zone_b_),
+                      makeTestHost(info_, "tcp://127.0.0.1:84", zone_b_),
+                      makeTestHost(info_, "tcp://127.0.0.1:85", zone_b_),
+                      makeTestHost(info_, "tcp://127.0.0.1:86", zone_b_),
+                      makeTestHost(info_, "tcp://127.0.0.1:87", zone_b_),
+                      makeTestHost(info_, "tcp://127.0.0.1:88", zone_c_),
+                      makeTestHost(info_, "tcp://127.0.0.1:89", zone_c_)}));
+  HostsPerLocalitySharedPtr upstream_hosts_per_locality = makeHostsPerLocality(
+      {{makeTestHost(info_, "tcp://127.0.0.1:80", zone_a_),
+        makeTestHost(info_, "tcp://127.0.0.1:81", zone_a_),
+        makeTestHost(info_, "tcp://127.0.0.1:82", zone_a_)},
+       {makeTestHost(info_, "tcp://127.0.0.1:83", zone_b_),
+        makeTestHost(info_, "tcp://127.0.0.1:84", zone_b_),
+        makeTestHost(info_, "tcp://127.0.0.1:85", zone_b_),
+        makeTestHost(info_, "tcp://127.0.0.1:86", zone_b_),
+        makeTestHost(info_, "tcp://127.0.0.1:87", zone_b_)},
+       {makeTestHost(info_, "tcp://127.0.0.1:88", zone_c_),
+        makeTestHost(info_, "tcp://127.0.0.1:89", zone_c_)}});
+
+  HostVectorSharedPtr local_hosts(
+      new HostVector({makeTestHost(info_, "tcp://127.0.0.2:80", zone_a_),
+                      makeTestHost(info_, "tcp://127.0.0.2:81", zone_a_),
+                      makeTestHost(info_, "tcp://127.0.0.2:82", zone_a_),
+                      makeTestHost(info_, "tcp://127.0.0.2:83", zone_b_),
+                      makeTestHost(info_, "tcp://127.0.0.2:84", zone_b_),
+                      makeTestHost(info_, "tcp://127.0.0.2:85", zone_b_),
+                      makeTestHost(info_, "tcp://127.0.0.2:86", zone_b_),
+                      makeTestHost(info_, "tcp://127.0.0.2:87", zone_b_),
+                      makeTestHost(info_, "tcp://127.0.0.2:88", zone_c_),
+                      makeTestHost(info_, "tcp://127.0.0.2:89", zone_c_)}));
+  HostsPerLocalitySharedPtr local_hosts_per_locality = makeHostsPerLocality(
+      {{makeTestHost(info_, "tcp://127.0.0.2:80", zone_a_),
+        makeTestHost(info_, "tcp://127.0.0.2:81", zone_a_),
+        makeTestHost(info_, "tcp://127.0.0.2:82", zone_a_)},
+       {makeTestHost(info_, "tcp://127.0.0.2:83", zone_b_),
+        makeTestHost(info_, "tcp://127.0.0.2:84", zone_b_),
+        makeTestHost(info_, "tcp://127.0.0.2:85", zone_b_),
+        makeTestHost(info_, "tcp://127.0.0.2:86", zone_b_),
+        makeTestHost(info_, "tcp://127.0.0.2:87", zone_b_)},
+       {makeTestHost(info_, "tcp://127.0.0.2:88", zone_c_),
+        makeTestHost(info_, "tcp://127.0.0.2:89", zone_c_)}});
+
+  EXPECT_CALL(runtime_.snapshot_, getInteger("upstream.healthy_panic_threshold", 50))
+      .WillRepeatedly(Return(50));
+  EXPECT_CALL(runtime_.snapshot_, featureEnabled("upstream.zone_routing.enabled", 100))
+      .WillRepeatedly(Return(true));
+  EXPECT_CALL(runtime_.snapshot_, getInteger("upstream.zone_routing.min_cluster_size", 1))
+      .WillRepeatedly(Return(1));
+  EXPECT_CALL(runtime_.snapshot_, getInteger("upstream.zone_routing.force_local_zone.min_size", 0))
+      .WillRepeatedly(Return(0));
+
+  init(upstream_hosts, upstream_hosts_per_locality, local_hosts, local_hosts_per_locality);
+
+  // No fractions set, lrs_fractions_stale_ should be true (default).
+  EXPECT_TRUE(lb_->getLrsFractionsStale());
+
+  // With equal host counts (3/5/2 = 30%/50%/20%) in both local and upstream,
+  // local_pct == upstream_pct for zone A, so we should get LocalityDirect.
+  // All traffic should route directly to zone A (index 0).
+  // Random calls: #1 priority hash, #2 host selection within locality.
+  EXPECT_CALL(random_, random()).WillOnce(Return(0)).WillOnce(Return(0));
+  lb_->chooseHost(nullptr);
+  EXPECT_EQ(1U, stats_.lb_zone_routing_all_directly_.value());
+}
+
+// When fractions are set, they should be used for local percentage computation
+// while upstream still uses host counts.
+TEST_F(LrsReportedRateTest, UsesFractionsForLocalPercentage) {
+  // Upstream: zone_a=3, zone_b=5, zone_c=2 (30%/50%/20% by host count)
+  // Local with LRS fractions: zone_a=5000 (50%), zone_b=3500 (35%), zone_c=1500 (15%)
+  // This simulates BGP skew where zone_a gets more traffic than its host count suggests.
+
+  HostVectorSharedPtr upstream_hosts(
+      new HostVector({makeTestHost(info_, "tcp://127.0.0.1:80", zone_a_),
+                      makeTestHost(info_, "tcp://127.0.0.1:81", zone_a_),
+                      makeTestHost(info_, "tcp://127.0.0.1:82", zone_a_),
+                      makeTestHost(info_, "tcp://127.0.0.1:83", zone_b_),
+                      makeTestHost(info_, "tcp://127.0.0.1:84", zone_b_),
+                      makeTestHost(info_, "tcp://127.0.0.1:85", zone_b_),
+                      makeTestHost(info_, "tcp://127.0.0.1:86", zone_b_),
+                      makeTestHost(info_, "tcp://127.0.0.1:87", zone_b_),
+                      makeTestHost(info_, "tcp://127.0.0.1:88", zone_c_),
+                      makeTestHost(info_, "tcp://127.0.0.1:89", zone_c_)}));
+  HostsPerLocalitySharedPtr upstream_hosts_per_locality = makeHostsPerLocality(
+      {{makeTestHost(info_, "tcp://127.0.0.1:80", zone_a_),
+        makeTestHost(info_, "tcp://127.0.0.1:81", zone_a_),
+        makeTestHost(info_, "tcp://127.0.0.1:82", zone_a_)},
+       {makeTestHost(info_, "tcp://127.0.0.1:83", zone_b_),
+        makeTestHost(info_, "tcp://127.0.0.1:84", zone_b_),
+        makeTestHost(info_, "tcp://127.0.0.1:85", zone_b_),
+        makeTestHost(info_, "tcp://127.0.0.1:86", zone_b_),
+        makeTestHost(info_, "tcp://127.0.0.1:87", zone_b_)},
+       {makeTestHost(info_, "tcp://127.0.0.1:88", zone_c_),
+        makeTestHost(info_, "tcp://127.0.0.1:89", zone_c_)}});
+
+  // Local hosts: 3 in zone_a, 5 in zone_b, 2 in zone_c (host counts).
+  HostVectorSharedPtr local_hosts(
+      new HostVector({makeTestHost(info_, "tcp://127.0.0.2:80", zone_a_),
+                      makeTestHost(info_, "tcp://127.0.0.2:81", zone_a_),
+                      makeTestHost(info_, "tcp://127.0.0.2:82", zone_a_),
+                      makeTestHost(info_, "tcp://127.0.0.2:83", zone_b_),
+                      makeTestHost(info_, "tcp://127.0.0.2:84", zone_b_),
+                      makeTestHost(info_, "tcp://127.0.0.2:85", zone_b_),
+                      makeTestHost(info_, "tcp://127.0.0.2:86", zone_b_),
+                      makeTestHost(info_, "tcp://127.0.0.2:87", zone_b_),
+                      makeTestHost(info_, "tcp://127.0.0.2:88", zone_c_),
+                      makeTestHost(info_, "tcp://127.0.0.2:89", zone_c_)}));
+  HostsPerLocalitySharedPtr local_hosts_per_locality = makeHostsPerLocality(
+      {{makeTestHost(info_, "tcp://127.0.0.2:80", zone_a_),
+        makeTestHost(info_, "tcp://127.0.0.2:81", zone_a_),
+        makeTestHost(info_, "tcp://127.0.0.2:82", zone_a_)},
+       {makeTestHost(info_, "tcp://127.0.0.2:83", zone_b_),
+        makeTestHost(info_, "tcp://127.0.0.2:84", zone_b_),
+        makeTestHost(info_, "tcp://127.0.0.2:85", zone_b_),
+        makeTestHost(info_, "tcp://127.0.0.2:86", zone_b_),
+        makeTestHost(info_, "tcp://127.0.0.2:87", zone_b_)},
+       {makeTestHost(info_, "tcp://127.0.0.2:88", zone_c_),
+        makeTestHost(info_, "tcp://127.0.0.2:89", zone_c_)}});
+
+  EXPECT_CALL(runtime_.snapshot_, getInteger("upstream.healthy_panic_threshold", 50))
+      .WillRepeatedly(Return(50));
+  EXPECT_CALL(runtime_.snapshot_, featureEnabled("upstream.zone_routing.enabled", 100))
+      .WillRepeatedly(Return(true));
+  EXPECT_CALL(runtime_.snapshot_, getInteger("upstream.zone_routing.min_cluster_size", 1))
+      .WillRepeatedly(Return(1));
+  EXPECT_CALL(runtime_.snapshot_, getInteger("upstream.zone_routing.force_local_zone.min_size", 0))
+      .WillRepeatedly(Return(0));
+
+  init(upstream_hosts, upstream_hosts_per_locality, local_hosts, local_hosts_per_locality);
+
+  // Set LRS fractions: zone_a=50%, zone_b=35%, zone_c=15%.
+  lb_->setLrsReportedFraction(zone_a_, 5000);
+  lb_->setLrsReportedFraction(zone_b_, 3500);
+  lb_->setLrsReportedFraction(zone_c_, 1500);
+  lb_->setLrsFractionsStale(false);
+
+  // Regenerate routing structures directly (bypasses the callback that clears fractions).
+  lb_->regenerateRouting();
+
+  // With LRS fractions:
+  //   local_percentage: zone_a=50%, zone_b=35%, zone_c=15% (from fractions)
+  //   upstream_percentage: zone_a=30%, zone_b=50%, zone_c=20% (from host counts)
+  //
+  // For zone A: upstream_pct (3000) < local_pct (5000) -> LocalityResidual.
+  // local_percent_to_route = upstream_pct * 10000 / local_pct = 3000 * 10000 / 5000 = 6000
+  // So 60% of traffic should go local, 40% should spill over.
+
+  // When random() returns a value < 6000 (out of 10000), we route locally (zone A = index 0).
+  // Random calls: #1 priority hash, #2 zone routing decision, #3 host selection.
+  EXPECT_CALL(random_, random()).WillOnce(Return(0)).WillOnce(Return(5999)).WillOnce(Return(0));
+  auto response = lb_->chooseHost(nullptr);
+  EXPECT_EQ(1U, stats_.lb_zone_routing_sampled_.value());
+
+  // When random() returns a value >= 6000, we route cross-zone.
+  // Random calls: #1 priority hash, #2 zone routing, #3 residual pick, #4 host selection.
+  EXPECT_CALL(random_, random())
+      .WillOnce(Return(0))
+      .WillOnce(Return(6000))
+      .WillOnce(Return(0))
+      .WillOnce(Return(0));
+  response = lb_->chooseHost(nullptr);
+  EXPECT_EQ(1U, stats_.lb_zone_routing_cross_zone_.value());
+}
+
+// When fractions show skew (zone_a gets 50% traffic but only 30% of hosts),
+// routing transitions from LocalityDirect to LocalityResidual.
+TEST_F(LrsReportedRateTest, SkewedTrafficCausesResidualRouting) {
+  // Equal setup: zone_a=3, zone_b=3 (both local and upstream).
+  // With equal host counts, this would be LocalityDirect.
+  HostVectorSharedPtr upstream_hosts(
+      new HostVector({makeTestHost(info_, "tcp://127.0.0.1:80", zone_a_),
+                      makeTestHost(info_, "tcp://127.0.0.1:81", zone_a_),
+                      makeTestHost(info_, "tcp://127.0.0.1:82", zone_a_),
+                      makeTestHost(info_, "tcp://127.0.0.1:83", zone_b_),
+                      makeTestHost(info_, "tcp://127.0.0.1:84", zone_b_),
+                      makeTestHost(info_, "tcp://127.0.0.1:85", zone_b_)}));
+  HostsPerLocalitySharedPtr upstream_hosts_per_locality = makeHostsPerLocality(
+      {{makeTestHost(info_, "tcp://127.0.0.1:80", zone_a_),
+        makeTestHost(info_, "tcp://127.0.0.1:81", zone_a_),
+        makeTestHost(info_, "tcp://127.0.0.1:82", zone_a_)},
+       {makeTestHost(info_, "tcp://127.0.0.1:83", zone_b_),
+        makeTestHost(info_, "tcp://127.0.0.1:84", zone_b_),
+        makeTestHost(info_, "tcp://127.0.0.1:85", zone_b_)}});
+
+  HostVectorSharedPtr local_hosts(
+      new HostVector({makeTestHost(info_, "tcp://127.0.0.2:80", zone_a_),
+                      makeTestHost(info_, "tcp://127.0.0.2:81", zone_a_),
+                      makeTestHost(info_, "tcp://127.0.0.2:82", zone_a_),
+                      makeTestHost(info_, "tcp://127.0.0.2:83", zone_b_),
+                      makeTestHost(info_, "tcp://127.0.0.2:84", zone_b_),
+                      makeTestHost(info_, "tcp://127.0.0.2:85", zone_b_)}));
+  HostsPerLocalitySharedPtr local_hosts_per_locality = makeHostsPerLocality(
+      {{makeTestHost(info_, "tcp://127.0.0.2:80", zone_a_),
+        makeTestHost(info_, "tcp://127.0.0.2:81", zone_a_),
+        makeTestHost(info_, "tcp://127.0.0.2:82", zone_a_)},
+       {makeTestHost(info_, "tcp://127.0.0.2:83", zone_b_),
+        makeTestHost(info_, "tcp://127.0.0.2:84", zone_b_),
+        makeTestHost(info_, "tcp://127.0.0.2:85", zone_b_)}});
+
+  EXPECT_CALL(runtime_.snapshot_, getInteger("upstream.healthy_panic_threshold", 50))
+      .WillRepeatedly(Return(50));
+  EXPECT_CALL(runtime_.snapshot_, featureEnabled("upstream.zone_routing.enabled", 100))
+      .WillRepeatedly(Return(true));
+  EXPECT_CALL(runtime_.snapshot_, getInteger("upstream.zone_routing.min_cluster_size", 1))
+      .WillRepeatedly(Return(1));
+  EXPECT_CALL(runtime_.snapshot_, getInteger("upstream.zone_routing.force_local_zone.min_size", 0))
+      .WillRepeatedly(Return(0));
+
+  init(upstream_hosts, upstream_hosts_per_locality, local_hosts, local_hosts_per_locality);
+
+  // Without fractions (stale), should be LocalityDirect since local=upstream percentages.
+  // Random calls: #1 priority hash, #2 host selection.
+  EXPECT_CALL(random_, random()).WillOnce(Return(0)).WillOnce(Return(0));
+  lb_->chooseHost(nullptr);
+  EXPECT_EQ(1U, stats_.lb_zone_routing_all_directly_.value());
+
+  // Now set skewed fractions: zone_a=70%, zone_b=30%.
+  lb_->setLrsReportedFraction(zone_a_, 7000);
+  lb_->setLrsReportedFraction(zone_b_, 3000);
+  lb_->setLrsFractionsStale(false);
+
+  // Regenerate routing structures directly with the new fractions.
+  lb_->regenerateRouting();
+
+  // Now local_pct: zone_a=70%, zone_b=30%. upstream_pct: zone_a=50%, zone_b=50%.
+  // zone_a: upstream_pct (5000) < local_pct (7000) -> LocalityResidual.
+  // local_percent_to_route = 5000 * 10000 / 7000 = 7142
+
+  // Route locally when random < 7142.
+  // Random calls: #1 priority hash, #2 zone routing, #3 host selection.
+  EXPECT_CALL(random_, random()).WillOnce(Return(0)).WillOnce(Return(7141)).WillOnce(Return(0));
+  lb_->chooseHost(nullptr);
+  EXPECT_EQ(1U, stats_.lb_zone_routing_sampled_.value());
+
+  // Route cross-zone when random >= 7142.
+  // Random calls: #1 priority hash, #2 zone routing, #3 residual pick, #4 host selection.
+  EXPECT_CALL(random_, random())
+      .WillOnce(Return(0))
+      .WillOnce(Return(7142))
+      .WillOnce(Return(0))
+      .WillOnce(Return(0));
+  lb_->chooseHost(nullptr);
+  EXPECT_EQ(1U, stats_.lb_zone_routing_cross_zone_.value());
+}
+
+// When fractions become stale, the LB should fall back to host count behavior.
+TEST_F(LrsReportedRateTest, StaleFractionsFallBack) {
+  // 2 zones: A and B, equal hosts.
+  HostVectorSharedPtr upstream_hosts(
+      new HostVector({makeTestHost(info_, "tcp://127.0.0.1:80", zone_a_),
+                      makeTestHost(info_, "tcp://127.0.0.1:81", zone_a_),
+                      makeTestHost(info_, "tcp://127.0.0.1:82", zone_b_),
+                      makeTestHost(info_, "tcp://127.0.0.1:83", zone_b_)}));
+  HostsPerLocalitySharedPtr upstream_hosts_per_locality = makeHostsPerLocality(
+      {{makeTestHost(info_, "tcp://127.0.0.1:80", zone_a_),
+        makeTestHost(info_, "tcp://127.0.0.1:81", zone_a_)},
+       {makeTestHost(info_, "tcp://127.0.0.1:82", zone_b_),
+        makeTestHost(info_, "tcp://127.0.0.1:83", zone_b_)}});
+
+  HostVectorSharedPtr local_hosts(
+      new HostVector({makeTestHost(info_, "tcp://127.0.0.2:80", zone_a_),
+                      makeTestHost(info_, "tcp://127.0.0.2:81", zone_a_),
+                      makeTestHost(info_, "tcp://127.0.0.2:82", zone_b_),
+                      makeTestHost(info_, "tcp://127.0.0.2:83", zone_b_)}));
+  HostsPerLocalitySharedPtr local_hosts_per_locality = makeHostsPerLocality(
+      {{makeTestHost(info_, "tcp://127.0.0.2:80", zone_a_),
+        makeTestHost(info_, "tcp://127.0.0.2:81", zone_a_)},
+       {makeTestHost(info_, "tcp://127.0.0.2:82", zone_b_),
+        makeTestHost(info_, "tcp://127.0.0.2:83", zone_b_)}});
+
+  EXPECT_CALL(runtime_.snapshot_, getInteger("upstream.healthy_panic_threshold", 50))
+      .WillRepeatedly(Return(50));
+  EXPECT_CALL(runtime_.snapshot_, featureEnabled("upstream.zone_routing.enabled", 100))
+      .WillRepeatedly(Return(true));
+  EXPECT_CALL(runtime_.snapshot_, getInteger("upstream.zone_routing.min_cluster_size", 1))
+      .WillRepeatedly(Return(1));
+  EXPECT_CALL(runtime_.snapshot_, getInteger("upstream.zone_routing.force_local_zone.min_size", 0))
+      .WillRepeatedly(Return(0));
+
+  init(upstream_hosts, upstream_hosts_per_locality, local_hosts, local_hosts_per_locality);
+
+  // Set fractions with skew: zone_a=80%, zone_b=20%.
+  lb_->setLrsReportedFraction(zone_a_, 8000);
+  lb_->setLrsReportedFraction(zone_b_, 2000);
+  lb_->setLrsFractionsStale(false);
+
+  lb_->regenerateRouting();
+
+  // With fractions, should be LocalityResidual (upstream 50% < local 80% for zone A).
+  // local_percent_to_route = 5000 * 10000 / 8000 = 6250
+  // Verify cross-zone routing is triggered.
+  // Random calls: #1 priority hash, #2 zone routing, #3 residual pick, #4 host selection.
+  EXPECT_CALL(random_, random())
+      .WillOnce(Return(0))
+      .WillOnce(Return(9999))
+      .WillOnce(Return(0))
+      .WillOnce(Return(0));
+  lb_->chooseHost(nullptr);
+  EXPECT_EQ(1U, stats_.lb_zone_routing_cross_zone_.value());
+
+  // Now mark fractions as stale.
+  lb_->setLrsFractionsStale(true);
+
+  lb_->regenerateRouting();
+
+  // With stale fractions, falls back to host count (equal: 2/2 = 50%/50%).
+  // local_pct == upstream_pct -> LocalityDirect. All traffic goes to zone A.
+  // Random calls: #1 priority hash, #2 host selection.
+  EXPECT_CALL(random_, random()).WillOnce(Return(0)).WillOnce(Return(0));
+  lb_->chooseHost(nullptr);
+  EXPECT_GE(stats_.lb_zone_routing_all_directly_.value(), 1U);
+}
+
+// Upstream always uses host counts regardless of LRS_REPORTED_RATE mode.
+TEST_F(LrsReportedRateTest, UpstreamUsesHostCountsRegardless) {
+  // zone_a: 2 upstream, 2 local. zone_b: 2 upstream, 2 local.
+  // LRS fractions: zone_a=80%, zone_b=20%.
+  // Upstream should still compute 50%/50% from host counts.
+  HostVectorSharedPtr upstream_hosts(
+      new HostVector({makeTestHost(info_, "tcp://127.0.0.1:80", zone_a_),
+                      makeTestHost(info_, "tcp://127.0.0.1:81", zone_a_),
+                      makeTestHost(info_, "tcp://127.0.0.1:82", zone_b_),
+                      makeTestHost(info_, "tcp://127.0.0.1:83", zone_b_)}));
+  HostsPerLocalitySharedPtr upstream_hosts_per_locality = makeHostsPerLocality(
+      {{makeTestHost(info_, "tcp://127.0.0.1:80", zone_a_),
+        makeTestHost(info_, "tcp://127.0.0.1:81", zone_a_)},
+       {makeTestHost(info_, "tcp://127.0.0.1:82", zone_b_),
+        makeTestHost(info_, "tcp://127.0.0.1:83", zone_b_)}});
+
+  HostVectorSharedPtr local_hosts(
+      new HostVector({makeTestHost(info_, "tcp://127.0.0.2:80", zone_a_),
+                      makeTestHost(info_, "tcp://127.0.0.2:81", zone_a_),
+                      makeTestHost(info_, "tcp://127.0.0.2:82", zone_b_),
+                      makeTestHost(info_, "tcp://127.0.0.2:83", zone_b_)}));
+  HostsPerLocalitySharedPtr local_hosts_per_locality = makeHostsPerLocality(
+      {{makeTestHost(info_, "tcp://127.0.0.2:80", zone_a_),
+        makeTestHost(info_, "tcp://127.0.0.2:81", zone_a_)},
+       {makeTestHost(info_, "tcp://127.0.0.2:82", zone_b_),
+        makeTestHost(info_, "tcp://127.0.0.2:83", zone_b_)}});
+
+  EXPECT_CALL(runtime_.snapshot_, getInteger("upstream.healthy_panic_threshold", 50))
+      .WillRepeatedly(Return(50));
+  EXPECT_CALL(runtime_.snapshot_, featureEnabled("upstream.zone_routing.enabled", 100))
+      .WillRepeatedly(Return(true));
+  EXPECT_CALL(runtime_.snapshot_, getInteger("upstream.zone_routing.min_cluster_size", 1))
+      .WillRepeatedly(Return(1));
+  EXPECT_CALL(runtime_.snapshot_, getInteger("upstream.zone_routing.force_local_zone.min_size", 0))
+      .WillRepeatedly(Return(0));
+
+  init(upstream_hosts, upstream_hosts_per_locality, local_hosts, local_hosts_per_locality);
+
+  // Set skewed fractions for local side.
+  lb_->setLrsReportedFraction(zone_a_, 8000);
+  lb_->setLrsReportedFraction(zone_b_, 2000);
+  lb_->setLrsFractionsStale(false);
+
+  lb_->regenerateRouting();
+
+  // local_pct: zone_a=80%, zone_b=20%. upstream_pct: zone_a=50%, zone_b=50% (host counts).
+  // zone_a: upstream (50%) < local (80%) -> LocalityResidual.
+  // local_percent_to_route = 5000 * 10000 / 8000 = 6250.
+  // This proves upstream uses host counts (50%) not fractions (80%).
+  // Random calls: #1 priority hash, #2 zone routing, #3 host selection.
+  EXPECT_CALL(random_, random()).WillOnce(Return(0)).WillOnce(Return(6249)).WillOnce(Return(0));
+  lb_->chooseHost(nullptr);
+  EXPECT_EQ(1U, stats_.lb_zone_routing_sampled_.value());
+
+  // Random calls: #1 priority hash, #2 zone routing, #3 residual pick, #4 host selection.
+  EXPECT_CALL(random_, random())
+      .WillOnce(Return(0))
+      .WillOnce(Return(6250))
+      .WillOnce(Return(0))
+      .WillOnce(Return(0));
+  lb_->chooseHost(nullptr);
+  EXPECT_EQ(1U, stats_.lb_zone_routing_cross_zone_.value());
+}
+
+// When fractions are set for only some localities, localities without fractions
+// should fall back to host count.
+TEST_F(LrsReportedRateTest, PartialFractionsUseMixedSources) {
+  // 3 zones. Fractions set for zone_a and zone_b, but not zone_c.
+  HostVectorSharedPtr upstream_hosts(
+      new HostVector({makeTestHost(info_, "tcp://127.0.0.1:80", zone_a_),
+                      makeTestHost(info_, "tcp://127.0.0.1:81", zone_a_),
+                      makeTestHost(info_, "tcp://127.0.0.1:82", zone_b_),
+                      makeTestHost(info_, "tcp://127.0.0.1:83", zone_b_),
+                      makeTestHost(info_, "tcp://127.0.0.1:84", zone_c_),
+                      makeTestHost(info_, "tcp://127.0.0.1:85", zone_c_)}));
+  HostsPerLocalitySharedPtr upstream_hosts_per_locality = makeHostsPerLocality(
+      {{makeTestHost(info_, "tcp://127.0.0.1:80", zone_a_),
+        makeTestHost(info_, "tcp://127.0.0.1:81", zone_a_)},
+       {makeTestHost(info_, "tcp://127.0.0.1:82", zone_b_),
+        makeTestHost(info_, "tcp://127.0.0.1:83", zone_b_)},
+       {makeTestHost(info_, "tcp://127.0.0.1:84", zone_c_),
+        makeTestHost(info_, "tcp://127.0.0.1:85", zone_c_)}});
+
+  HostVectorSharedPtr local_hosts(
+      new HostVector({makeTestHost(info_, "tcp://127.0.0.2:80", zone_a_),
+                      makeTestHost(info_, "tcp://127.0.0.2:81", zone_a_),
+                      makeTestHost(info_, "tcp://127.0.0.2:82", zone_b_),
+                      makeTestHost(info_, "tcp://127.0.0.2:83", zone_b_),
+                      makeTestHost(info_, "tcp://127.0.0.2:84", zone_c_),
+                      makeTestHost(info_, "tcp://127.0.0.2:85", zone_c_)}));
+  HostsPerLocalitySharedPtr local_hosts_per_locality = makeHostsPerLocality(
+      {{makeTestHost(info_, "tcp://127.0.0.2:80", zone_a_),
+        makeTestHost(info_, "tcp://127.0.0.2:81", zone_a_)},
+       {makeTestHost(info_, "tcp://127.0.0.2:82", zone_b_),
+        makeTestHost(info_, "tcp://127.0.0.2:83", zone_b_)},
+       {makeTestHost(info_, "tcp://127.0.0.2:84", zone_c_),
+        makeTestHost(info_, "tcp://127.0.0.2:85", zone_c_)}});
+
+  EXPECT_CALL(runtime_.snapshot_, getInteger("upstream.healthy_panic_threshold", 50))
+      .WillRepeatedly(Return(50));
+  EXPECT_CALL(runtime_.snapshot_, featureEnabled("upstream.zone_routing.enabled", 100))
+      .WillRepeatedly(Return(true));
+  EXPECT_CALL(runtime_.snapshot_, getInteger("upstream.zone_routing.min_cluster_size", 1))
+      .WillRepeatedly(Return(1));
+  EXPECT_CALL(runtime_.snapshot_, getInteger("upstream.zone_routing.force_local_zone.min_size", 0))
+      .WillRepeatedly(Return(0));
+
+  init(upstream_hosts, upstream_hosts_per_locality, local_hosts, local_hosts_per_locality);
+
+  // Set fractions for zone_a and zone_b only. zone_c gets host count (2).
+  // zone_a = 6000 (60%), zone_b = 1000 (10%). zone_c = host count 2.
+  // Total local weight = 6000 + 1000 + 2 = 7002.
+  // local_pct: zone_a = 6000/7002 * 10000 ≈ 8568, zone_b ≈ 1428, zone_c ≈ 2.
+  lb_->setLrsReportedFraction(zone_a_, 6000);
+  lb_->setLrsReportedFraction(zone_b_, 1000);
+  lb_->setLrsFractionsStale(false);
+
+  lb_->regenerateRouting();
+
+  // zone_a: upstream_pct ≈ 33% (3333), local_pct ≈ 85.68% (8568).
+  // upstream < local -> LocalityResidual. This means fractions were used for zone_a.
+  // Cross-zone routing should occur for some random values.
+  // Random calls: #1 priority hash, #2 zone routing, #3 residual pick, #4 host selection.
+  EXPECT_CALL(random_, random())
+      .WillOnce(Return(0))
+      .WillOnce(Return(9999))
+      .WillOnce(Return(0))
+      .WillOnce(Return(0));
+  lb_->chooseHost(nullptr);
+  EXPECT_EQ(1U, stats_.lb_zone_routing_cross_zone_.value());
+}
+
+// Fractions update on EDS update via metadata.
+TEST_F(LrsReportedRateTest, FractionsUpdateOnEds) {
+  // 2 zones, equal hosts.
+  HostVectorSharedPtr upstream_hosts(
+      new HostVector({makeTestHost(info_, "tcp://127.0.0.1:80", zone_a_),
+                      makeTestHost(info_, "tcp://127.0.0.1:81", zone_a_),
+                      makeTestHost(info_, "tcp://127.0.0.1:82", zone_b_),
+                      makeTestHost(info_, "tcp://127.0.0.1:83", zone_b_)}));
+  HostsPerLocalitySharedPtr upstream_hosts_per_locality = makeHostsPerLocality(
+      {{makeTestHost(info_, "tcp://127.0.0.1:80", zone_a_),
+        makeTestHost(info_, "tcp://127.0.0.1:81", zone_a_)},
+       {makeTestHost(info_, "tcp://127.0.0.1:82", zone_b_),
+        makeTestHost(info_, "tcp://127.0.0.1:83", zone_b_)}});
+
+  // Create local hosts with metadata containing observed_traffic_fraction.
+  envoy::config::core::v3::Metadata metadata_a;
+  auto* lb_fields_a =
+      (*metadata_a.mutable_filter_metadata())["envoy.lb"].mutable_fields();
+  (*lb_fields_a)["observed_traffic_fraction"].set_number_value(7000); // 70%
+
+  envoy::config::core::v3::Metadata metadata_b;
+  auto* lb_fields_b =
+      (*metadata_b.mutable_filter_metadata())["envoy.lb"].mutable_fields();
+  (*lb_fields_b)["observed_traffic_fraction"].set_number_value(3000); // 30%
+
+  HostVectorSharedPtr local_hosts(
+      new HostVector({makeTestHost(info_, "tcp://127.0.0.2:80", metadata_a, zone_a_),
+                      makeTestHost(info_, "tcp://127.0.0.2:81", metadata_a, zone_a_),
+                      makeTestHost(info_, "tcp://127.0.0.2:82", metadata_b, zone_b_),
+                      makeTestHost(info_, "tcp://127.0.0.2:83", metadata_b, zone_b_)}));
+  HostsPerLocalitySharedPtr local_hosts_per_locality = makeHostsPerLocality(
+      {{makeTestHost(info_, "tcp://127.0.0.2:80", metadata_a, zone_a_),
+        makeTestHost(info_, "tcp://127.0.0.2:81", metadata_a, zone_a_)},
+       {makeTestHost(info_, "tcp://127.0.0.2:82", metadata_b, zone_b_),
+        makeTestHost(info_, "tcp://127.0.0.2:83", metadata_b, zone_b_)}});
+
+  EXPECT_CALL(runtime_.snapshot_, getInteger("upstream.healthy_panic_threshold", 50))
+      .WillRepeatedly(Return(50));
+  EXPECT_CALL(runtime_.snapshot_, featureEnabled("upstream.zone_routing.enabled", 100))
+      .WillRepeatedly(Return(true));
+  EXPECT_CALL(runtime_.snapshot_, getInteger("upstream.zone_routing.min_cluster_size", 1))
+      .WillRepeatedly(Return(1));
+  EXPECT_CALL(runtime_.snapshot_, getInteger("upstream.zone_routing.force_local_zone.min_size", 0))
+      .WillRepeatedly(Return(0));
+
+  init(upstream_hosts, upstream_hosts_per_locality, local_hosts, local_hosts_per_locality);
+
+  // The metadata-based fractions should be extracted automatically via the local priority
+  // set callback which calls updateLrsReportedFractions().
+  // zone_a: local_pct = 70%, upstream_pct = 50%. upstream < local -> LocalityResidual.
+  EXPECT_FALSE(lb_->getLrsFractionsStale());
+
+  // Verify cross-zone routing occurs (proves fractions were extracted from metadata).
+  // Random calls: #1 priority hash, #2 zone routing, #3 residual pick, #4 host selection.
+  EXPECT_CALL(random_, random())
+      .WillOnce(Return(0))
+      .WillOnce(Return(9999))
+      .WillOnce(Return(0))
+      .WillOnce(Return(0));
+  lb_->chooseHost(nullptr);
+  EXPECT_EQ(1U, stats_.lb_zone_routing_cross_zone_.value());
+}
+
+// Spillover distributes correctly to zones with residual capacity.
+TEST_F(LrsReportedRateTest, SpilloverDistribution) {
+  // 3 zones with different capacities.
+  // Upstream: zone_a=3 (30%), zone_b=5 (50%), zone_c=2 (20%).
+  // LRS fractions: zone_a=50%, zone_b=35%, zone_c=15%.
+  HostVectorSharedPtr upstream_hosts(
+      new HostVector({makeTestHost(info_, "tcp://127.0.0.1:80", zone_a_),
+                      makeTestHost(info_, "tcp://127.0.0.1:81", zone_a_),
+                      makeTestHost(info_, "tcp://127.0.0.1:82", zone_a_),
+                      makeTestHost(info_, "tcp://127.0.0.1:83", zone_b_),
+                      makeTestHost(info_, "tcp://127.0.0.1:84", zone_b_),
+                      makeTestHost(info_, "tcp://127.0.0.1:85", zone_b_),
+                      makeTestHost(info_, "tcp://127.0.0.1:86", zone_b_),
+                      makeTestHost(info_, "tcp://127.0.0.1:87", zone_b_),
+                      makeTestHost(info_, "tcp://127.0.0.1:88", zone_c_),
+                      makeTestHost(info_, "tcp://127.0.0.1:89", zone_c_)}));
+  HostsPerLocalitySharedPtr upstream_hosts_per_locality = makeHostsPerLocality(
+      {{makeTestHost(info_, "tcp://127.0.0.1:80", zone_a_),
+        makeTestHost(info_, "tcp://127.0.0.1:81", zone_a_),
+        makeTestHost(info_, "tcp://127.0.0.1:82", zone_a_)},
+       {makeTestHost(info_, "tcp://127.0.0.1:83", zone_b_),
+        makeTestHost(info_, "tcp://127.0.0.1:84", zone_b_),
+        makeTestHost(info_, "tcp://127.0.0.1:85", zone_b_),
+        makeTestHost(info_, "tcp://127.0.0.1:86", zone_b_),
+        makeTestHost(info_, "tcp://127.0.0.1:87", zone_b_)},
+       {makeTestHost(info_, "tcp://127.0.0.1:88", zone_c_),
+        makeTestHost(info_, "tcp://127.0.0.1:89", zone_c_)}});
+
+  HostVectorSharedPtr local_hosts(
+      new HostVector({makeTestHost(info_, "tcp://127.0.0.2:80", zone_a_),
+                      makeTestHost(info_, "tcp://127.0.0.2:81", zone_a_),
+                      makeTestHost(info_, "tcp://127.0.0.2:82", zone_a_),
+                      makeTestHost(info_, "tcp://127.0.0.2:83", zone_b_),
+                      makeTestHost(info_, "tcp://127.0.0.2:84", zone_b_),
+                      makeTestHost(info_, "tcp://127.0.0.2:85", zone_b_),
+                      makeTestHost(info_, "tcp://127.0.0.2:86", zone_b_),
+                      makeTestHost(info_, "tcp://127.0.0.2:87", zone_b_),
+                      makeTestHost(info_, "tcp://127.0.0.2:88", zone_c_),
+                      makeTestHost(info_, "tcp://127.0.0.2:89", zone_c_)}));
+  HostsPerLocalitySharedPtr local_hosts_per_locality = makeHostsPerLocality(
+      {{makeTestHost(info_, "tcp://127.0.0.2:80", zone_a_),
+        makeTestHost(info_, "tcp://127.0.0.2:81", zone_a_),
+        makeTestHost(info_, "tcp://127.0.0.2:82", zone_a_)},
+       {makeTestHost(info_, "tcp://127.0.0.2:83", zone_b_),
+        makeTestHost(info_, "tcp://127.0.0.2:84", zone_b_),
+        makeTestHost(info_, "tcp://127.0.0.2:85", zone_b_),
+        makeTestHost(info_, "tcp://127.0.0.2:86", zone_b_),
+        makeTestHost(info_, "tcp://127.0.0.2:87", zone_b_)},
+       {makeTestHost(info_, "tcp://127.0.0.2:88", zone_c_),
+        makeTestHost(info_, "tcp://127.0.0.2:89", zone_c_)}});
+
+  EXPECT_CALL(runtime_.snapshot_, getInteger("upstream.healthy_panic_threshold", 50))
+      .WillRepeatedly(Return(50));
+  EXPECT_CALL(runtime_.snapshot_, featureEnabled("upstream.zone_routing.enabled", 100))
+      .WillRepeatedly(Return(true));
+  EXPECT_CALL(runtime_.snapshot_, getInteger("upstream.zone_routing.min_cluster_size", 1))
+      .WillRepeatedly(Return(1));
+  EXPECT_CALL(runtime_.snapshot_, getInteger("upstream.zone_routing.force_local_zone.min_size", 0))
+      .WillRepeatedly(Return(0));
+
+  init(upstream_hosts, upstream_hosts_per_locality, local_hosts, local_hosts_per_locality);
+
+  lb_->setLrsReportedFraction(zone_a_, 5000);
+  lb_->setLrsReportedFraction(zone_b_, 3500);
+  lb_->setLrsReportedFraction(zone_c_, 1500);
+  lb_->setLrsFractionsStale(false);
+
+  lb_->regenerateRouting();
+
+  // local_pct: zone_a=50%, zone_b=35%, zone_c=15%.
+  // upstream_pct: zone_a=30%, zone_b=50%, zone_c=20%.
+  // zone_a: upstream(30%) < local(50%) -> Residual.
+  // local_percent_to_route = 3000 * 10000 / 5000 = 6000.
+  //
+  // Residual capacity:
+  //   zone_a (local, index 0): no residual (already routed what we can)
+  //   zone_b (index 1): upstream(5000) - local(3500) = 1500
+  //   zone_c (index 2): upstream(2000) - local(1500) = 500
+  // Total residual: 2000. zone_b gets 1500/2000=75%, zone_c gets 500/2000=25%.
+
+  // Cross-zone traffic with threshold 0 -> should land in zone_b (index 1, residual [0,1500))
+  // Random calls: #1 priority hash, #2 zone routing, #3 residual pick, #4 host selection.
+  EXPECT_CALL(random_, random())
+      .WillOnce(Return(0))
+      .WillOnce(Return(6001))
+      .WillOnce(Return(0))
+      .WillOnce(Return(0));
+  auto host = lb_->chooseHost(nullptr);
+  EXPECT_EQ(1U, stats_.lb_zone_routing_cross_zone_.value());
+
+  // Cross-zone traffic with threshold 1499 -> still zone_b
+  EXPECT_CALL(random_, random())
+      .WillOnce(Return(0))
+      .WillOnce(Return(6001))
+      .WillOnce(Return(1499))
+      .WillOnce(Return(0));
+  host = lb_->chooseHost(nullptr);
+  EXPECT_EQ(2U, stats_.lb_zone_routing_cross_zone_.value());
+
+  // Cross-zone traffic with threshold 1500 -> zone_c (index 2, residual [1500,2000))
+  EXPECT_CALL(random_, random())
+      .WillOnce(Return(0))
+      .WillOnce(Return(6001))
+      .WillOnce(Return(1500))
+      .WillOnce(Return(0));
+  host = lb_->chooseHost(nullptr);
+  EXPECT_EQ(3U, stats_.lb_zone_routing_cross_zone_.value());
+}
+
 } // namespace
 } // namespace Upstream
 } // namespace Envoy
