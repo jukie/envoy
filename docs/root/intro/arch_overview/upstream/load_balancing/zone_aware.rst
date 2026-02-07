@@ -48,3 +48,85 @@ with regard to percentage relations in the local zone between originating and up
 
 Note that when using multiple priorities, zone aware routing is currently only supported for P=0.
 
+.. _arch_overview_load_balancing_zone_aware_routing_locality_basis:
+
+Locality basis
+^^^^^^^^^^^^^^
+
+By default, zone aware routing computes per-zone percentages using the number of healthy hosts
+in each zone (``HEALTHY_HOSTS_NUM``). The
+:ref:`locality_basis <envoy_v3_api_field_extensions.load_balancing_policies.common.v3.LocalityLbConfig.ZoneAwareLbConfig.locality_basis>`
+field on
+:ref:`ZoneAwareLbConfig <envoy_v3_api_msg_extensions.load_balancing_policies.common.v3.LocalityLbConfig.ZoneAwareLbConfig>`
+controls how these percentages are computed. Three modes are available:
+
+* ``HEALTHY_HOSTS_NUM`` (default): Percentages are proportional to the count of healthy hosts
+  in each zone. A zone with 3 out of 10 total hosts gets 30%.
+* ``HEALTHY_HOSTS_WEIGHT``: Percentages are proportional to the sum of host weights in each
+  zone. Useful when hosts have heterogeneous capacity.
+* ``LRS_REPORTED_RATE``: Percentages use control-plane-provided traffic fractions instead of
+  host counts. See :ref:`LRS-reported rate <arch_overview_load_balancing_zone_aware_routing_lrs_reported_rate>`
+  below.
+
+.. _arch_overview_load_balancing_zone_aware_routing_lrs_reported_rate:
+
+LRS-reported rate locality basis
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+The ``LRS_REPORTED_RATE`` mode addresses a limitation of the default host-count-based approach.
+Zone aware routing normally assumes that traffic is distributed proportionally across zones based on
+the number of Envoy instances in each zone: a zone with 30% of instances is assumed to handle 30%
+of inbound traffic. This assumption breaks under BGP anycast skew or heterogeneous client
+distributions, where some zones receive disproportionately more traffic than their instance count
+suggests.
+
+In ``LRS_REPORTED_RATE`` mode, the control plane aggregates
+:ref:`Load Reporting Service (LRS) <arch_overview_load_reporting_service>` data from all Envoy
+instances to compute the actual per-zone traffic fractions. These fractions are pushed back to
+Envoy via the
+:ref:`observed_traffic_fraction <envoy_v3_api_field_config.endpoint.v3.LocalityLbEndpoints.observed_traffic_fraction>`
+field in the local cluster's EDS response. Zone aware routing then uses these observed fractions
+for the originating cluster percentages instead of computing them from host counts.
+
+Only the originating (local) cluster percentages change. The upstream cluster percentages continue
+to use host counts or weights, as they represent available capacity rather than traffic demand.
+This preserves the existing zone aware routing semantics: local preference, spillover to zones
+with residual capacity, and all other existing behavior.
+
+**Data flow:**
+
+::
+
+  Envoy instances ──► LRS reports ──► Control plane aggregates
+  Control plane computes per-zone traffic fractions
+  Control plane sets observed_traffic_fraction in local cluster EDS
+  Envoy reads fractions during zone-aware percentage computation
+
+**Fallback behavior:**
+
+If fractions are not available (e.g., on first startup) or become stale (exceed
+the configured
+:ref:`staleness_threshold <envoy_v3_api_field_extensions.load_balancing_policies.common.v3.LocalityLbConfig.ZoneAwareLbConfig.LrsRateConfig.staleness_threshold>`),
+the load balancer automatically falls back to ``HEALTHY_HOSTS_NUM`` behavior. This ensures safe
+degradation if the control plane stops providing updated fractions.
+
+**Example:**
+
+Consider a deployment with 3 zones where BGP skew causes zone-a to receive 50% of traffic
+despite having only 30% of Envoy instances:
+
+::
+
+  Without LRS_REPORTED_RATE:
+    local_percentage:    zone-a=30%  zone-b=50%  zone-c=20%  (from host counts)
+    upstream_percentage: zone-a=30%  zone-b=50%  zone-c=20%
+    Result: zone-a routes 100% locally (30% <= 30%), overloading zone-a upstreams
+
+  With LRS_REPORTED_RATE:
+    local_percentage:    zone-a=50%  zone-b=35%  zone-c=15%  (from observed fractions)
+    upstream_percentage: zone-a=30%  zone-b=50%  zone-c=20%  (from host counts)
+    Result: zone-a routes 60% locally, spills 40% to zones with excess capacity
+
+See :ref:`How do I configure LRS-reported rate zone aware routing? <common_configuration_lrs_reported_rate_zone_aware_routing>`
+for configuration details.
+
