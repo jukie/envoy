@@ -58,6 +58,7 @@ Configuration
   configuration/level_two
   configuration/sni
   configuration/zone_aware_routing
+  configuration/lrs_reported_rate_zone_aware_routing
   configuration/tracing
   configuration/flow_control
   configuration/timeouts
