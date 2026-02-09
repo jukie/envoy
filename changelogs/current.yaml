@@ -218,4 +218,11 @@ new_features:
     Added ``QUERY_PARAMS`` support for substitution formatter to log all query params.
     They can either be logged in their original form or decoded.
 
+- area: load_balancing
+  change: |
+    Added ``ORCA_UTILIZATION`` value to the ``LocalityBasis`` enum in
+    :ref:`ZoneAwareLbConfig <envoy_v3_api_msg_extensions.load_balancing_policies.common.v3.LocalityLbConfig.ZoneAwareLbConfig>`
+    for zone-aware routing based on ORCA-reported utilization metrics. Added ``discovery_request_percent``
+    field to configure the fraction of traffic sent to remote localities for ORCA data collection (default 1%).
+
 deprecated:

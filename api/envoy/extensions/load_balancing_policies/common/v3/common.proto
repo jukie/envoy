@@ -24,7 +24,7 @@ option (udpa.annotations.file_status).package_version_status = ACTIVE;
 message LocalityLbConfig {
   // Configuration for :ref:`zone aware routing
   // <arch_overview_load_balancing_zone_aware_routing>`.
-  // [#next-free-field: 8]
+  // [#next-free-field: 9]
   message ZoneAwareLbConfig {
     // Basis for computing per-locality percentages in zone-aware routing.
     enum LocalityBasis {
@@ -49,6 +49,19 @@ message LocalityLbConfig {
       // This preserves zone-aware routing semantics (local preference, spillover)
       // while using globally accurate traffic distribution data.
       LRS_REPORTED_RATE = 2;
+
+      // Use ORCA-reported utilization metrics from upstream hosts to compute
+      // per-locality load percentages in zone-aware routing.
+      //
+      // When this mode is active, the load balancer periodically sends a
+      // configurable fraction of requests (``discovery_request_percent``) to
+      // remote localities to collect ORCA utilization data. Per-locality
+      // utilization is aggregated and used as ``local_percentage`` in zone-aware
+      // routing decisions, replacing host-count-based estimation.
+      //
+      // - ``upstream_percentage`` continues to use host counts/weights (capacity-based).
+      // - Falls back to ``HEALTHY_HOSTS_NUM`` behavior if ORCA data is not yet available.
+      ORCA_UTILIZATION = 3;
     }
 
     // Configures Envoy to always route requests to the local zone regardless of the
@@ -97,6 +110,7 @@ message LocalityLbConfig {
     // - HEALTHY_HOSTS_NUM: proportional to the count of healthy hosts.
     // - HEALTHY_HOSTS_WEIGHT: proportional to the weights of healthy hosts.
     // - LRS_REPORTED_RATE: uses control-plane-provided traffic fractions.
+    // - ORCA_UTILIZATION: uses ORCA-reported utilization from upstream hosts.
     // Default value is HEALTHY_HOSTS_NUM if unset.
     LocalityBasis locality_basis = 6;
 
@@ -133,6 +147,18 @@ message LocalityLbConfig {
     // Configuration for LRS_REPORTED_RATE locality basis mode.
     // Only used when ``locality_basis`` is set to ``LRS_REPORTED_RATE``.
     LrsRateConfig lrs_rate_config = 7;
+
+    // Percentage of requests to send to remote (non-local) localities for
+    // the purpose of collecting ORCA utilization data. Only used when
+    // ``locality_basis`` is set to ``ORCA_UTILIZATION``.
+    //
+    // This allows the load balancer to discover utilization of upstream hosts
+    // in remote localities even when zone-aware routing would normally keep
+    // all traffic local. Without this discovery traffic, the load balancer
+    // has no visibility into remote locality health.
+    //
+    // Default: 1%.
+    type.v3.Percent discovery_request_percent = 8;
   }
 
   // Configuration for :ref:`locality weighted load balancing
