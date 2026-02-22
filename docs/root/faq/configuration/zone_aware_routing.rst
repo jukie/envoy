@@ -30,6 +30,21 @@ These are the requirements:
     - name: cluster_b
       type: EDS
       eds_cluster_config: ...
+      common_lb_config:
+        zone_aware_lb_config:
+          routing_enabled:
+            value: 100
+          min_cluster_size: 6
+          fail_traffic_on_panic: false
+
+The destination cluster (``cluster_b``) includes a
+:ref:`zone_aware_lb_config <envoy_v3_api_msg_config.cluster.v3.Cluster.CommonLbConfig.ZoneAwareLbConfig>`
+block that controls zone-aware routing behavior. The ``routing_enabled`` field sets the percentage of
+requests eligible for zone-aware routing, ``min_cluster_size`` sets the minimum number of healthy
+upstream hosts required, and ``fail_traffic_on_panic`` controls whether to fail requests or
+distribute to all hosts when the cluster enters panic mode. See
+:ref:`zone aware routing configuration <arch_overview_load_balancing_zone_aware_routing_configuration>`
+for full details including the modern extension-based API.
 
 Envoy configuration on the destination service
 ----------------------------------------------
