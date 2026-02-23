@@ -129,6 +129,95 @@ TEST(OrcaLoadMetricsTest, AddAllReportedMetrics) {
                      Field(&LoadMetricStats::Stat::total_metric_value, DoubleEq(11))))));
 }
 
+// Tests for addOrcaRequestCostToLoadMetricStats (request_cost-only forwarding for OOB mode).
+
+TEST(OrcaLoadMetricsTest, RequestCostOnly_ForwardsRequestCost) {
+  Envoy::Orca::LrsReportMetricNames metric_names;
+  metric_names.push_back("request_cost.*");
+
+  Envoy::Upstream::LoadMetricStatsImpl stats;
+  Envoy::Orca::addOrcaRequestCostToLoadMetricStats(metric_names, makeOrcaReport(), stats);
+  auto load_stats_map = stats.latch();
+  ASSERT_NE(load_stats_map, nullptr);
+  EXPECT_THAT(*load_stats_map,
+              UnorderedElementsAre(
+                  Pair("request_cost.rc_foo",
+                       AllOf(Field(&LoadMetricStats::Stat::num_requests_with_metric, 1),
+                             Field(&LoadMetricStats::Stat::total_metric_value, DoubleEq(0.4)))),
+                  Pair("request_cost.rc_bar",
+                       AllOf(Field(&LoadMetricStats::Stat::num_requests_with_metric, 1),
+                             Field(&LoadMetricStats::Stat::total_metric_value, DoubleEq(0.5))))));
+}
+
+TEST(OrcaLoadMetricsTest, RequestCostOnly_IgnoresUtilizationAndQps) {
+  // Even when all metric types are in the metric_names list,
+  // addOrcaRequestCostToLoadMetricStats should only forward request_cost entries.
+  Envoy::Orca::LrsReportMetricNames metric_names;
+  metric_names.push_back("application_utilization");
+  metric_names.push_back("cpu_utilization");
+  metric_names.push_back("mem_utilization");
+  metric_names.push_back("eps");
+  metric_names.push_back("rps_fractional");
+  metric_names.push_back("named_metrics.*");
+  metric_names.push_back("utilization.*");
+  metric_names.push_back("request_cost.*");
+
+  Envoy::Upstream::LoadMetricStatsImpl stats;
+  Envoy::Orca::addOrcaRequestCostToLoadMetricStats(metric_names, makeOrcaReport(), stats);
+  auto load_stats_map = stats.latch();
+  ASSERT_NE(load_stats_map, nullptr);
+  // Only request_cost entries should be present.
+  EXPECT_EQ(load_stats_map->size(), 2);
+  EXPECT_THAT(*load_stats_map,
+              UnorderedElementsAre(
+                  Pair("request_cost.rc_foo",
+                       AllOf(Field(&LoadMetricStats::Stat::num_requests_with_metric, 1),
+                             Field(&LoadMetricStats::Stat::total_metric_value, DoubleEq(0.4)))),
+                  Pair("request_cost.rc_bar",
+                       AllOf(Field(&LoadMetricStats::Stat::num_requests_with_metric, 1),
+                             Field(&LoadMetricStats::Stat::total_metric_value, DoubleEq(0.5))))));
+}
+
+TEST(OrcaLoadMetricsTest, RequestCostOnly_EmptyRequestCost) {
+  Envoy::Orca::LrsReportMetricNames metric_names;
+  metric_names.push_back("request_cost.*");
+
+  xds::data::orca::v3::OrcaLoadReport report;
+  report.set_cpu_utilization(0.9);
+  // No request_cost entries in the report.
+
+  Envoy::Upstream::LoadMetricStatsImpl stats;
+  Envoy::Orca::addOrcaRequestCostToLoadMetricStats(metric_names, report, stats);
+  auto load_stats_map = stats.latch();
+  // No entries should be produced.
+  EXPECT_EQ(load_stats_map, nullptr);
+}
+
+TEST(OrcaLoadMetricsTest, RequestCostOnly_SpecificRequestCost) {
+  Envoy::Orca::LrsReportMetricNames metric_names;
+  metric_names.push_back("request_cost.rc_foo");
+
+  Envoy::Upstream::LoadMetricStatsImpl stats;
+  Envoy::Orca::addOrcaRequestCostToLoadMetricStats(metric_names, makeOrcaReport(), stats);
+  auto load_stats_map = stats.latch();
+  ASSERT_NE(load_stats_map, nullptr);
+  EXPECT_EQ(load_stats_map->size(), 1);
+  EXPECT_EQ(load_stats_map->at("request_cost.rc_foo").total_metric_value, 0.4);
+  EXPECT_EQ(load_stats_map->at("request_cost.rc_foo").num_requests_with_metric, 1);
+}
+
+TEST(OrcaLoadMetricsTest, RequestCostOnly_NoRequestCostInMetricNames) {
+  // If metric_names only has non-request_cost entries, nothing should be forwarded.
+  Envoy::Orca::LrsReportMetricNames metric_names;
+  metric_names.push_back("cpu_utilization");
+  metric_names.push_back("utilization.*");
+
+  Envoy::Upstream::LoadMetricStatsImpl stats;
+  Envoy::Orca::addOrcaRequestCostToLoadMetricStats(metric_names, makeOrcaReport(), stats);
+  auto load_stats_map = stats.latch();
+  EXPECT_EQ(load_stats_map, nullptr);
+}
+
 } // namespace
 } // namespace Orca
 } // namespace Envoy

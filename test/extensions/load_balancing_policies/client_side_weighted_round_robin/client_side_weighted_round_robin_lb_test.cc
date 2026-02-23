@@ -506,6 +506,70 @@ TEST(ClientSideWeightedRoundRobinConfigTest, SlowStartConfigPropagatesToOverride
                    0.25);
 }
 
+// OOB config parsing tests.
+
+TEST(ClientSideWeightedRoundRobinConfigTest, OobLoadReportDefaultsToFalse) {
+  envoy::extensions::load_balancing_policies::client_side_weighted_round_robin::v3::
+      ClientSideWeightedRoundRobin proto;
+  // Don't set enable_oob_load_report at all.
+  NiceMock<Event::MockDispatcher> dispatcher;
+  ThreadLocal::MockInstance tls;
+  ClientSideWeightedRoundRobinLbConfig typed(proto, dispatcher, tls);
+  EXPECT_FALSE(typed.enable_oob_load_report);
+}
+
+TEST(ClientSideWeightedRoundRobinConfigTest, OobLoadReportReadsTrueWhenSet) {
+  envoy::extensions::load_balancing_policies::client_side_weighted_round_robin::v3::
+      ClientSideWeightedRoundRobin proto;
+  proto.mutable_enable_oob_load_report()->set_value(true);
+  NiceMock<Event::MockDispatcher> dispatcher;
+  ThreadLocal::MockInstance tls;
+  ClientSideWeightedRoundRobinLbConfig typed(proto, dispatcher, tls);
+  EXPECT_TRUE(typed.enable_oob_load_report);
+}
+
+TEST(ClientSideWeightedRoundRobinConfigTest, OobReportingPeriodDefaultsTo10s) {
+  envoy::extensions::load_balancing_policies::client_side_weighted_round_robin::v3::
+      ClientSideWeightedRoundRobin proto;
+  NiceMock<Event::MockDispatcher> dispatcher;
+  ThreadLocal::MockInstance tls;
+  ClientSideWeightedRoundRobinLbConfig typed(proto, dispatcher, tls);
+  EXPECT_EQ(typed.oob_reporting_period, std::chrono::milliseconds(10000));
+}
+
+TEST(ClientSideWeightedRoundRobinConfigTest, OobReportingPeriodReadsCustomValue) {
+  envoy::extensions::load_balancing_policies::client_side_weighted_round_robin::v3::
+      ClientSideWeightedRoundRobin proto;
+  proto.mutable_oob_reporting_period()->set_seconds(5);
+  NiceMock<Event::MockDispatcher> dispatcher;
+  ThreadLocal::MockInstance tls;
+  ClientSideWeightedRoundRobinLbConfig typed(proto, dispatcher, tls);
+  EXPECT_EQ(typed.oob_reporting_period, std::chrono::milliseconds(5000));
+}
+
+TEST(ClientSideWeightedRoundRobinConfigTest, OobInitialJitterDefaultsToReportingPeriod) {
+  envoy::extensions::load_balancing_policies::client_side_weighted_round_robin::v3::
+      ClientSideWeightedRoundRobin proto;
+  proto.mutable_oob_reporting_period()->set_seconds(7);
+  NiceMock<Event::MockDispatcher> dispatcher;
+  ThreadLocal::MockInstance tls;
+  ClientSideWeightedRoundRobinLbConfig typed(proto, dispatcher, tls);
+  EXPECT_EQ(typed.oob_initial_jitter, std::chrono::milliseconds(7000));
+}
+
+TEST(ClientSideWeightedRoundRobinConfigTest, OobConfiguredFlagOnHostLbPolicyData) {
+  // Verify that ClientSideHostLbPolicyData correctly stores and reports oob_configured.
+  auto data_no_oob =
+      std::make_unique<ClientSideWeightedRoundRobinLoadBalancer::ClientSideHostLbPolicyData>(
+          nullptr, /*oob_configured=*/false);
+  EXPECT_FALSE(data_no_oob->oobReportingConfigured());
+
+  auto data_with_oob =
+      std::make_unique<ClientSideWeightedRoundRobinLoadBalancer::ClientSideHostLbPolicyData>(
+          nullptr, /*oob_configured=*/true);
+  EXPECT_TRUE(data_with_oob->oobReportingConfigured());
+}
+
 // Unit tests for ClientSideWeightedRoundRobinLoadBalancer implementation.
 
 TEST(ClientSideWeightedRoundRobinLoadBalancerTest,

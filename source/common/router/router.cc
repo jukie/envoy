@@ -2398,13 +2398,25 @@ void Filter::maybeProcessOrcaLoadReport(const Envoy::Http::HeaderMap& headers_or
 
   orca_load_report_received_ = true;
 
+  const bool oob_configured = host_lb_policy_data.has_value() &&
+                               host_lb_policy_data->oobReportingConfigured();
+
+  // LRS delivery: when OOB is configured, only forward request_cost metrics to avoid
+  // double-counting utilization/QPS/EPS (which are delivered via the OOB path).
   if (cluster_->lrsReportMetricNames().has_value()) {
     ENVOY_STREAM_LOG(trace, "Adding ORCA load report {} to load metrics", *callbacks_,
                      orca_load_report->DebugString());
-    Envoy::Orca::addOrcaLoadReportToLoadMetricStats(
-        *cluster_->lrsReportMetricNames(), *orca_load_report, upstream_host->loadMetricStats());
+    if (oob_configured) {
+      Envoy::Orca::addOrcaRequestCostToLoadMetricStats(
+          *cluster_->lrsReportMetricNames(), *orca_load_report, upstream_host->loadMetricStats());
+    } else {
+      Envoy::Orca::addOrcaLoadReportToLoadMetricStats(
+          *cluster_->lrsReportMetricNames(), *orca_load_report, upstream_host->loadMetricStats());
+    }
   }
-  if (host_lb_policy_data.has_value()) {
+
+  // LB delivery: suppressed when OOB is configured (LB receives data via OOB streams instead).
+  if (host_lb_policy_data.has_value() && !oob_configured) {
     ENVOY_STREAM_LOG(trace, "orca_load_report for {} report = {}", *callbacks_,
                      upstream_host->address()->asString(), orca_load_report->DebugString());
     const absl::Status status =

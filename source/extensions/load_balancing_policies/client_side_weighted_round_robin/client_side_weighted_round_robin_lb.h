@@ -38,6 +38,11 @@ public:
   std::chrono::milliseconds weight_expiration_period;
   std::chrono::milliseconds weight_update_period;
 
+  // OOB load reporting parameters.
+  bool enable_oob_load_report;
+  std::chrono::milliseconds oob_reporting_period;
+  std::chrono::milliseconds oob_initial_jitter;
+
   // Round robin proto overrides that we want to propagate to the worker RR LB (e.g., slow start).
   RoundRobinConfig round_robin_overrides_;
 
@@ -60,12 +65,16 @@ public:
   // not shared between different clusters, but are shared between load
   // balancer instances on different threads.
   struct ClientSideHostLbPolicyData : public Envoy::Upstream::HostLbPolicyData {
-    ClientSideHostLbPolicyData(OrcaLoadReportHandlerSharedPtr handler)
-        : report_handler_(std::move(handler)) {}
+    ClientSideHostLbPolicyData(OrcaLoadReportHandlerSharedPtr handler,
+                               bool oob_configured = false)
+        : report_handler_(std::move(handler)), oob_configured_(oob_configured) {}
     ClientSideHostLbPolicyData(OrcaLoadReportHandlerSharedPtr handler, uint32_t weight,
-                               MonotonicTime non_empty_since, MonotonicTime last_update_time)
-        : report_handler_(std::move(handler)), weight_(weight), non_empty_since_(non_empty_since),
-          last_update_time_(last_update_time) {}
+                               MonotonicTime non_empty_since, MonotonicTime last_update_time,
+                               bool oob_configured = false)
+        : report_handler_(std::move(handler)), oob_configured_(oob_configured), weight_(weight),
+          non_empty_since_(non_empty_since), last_update_time_(last_update_time) {}
+
+    bool oobReportingConfigured() const override { return oob_configured_; }
 
     absl::Status onOrcaLoadReport(const Upstream::OrcaLoadReport& report,
                                   const StreamInfo::StreamInfo& stream_info) override;
@@ -97,6 +106,7 @@ public:
     }
 
     OrcaLoadReportHandlerSharedPtr report_handler_;
+    const bool oob_configured_;
 
     // Weight as calculated from the last load report.
     std::atomic<uint32_t> weight_ = 1;
@@ -244,6 +254,9 @@ private:
   std::chrono::milliseconds blackout_period_;
   std::chrono::milliseconds weight_expiration_period_;
   std::chrono::milliseconds weight_update_period_;
+
+  // OOB load reporting config (used to set oob_configured flag on host LB policy data).
+  bool enable_oob_load_report_{false};
 
   Event::TimerPtr weight_calculation_timer_;
   // Callback for `priority_set_` updates.

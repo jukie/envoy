@@ -46,13 +46,23 @@ option (udpa.annotations.file_status).package_version_status = ACTIVE;
 //
 // [#next-free-field: 9]
 message ClientSideWeightedRoundRobin {
-  // Whether to enable out-of-band utilization reporting collection from
-  // the endpoints. By default, per-request utilization reporting is used.
+  // Whether to enable out-of-band (OOB) utilization reporting collection from
+  // the endpoints using the ORCA OpenRcaService StreamCoreMetrics streaming RPC.
+  // When enabled, Envoy opens a persistent gRPC stream to each endpoint and
+  // receives periodic load reports independent of the request path. Per-request
+  // ORCA reports are still processed for LRS (Load Reporting Service) metrics,
+  // but only request_cost entries are forwarded to avoid double-counting
+  // utilization/QPS/EPS which are delivered via the OOB path. Per-request LB
+  // weight updates are suppressed when OOB is active for a host.
+  // By default, per-request utilization reporting is used.
   google.protobuf.BoolValue enable_oob_load_report = 1;
 
-  // Load reporting interval to request from the server. Note that the
-  // server may not provide reports as frequently as the client requests.
+  // Load reporting interval to request from the server via the
+  // OrcaLoadReportRequest.report_interval field. Note that the server may not
+  // provide reports as frequently as the client requests.
   // Used only when enable_oob_load_report is true. Default is 10 seconds.
+  // Also used as the initial jitter upper bound for staggering OOB stream
+  // establishment across endpoints.
   google.protobuf.Duration oob_reporting_period = 2;
 
   // A given endpoint must report load metrics continuously for at least
