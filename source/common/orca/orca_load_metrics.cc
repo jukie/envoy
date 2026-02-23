@@ -83,6 +83,21 @@ void addOrcaLoadReportToLoadMetricStats(const LrsReportMetricNames& metric_names
                      });
 }
 
+void addOrcaRequestCostToLoadMetricStats(const LrsReportMetricNames& metric_names,
+                                         const xds::data::orca::v3::OrcaLoadReport& report,
+                                         Upstream::LoadMetricStats& stats) {
+  // Only forward request_cost entries to LRS. Utilization/QPS/EPS metrics
+  // are handled by the OOB path when OOB reporting is configured.
+  for (const std::string& metric_name : metric_names) {
+    if (absl::StartsWith(metric_name, kRequestCostFieldPrefix)) {
+      scanOrcaLoadReportMetricsMap(report.request_cost(), metric_name, kRequestCostFieldPrefix,
+                                   [&stats](absl::string_view name, double value) {
+                                     stats.add(name, value);
+                                   });
+    }
+  }
+}
+
 double getMaxUtilization(const LrsReportMetricNames& metric_names,
                          const xds::data::orca::v3::OrcaLoadReport& report) {
   double max_utilization = 0;

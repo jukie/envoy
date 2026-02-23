@@ -42,3 +42,53 @@ envoy_cc_library(
         "@xds//xds/data/orca/v3:pkg_cc_proto",
     ],
 )
+
+envoy_cc_library(
+    name = "orca_oob_session_lib",
+    srcs = ["orca_oob_session.cc"],
+    hdrs = ["orca_oob_session.h"],
+    deps = [
+        "//envoy/buffer:buffer_interface",
+        "//envoy/common:random_generator_interface",
+        "//envoy/event:deferred_deletable",
+        "//envoy/event:dispatcher_interface",
+        "//envoy/event:timer_interface",
+        "//envoy/grpc:status",
+        "//envoy/http:codec_interface",
+        "//envoy/network:connection_interface",
+        "//envoy/stats:stats_macros",
+        "//envoy/upstream:upstream_interface",
+        "//source/common/buffer:zero_copy_input_stream_lib",
+        "//source/common/common:backoff_lib",
+        "//source/common/common:logger_lib",
+        "//source/common/grpc:codec_lib",
+        "//source/common/grpc:common_lib",
+        "//source/common/http:codec_client_lib",
+        "//source/common/http:response_decoder_impl_base",
+        "//source/common/http:utility_lib",
+        "@xds//xds/data/orca/v3:pkg_cc_proto",
+        "@xds//xds/service/orca/v3:pkg_cc_proto",
+    ],
+)
+
+envoy_cc_library(
+    name = "orca_oob_manager_lib",
+    srcs = ["orca_oob_manager.cc"],
+    hdrs = ["orca_oob_manager.h"],
+    deps = [
+        ":orca_load_metrics_lib",
+        ":orca_oob_session_lib",
+        "//envoy/common:random_generator_interface",
+        "//envoy/event:dispatcher_interface",
+        "//envoy/event:timer_interface",
+        "//envoy/stats:stats_interface",
+        "//envoy/upstream:upstream_interface",
+        "//source/common/common:callback_impl_lib",
+        "//source/common/common:logger_lib",
+        "//source/common/network:address_lib",
+        "//source/common/network:utility_lib",
+        "//source/common/stream_info:stream_info_lib",
+        "@abseil-cpp//absl/container:flat_hash_map",
+        "@xds//xds/data/orca/v3:pkg_cc_proto",
+    ],
+)

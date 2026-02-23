@@ -7773,8 +7773,14 @@ TEST_F(RouterTest, OrcaLoadReport_NoConfiguredMetricNames) {
 
 class TestOrcaLoadReportLbData : public Upstream::HostLbPolicyData {
 public:
+  explicit TestOrcaLoadReportLbData(bool oob_configured = false)
+      : oob_configured_(oob_configured) {}
   MOCK_METHOD(absl::Status, onOrcaLoadReport,
               (const Upstream::OrcaLoadReport&, const StreamInfo::StreamInfo&), (override));
+  bool oobReportingConfigured() const override { return oob_configured_; }
+
+private:
+  bool oob_configured_;
 };
 
 TEST_F(RouterTest, OrcaLoadReportCallbacks) {
@@ -7898,6 +7904,168 @@ TEST_F(RouterTest, OrcaLoadReportInvalidHeaderValue) {
   Http::ResponseHeaderMapPtr response_headers(new Http::TestResponseHeaderMapImpl{
       {":status", "200"}, {"endpoint-load-metrics-bin", orca_load_report_header_bin}});
   response_decoder->decodeHeaders(std::move(response_headers), true);
+}
+
+// OOB suppression tests: per-request LB delivery is suppressed when OOB is configured.
+
+TEST_F(RouterTest, OrcaLoadReportLbSuppressedWhenOobConfigured) {
+  EXPECT_CALL(callbacks_.route_->route_entry_, timeout())
+      .WillOnce(Return(std::chrono::milliseconds(0)));
+  EXPECT_CALL(callbacks_.dispatcher_, createTimer_(_)).Times(0);
+
+  NiceMock<Http::MockRequestEncoder> encoder;
+  Http::ResponseDecoder* response_decoder = nullptr;
+  expectNewStreamWithImmediateEncoder(encoder, &response_decoder, Http::Protocol::Http10);
+
+  Http::TestRequestHeaderMapImpl headers;
+  HttpTestUtility::addDefaultHeaders(headers);
+  router_->decodeHeaders(headers, true);
+
+  // Configure host with OOB enabled — LB delivery should be suppressed.
+  auto host_lb_policy_data = std::make_unique<TestOrcaLoadReportLbData>(/*oob_configured=*/true);
+  auto host_lb_policy_data_raw_ptr = host_lb_policy_data.get();
+  cm_.thread_local_cluster_.conn_pool_.host_->lb_policy_data_ = std::move(host_lb_policy_data);
+
+  // onOrcaLoadReport should NOT be called because OOB is configured.
+  EXPECT_CALL(*host_lb_policy_data_raw_ptr, onOrcaLoadReport(_, _)).Times(0);
+
+  xds::data::orca::v3::OrcaLoadReport orca_load_report;
+  orca_load_report.set_cpu_utilization(0.5);
+  std::string proto_string = TestUtility::getProtobufBinaryStringFromMessage(orca_load_report);
+  std::string orca_load_report_header_bin =
+      Envoy::Base64::encode(proto_string.c_str(), proto_string.length());
+  Http::ResponseHeaderMapPtr response_headers(new Http::TestResponseHeaderMapImpl{
+      {":status", "200"}, {"endpoint-load-metrics-bin", orca_load_report_header_bin}});
+  response_decoder->decodeHeaders(std::move(response_headers), true);
+}
+
+TEST_F(RouterTest, OrcaLoadReportLbNotSuppressedWhenOobNotConfigured) {
+  EXPECT_CALL(callbacks_.route_->route_entry_, timeout())
+      .WillOnce(Return(std::chrono::milliseconds(0)));
+  EXPECT_CALL(callbacks_.dispatcher_, createTimer_(_)).Times(0);
+
+  NiceMock<Http::MockRequestEncoder> encoder;
+  Http::ResponseDecoder* response_decoder = nullptr;
+  expectNewStreamWithImmediateEncoder(encoder, &response_decoder, Http::Protocol::Http10);
+
+  Http::TestRequestHeaderMapImpl headers;
+  HttpTestUtility::addDefaultHeaders(headers);
+  router_->decodeHeaders(headers, true);
+
+  // Configure host with OOB NOT enabled — LB delivery should proceed.
+  auto host_lb_policy_data = std::make_unique<TestOrcaLoadReportLbData>(/*oob_configured=*/false);
+  auto host_lb_policy_data_raw_ptr = host_lb_policy_data.get();
+  cm_.thread_local_cluster_.conn_pool_.host_->lb_policy_data_ = std::move(host_lb_policy_data);
+
+  // onOrcaLoadReport SHOULD be called.
+  EXPECT_CALL(*host_lb_policy_data_raw_ptr, onOrcaLoadReport(_, _))
+      .WillOnce(Return(absl::OkStatus()));
+
+  xds::data::orca::v3::OrcaLoadReport orca_load_report;
+  orca_load_report.set_cpu_utilization(0.5);
+  std::string proto_string = TestUtility::getProtobufBinaryStringFromMessage(orca_load_report);
+  std::string orca_load_report_header_bin =
+      Envoy::Base64::encode(proto_string.c_str(), proto_string.length());
+  Http::ResponseHeaderMapPtr response_headers(new Http::TestResponseHeaderMapImpl{
+      {":status", "200"}, {"endpoint-load-metrics-bin", orca_load_report_header_bin}});
+  response_decoder->decodeHeaders(std::move(response_headers), true);
+}
+
+TEST_F(RouterTest, OrcaLoadReportLrsStillDeliveredWhenOobConfigured) {
+  EXPECT_CALL(callbacks_.route_->route_entry_, timeout())
+      .WillOnce(Return(std::chrono::milliseconds(0)));
+  EXPECT_CALL(callbacks_.dispatcher_, createTimer_(_)).Times(0);
+
+  // Configure LRS metric names so LRS delivery path is active.
+  Envoy::Orca::LrsReportMetricNames metric_names;
+  metric_names.push_back("cpu_utilization");
+  metric_names.push_back("request_cost.cost1");
+  ON_CALL(*cm_.thread_local_cluster_.cluster_.info_, lrsReportMetricNames())
+      .WillByDefault(Return(makeOptRef<const Envoy::Orca::LrsReportMetricNames>(metric_names)));
+
+  NiceMock<Http::MockRequestEncoder> encoder;
+  Http::ResponseDecoder* response_decoder = nullptr;
+  expectNewStreamWithImmediateEncoder(encoder, &response_decoder, Http::Protocol::Http10);
+
+  Http::TestRequestHeaderMapImpl headers;
+  HttpTestUtility::addDefaultHeaders(headers);
+  router_->decodeHeaders(headers, true);
+
+  // Configure host with OOB enabled.
+  auto host_lb_policy_data = std::make_unique<TestOrcaLoadReportLbData>(/*oob_configured=*/true);
+  auto host_lb_policy_data_raw_ptr = host_lb_policy_data.get();
+  cm_.thread_local_cluster_.conn_pool_.host_->lb_policy_data_ = std::move(host_lb_policy_data);
+
+  // LB callback should NOT be called (OOB suppresses it).
+  EXPECT_CALL(*host_lb_policy_data_raw_ptr, onOrcaLoadReport(_, _)).Times(0);
+
+  // Send ORCA report with both cpu_utilization and request_cost.
+  xds::data::orca::v3::OrcaLoadReport orca_load_report;
+  orca_load_report.set_cpu_utilization(0.5);
+  orca_load_report.mutable_request_cost()->insert({"cost1", 0.3});
+  std::string proto_string = TestUtility::getProtobufBinaryStringFromMessage(orca_load_report);
+  std::string orca_load_report_header_bin =
+      Envoy::Base64::encode(proto_string.c_str(), proto_string.length());
+  Http::ResponseHeaderMapPtr response_headers(new Http::TestResponseHeaderMapImpl{
+      {":status", "200"}, {"endpoint-load-metrics-bin", orca_load_report_header_bin}});
+  response_decoder->decodeHeaders(std::move(response_headers), true);
+
+  // Verify LRS received the report (request_cost only, not cpu_utilization).
+  auto load_metric_stats_map =
+      cm_.thread_local_cluster_.conn_pool_.host_->loadMetricStats().latch();
+  ASSERT_NE(load_metric_stats_map, nullptr);
+  // When OOB is configured, only request_cost metrics are forwarded via per-request path.
+  EXPECT_TRUE(load_metric_stats_map->find("request_cost.cost1") != load_metric_stats_map->end());
+  // cpu_utilization should NOT be forwarded (OOB handles it).
+  EXPECT_TRUE(load_metric_stats_map->find("cpu_utilization") == load_metric_stats_map->end());
+}
+
+TEST_F(RouterTest, OrcaLoadReportLrsFullReportWhenOobNotConfigured) {
+  EXPECT_CALL(callbacks_.route_->route_entry_, timeout())
+      .WillOnce(Return(std::chrono::milliseconds(0)));
+  EXPECT_CALL(callbacks_.dispatcher_, createTimer_(_)).Times(0);
+
+  // Configure LRS metric names.
+  Envoy::Orca::LrsReportMetricNames metric_names;
+  metric_names.push_back("cpu_utilization");
+  metric_names.push_back("request_cost.cost1");
+  ON_CALL(*cm_.thread_local_cluster_.cluster_.info_, lrsReportMetricNames())
+      .WillByDefault(Return(makeOptRef<const Envoy::Orca::LrsReportMetricNames>(metric_names)));
+
+  NiceMock<Http::MockRequestEncoder> encoder;
+  Http::ResponseDecoder* response_decoder = nullptr;
+  expectNewStreamWithImmediateEncoder(encoder, &response_decoder, Http::Protocol::Http10);
+
+  Http::TestRequestHeaderMapImpl headers;
+  HttpTestUtility::addDefaultHeaders(headers);
+  router_->decodeHeaders(headers, true);
+
+  // Configure host with OOB NOT enabled.
+  auto host_lb_policy_data = std::make_unique<TestOrcaLoadReportLbData>(/*oob_configured=*/false);
+  auto host_lb_policy_data_raw_ptr = host_lb_policy_data.get();
+  cm_.thread_local_cluster_.conn_pool_.host_->lb_policy_data_ = std::move(host_lb_policy_data);
+
+  // LB callback SHOULD be called.
+  EXPECT_CALL(*host_lb_policy_data_raw_ptr, onOrcaLoadReport(_, _))
+      .WillOnce(Return(absl::OkStatus()));
+
+  // Send ORCA report with both cpu_utilization and request_cost.
+  xds::data::orca::v3::OrcaLoadReport orca_load_report;
+  orca_load_report.set_cpu_utilization(0.5);
+  orca_load_report.mutable_request_cost()->insert({"cost1", 0.3});
+  std::string proto_string = TestUtility::getProtobufBinaryStringFromMessage(orca_load_report);
+  std::string orca_load_report_header_bin =
+      Envoy::Base64::encode(proto_string.c_str(), proto_string.length());
+  Http::ResponseHeaderMapPtr response_headers(new Http::TestResponseHeaderMapImpl{
+      {":status", "200"}, {"endpoint-load-metrics-bin", orca_load_report_header_bin}});
+  response_decoder->decodeHeaders(std::move(response_headers), true);
+
+  // Verify LRS received the full report (both cpu_utilization and request_cost).
+  auto load_metric_stats_map =
+      cm_.thread_local_cluster_.conn_pool_.host_->loadMetricStats().latch();
+  ASSERT_NE(load_metric_stats_map, nullptr);
+  EXPECT_TRUE(load_metric_stats_map->find("cpu_utilization") != load_metric_stats_map->end());
+  EXPECT_TRUE(load_metric_stats_map->find("request_cost.cost1") != load_metric_stats_map->end());
 }
 
 } // namespace Router

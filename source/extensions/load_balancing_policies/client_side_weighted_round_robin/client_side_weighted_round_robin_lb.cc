@@ -56,6 +56,14 @@ ClientSideWeightedRoundRobinLbConfig::ClientSideWeightedRoundRobinLbConfig(
   weight_update_period =
       std::chrono::milliseconds(PROTOBUF_GET_MS_OR_DEFAULT(lb_proto, weight_update_period, 1000));
 
+  // OOB load reporting config.
+  enable_oob_load_report = lb_proto.has_enable_oob_load_report() &&
+                           lb_proto.enable_oob_load_report().value();
+  oob_reporting_period =
+      std::chrono::milliseconds(PROTOBUF_GET_MS_OR_DEFAULT(lb_proto, oob_reporting_period, 10000));
+  // Default initial jitter to oob_reporting_period to spread connections across one full cycle.
+  oob_initial_jitter = oob_reporting_period;
+
   if (lb_proto.has_slow_start_config()) {
     *round_robin_overrides_.mutable_slow_start_config() = lb_proto.slow_start_config();
   }
@@ -93,6 +101,9 @@ void ClientSideWeightedRoundRobinLoadBalancer::initFromConfig(
   blackout_period_ = lb_config.blackout_period;
   weight_expiration_period_ = lb_config.weight_expiration_period;
   weight_update_period_ = lb_config.weight_update_period;
+  enable_oob_load_report_ = lb_config.enable_oob_load_report;
+  oob_reporting_period_ = lb_config.oob_reporting_period;
+  oob_initial_jitter_ = lb_config.oob_initial_jitter;
 }
 
 void ClientSideWeightedRoundRobinLoadBalancer::updateWeightsOnMainThread() {
@@ -179,7 +190,8 @@ void ClientSideWeightedRoundRobinLoadBalancer::addClientSideLbPolicyDataToHosts(
   for (const auto& host_ptr : hosts) {
     if (!host_ptr->lbPolicyData().has_value()) {
       ENVOY_LOG(trace, "Adding LB policy data to Host {}", getHostAddress(host_ptr.get()));
-      host_ptr->setLbPolicyData(std::make_unique<ClientSideHostLbPolicyData>(report_handler_));
+      host_ptr->setLbPolicyData(std::make_unique<ClientSideHostLbPolicyData>(
+          report_handler_, enable_oob_load_report_));
     }
   }
 }
@@ -289,7 +301,10 @@ ClientSideWeightedRoundRobinLoadBalancer::ClientSideWeightedRoundRobinLoadBalanc
     const Upstream::PrioritySet& priority_set, Runtime::Loader& runtime,
     Envoy::Random::RandomGenerator& random, TimeSource& time_source)
     : cluster_info_(cluster_info), priority_set_(priority_set), runtime_(runtime), random_(random),
-      time_source_(time_source) {
+      time_source_(time_source),
+      main_thread_dispatcher_(
+          dynamic_cast<const ClientSideWeightedRoundRobinLbConfig*>(lb_config.ptr())
+              ->main_thread_dispatcher_) {
 
   const auto* typed_lb_config =
       dynamic_cast<const ClientSideWeightedRoundRobinLbConfig*>(lb_config.ptr());
@@ -302,10 +317,16 @@ ClientSideWeightedRoundRobinLoadBalancer::ClientSideWeightedRoundRobinLoadBalanc
   initFromConfig(*typed_lb_config);
 
   weight_calculation_timer_ =
-      typed_lb_config->main_thread_dispatcher_.createTimer([this]() -> void {
+      main_thread_dispatcher_.createTimer([this]() -> void {
         updateWeightsOnMainThread();
         weight_calculation_timer_->enableTimer(weight_update_period_);
       });
+}
+
+ClientSideWeightedRoundRobinLoadBalancer::~ClientSideWeightedRoundRobinLoadBalancer() {
+  if (oob_manager_) {
+    oob_manager_->stop();
+  }
 }
 
 absl::Status ClientSideWeightedRoundRobinLoadBalancer::initialize() {
@@ -315,11 +336,21 @@ absl::Status ClientSideWeightedRoundRobinLoadBalancer::initialize() {
   }
 
   // Setup a callback to receive priority set updates.
+  // IMPORTANT: This callback must be registered BEFORE the OOB manager's callback
+  // so that LB policy data is attached to hosts before OOB sessions start.
   priority_update_cb_ = priority_set_.addPriorityUpdateCb(
       [this](uint32_t, const HostVector& hosts_added, const HostVector&) {
         addClientSideLbPolicyDataToHosts(hosts_added);
         updateWeightsOnMainThread();
       });
+
+  // Start OOB reporting if configured.
+  if (enable_oob_load_report_) {
+    oob_manager_ = std::make_unique<Orca::OrcaOobManager>(
+        priority_set_, main_thread_dispatcher_, random_, oob_reporting_period_,
+        oob_initial_jitter_, cluster_info_.statsScope(), cluster_info_.lrsReportMetricNames());
+    oob_manager_->start();
+  }
 
   weight_calculation_timer_->enableTimer(weight_update_period_);
 

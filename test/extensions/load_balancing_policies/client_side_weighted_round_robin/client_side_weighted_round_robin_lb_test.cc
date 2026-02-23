@@ -83,6 +83,10 @@ public:
     return lb_->report_handler_;
   }
 
+  bool hasOobManager() const { return lb_->oob_manager_ != nullptr; }
+
+  bool enableOobLoadReport() const { return lb_->enable_oob_load_report_; }
+
 private:
   std::shared_ptr<ClientSideWeightedRoundRobinLoadBalancer> lb_;
   std::shared_ptr<ClientSideWeightedRoundRobinLoadBalancer::WorkerLocalLb> worker_lb_;
@@ -504,6 +508,179 @@ TEST(ClientSideWeightedRoundRobinConfigTest, SlowStartConfigPropagatesToOverride
   EXPECT_EQ(typed.round_robin_overrides_.slow_start_config().slow_start_window().seconds(), 15);
   EXPECT_DOUBLE_EQ(typed.round_robin_overrides_.slow_start_config().min_weight_percent().value(),
                    0.25);
+}
+
+// OOB config parsing tests.
+
+TEST(ClientSideWeightedRoundRobinConfigTest, OobLoadReportDefaultsToFalse) {
+  envoy::extensions::load_balancing_policies::client_side_weighted_round_robin::v3::
+      ClientSideWeightedRoundRobin proto;
+  // Don't set enable_oob_load_report at all.
+  NiceMock<Event::MockDispatcher> dispatcher;
+  ThreadLocal::MockInstance tls;
+  ClientSideWeightedRoundRobinLbConfig typed(proto, dispatcher, tls);
+  EXPECT_FALSE(typed.enable_oob_load_report);
+}
+
+TEST(ClientSideWeightedRoundRobinConfigTest, OobLoadReportReadsTrueWhenSet) {
+  envoy::extensions::load_balancing_policies::client_side_weighted_round_robin::v3::
+      ClientSideWeightedRoundRobin proto;
+  proto.mutable_enable_oob_load_report()->set_value(true);
+  NiceMock<Event::MockDispatcher> dispatcher;
+  ThreadLocal::MockInstance tls;
+  ClientSideWeightedRoundRobinLbConfig typed(proto, dispatcher, tls);
+  EXPECT_TRUE(typed.enable_oob_load_report);
+}
+
+TEST(ClientSideWeightedRoundRobinConfigTest, OobReportingPeriodDefaultsTo10s) {
+  envoy::extensions::load_balancing_policies::client_side_weighted_round_robin::v3::
+      ClientSideWeightedRoundRobin proto;
+  NiceMock<Event::MockDispatcher> dispatcher;
+  ThreadLocal::MockInstance tls;
+  ClientSideWeightedRoundRobinLbConfig typed(proto, dispatcher, tls);
+  EXPECT_EQ(typed.oob_reporting_period, std::chrono::milliseconds(10000));
+}
+
+TEST(ClientSideWeightedRoundRobinConfigTest, OobReportingPeriodReadsCustomValue) {
+  envoy::extensions::load_balancing_policies::client_side_weighted_round_robin::v3::
+      ClientSideWeightedRoundRobin proto;
+  proto.mutable_oob_reporting_period()->set_seconds(5);
+  NiceMock<Event::MockDispatcher> dispatcher;
+  ThreadLocal::MockInstance tls;
+  ClientSideWeightedRoundRobinLbConfig typed(proto, dispatcher, tls);
+  EXPECT_EQ(typed.oob_reporting_period, std::chrono::milliseconds(5000));
+}
+
+TEST(ClientSideWeightedRoundRobinConfigTest, OobInitialJitterDefaultsToReportingPeriod) {
+  envoy::extensions::load_balancing_policies::client_side_weighted_round_robin::v3::
+      ClientSideWeightedRoundRobin proto;
+  proto.mutable_oob_reporting_period()->set_seconds(7);
+  NiceMock<Event::MockDispatcher> dispatcher;
+  ThreadLocal::MockInstance tls;
+  ClientSideWeightedRoundRobinLbConfig typed(proto, dispatcher, tls);
+  EXPECT_EQ(typed.oob_initial_jitter, std::chrono::milliseconds(7000));
+}
+
+TEST(ClientSideWeightedRoundRobinConfigTest, OobConfiguredFlagOnHostLbPolicyData) {
+  // Verify that ClientSideHostLbPolicyData correctly stores and reports oob_configured.
+  auto data_no_oob =
+      std::make_unique<ClientSideWeightedRoundRobinLoadBalancer::ClientSideHostLbPolicyData>(
+          nullptr, /*oob_configured=*/false);
+  EXPECT_FALSE(data_no_oob->oobReportingConfigured());
+
+  auto data_with_oob =
+      std::make_unique<ClientSideWeightedRoundRobinLoadBalancer::ClientSideHostLbPolicyData>(
+          nullptr, /*oob_configured=*/true);
+  EXPECT_TRUE(data_with_oob->oobReportingConfigured());
+}
+
+// CSWR LB OOB integration tests.
+
+class CswrOobIntegrationTest : public Event::TestUsingSimulatedTime, public testing::Test {
+protected:
+  void initLb(bool enable_oob) {
+    if (enable_oob) {
+      proto_.mutable_enable_oob_load_report()->set_value(true);
+    }
+    proto_.mutable_blackout_period()->set_seconds(10);
+    proto_.mutable_weight_expiration_period()->set_seconds(180);
+    proto_.mutable_weight_update_period()->set_seconds(1);
+    proto_.mutable_error_utilization_penalty()->set_value(0.1);
+
+    EXPECT_CALL(tls_, allocateSlot());
+    ClientSideWeightedRoundRobinLbConfig config(proto_, dispatcher_, tls_);
+
+    lb_ = std::make_shared<ClientSideWeightedRoundRobinLoadBalancerFriend>(
+        std::make_shared<ClientSideWeightedRoundRobinLoadBalancer>(
+            config, cluster_info_, priority_set_, runtime_, random_, simTime()),
+        std::make_shared<ClientSideWeightedRoundRobinLoadBalancer::WorkerLocalLb>(
+            priority_set_, nullptr, stats_, runtime_, random_, common_config_,
+            config.round_robin_overrides_, simTime(), /*tls_shim=*/absl::nullopt));
+  }
+
+  envoy::extensions::load_balancing_policies::client_side_weighted_round_robin::v3::
+      ClientSideWeightedRoundRobin proto_;
+  NiceMock<Event::MockDispatcher> dispatcher_;
+  NiceMock<ThreadLocal::MockInstance> tls_;
+  Stats::IsolatedStoreImpl stats_store_;
+  ClusterLbStatNames stat_names_{stats_store_.symbolTable()};
+  ClusterLbStats stats_{stat_names_, *stats_store_.rootScope()};
+  NiceMock<Runtime::MockLoader> runtime_;
+  NiceMock<Random::MockRandomGenerator> random_;
+  NiceMock<MockPrioritySet> priority_set_;
+  NiceMock<MockClusterInfo> cluster_info_;
+  envoy::config::cluster::v3::Cluster::CommonLbConfig common_config_;
+  std::shared_ptr<ClientSideWeightedRoundRobinLoadBalancerFriend> lb_;
+};
+
+TEST_F(CswrOobIntegrationTest, OobManagerCreatedWhenEnabled) {
+  initLb(/*enable_oob=*/true);
+  ASSERT_EQ(lb_->initialize(), absl::OkStatus());
+  EXPECT_TRUE(lb_->hasOobManager());
+}
+
+TEST_F(CswrOobIntegrationTest, OobManagerNotCreatedWhenDisabled) {
+  initLb(/*enable_oob=*/false);
+  ASSERT_EQ(lb_->initialize(), absl::OkStatus());
+  EXPECT_FALSE(lb_->hasOobManager());
+}
+
+TEST_F(CswrOobIntegrationTest, OobManagerNotCreatedWhenConfigUnset) {
+  // Don't call mutable_enable_oob_load_report() at all.
+  proto_.mutable_blackout_period()->set_seconds(10);
+  proto_.mutable_weight_expiration_period()->set_seconds(180);
+  proto_.mutable_weight_update_period()->set_seconds(1);
+  proto_.mutable_error_utilization_penalty()->set_value(0.1);
+
+  EXPECT_CALL(tls_, allocateSlot());
+  ClientSideWeightedRoundRobinLbConfig config(proto_, dispatcher_, tls_);
+
+  lb_ = std::make_shared<ClientSideWeightedRoundRobinLoadBalancerFriend>(
+      std::make_shared<ClientSideWeightedRoundRobinLoadBalancer>(
+          config, cluster_info_, priority_set_, runtime_, random_, simTime()),
+      std::make_shared<ClientSideWeightedRoundRobinLoadBalancer::WorkerLocalLb>(
+          priority_set_, nullptr, stats_, runtime_, random_, common_config_,
+          config.round_robin_overrides_, simTime(), /*tls_shim=*/absl::nullopt));
+
+  ASSERT_EQ(lb_->initialize(), absl::OkStatus());
+  EXPECT_FALSE(lb_->hasOobManager());
+}
+
+TEST_F(CswrOobIntegrationTest, HostsGetOobConfiguredFlagWhenOobEnabled) {
+  // Add hosts to the host set before initializing the LB.
+  auto host = std::make_shared<NiceMock<MockHost>>();
+  auto address = *Network::Utility::resolveUrl("tcp://127.0.0.1:80");
+  ON_CALL(*host, address()).WillByDefault(testing::Return(address));
+  // Wire setLbPolicyData to actually store the data.
+  ON_CALL(*host, setLbPolicyData(testing::_))
+      .WillByDefault(testing::Invoke(
+          [&host](HostLbPolicyDataPtr data) { host->lb_policy_data_ = std::move(data); }));
+  priority_set_.getMockHostSet(0)->hosts_ = {host};
+
+  initLb(/*enable_oob=*/true);
+  ASSERT_EQ(lb_->initialize(), absl::OkStatus());
+
+  // After initialization, hosts should have lb policy data with oob_configured=true.
+  auto lb_data = host->lbPolicyData();
+  ASSERT_TRUE(lb_data.has_value());
+  EXPECT_TRUE(lb_data->oobReportingConfigured());
+}
+
+TEST_F(CswrOobIntegrationTest, HostsDoNotGetOobConfiguredFlagWhenOobDisabled) {
+  auto host = std::make_shared<NiceMock<MockHost>>();
+  auto address = *Network::Utility::resolveUrl("tcp://127.0.0.1:80");
+  ON_CALL(*host, address()).WillByDefault(testing::Return(address));
+  ON_CALL(*host, setLbPolicyData(testing::_))
+      .WillByDefault(testing::Invoke(
+          [&host](HostLbPolicyDataPtr data) { host->lb_policy_data_ = std::move(data); }));
+  priority_set_.getMockHostSet(0)->hosts_ = {host};
+
+  initLb(/*enable_oob=*/false);
+  ASSERT_EQ(lb_->initialize(), absl::OkStatus());
+
+  auto lb_data = host->lbPolicyData();
+  ASSERT_TRUE(lb_data.has_value());
+  EXPECT_FALSE(lb_data->oobReportingConfigured());
 }
 
 // Unit tests for ClientSideWeightedRoundRobinLoadBalancer implementation.
