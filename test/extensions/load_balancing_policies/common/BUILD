@@ -145,6 +145,8 @@ envoy_cc_test(
     srcs = ["orca_weight_manager_test.cc"],
     deps = [
         "//source/extensions/load_balancing_policies/common:orca_weight_manager_lib",
+        "//test/mocks:common_lib",
+        "//test/mocks/stream_info:stream_info_mocks",
         "//test/mocks/upstream:host_mocks",
         "@xds//xds/data/orca/v3:pkg_cc_proto",
     ],

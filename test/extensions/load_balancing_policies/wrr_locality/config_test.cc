@@ -12,7 +12,8 @@ namespace LoadBalancingPolicies {
 namespace WrrLocality {
 namespace {
 
-// Helper to build a WrrLocality config message with ClientSideWeightedRoundRobin as the endpoint picking policy.
+// Helper to build a WrrLocality config message with ClientSideWeightedRoundRobin as the endpoint
+// picking policy.
 envoy::extensions::load_balancing_policies::wrr_locality::v3::WrrLocality buildWrrLocalityConfig() {
   envoy::extensions::load_balancing_policies::client_side_weighted_round_robin::v3::
       ClientSideWeightedRoundRobin cswrr_config_msg;

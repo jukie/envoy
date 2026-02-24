@@ -30,8 +30,8 @@ using WrrLocalityLbProto =
 using RoundRobinConfig = envoy::extensions::load_balancing_policies::round_robin::v3::RoundRobin;
 
 /**
- * Load balancer config that holds ORCA parameters extracted from the ClientSideWeightedRoundRobin child
- * config, plus a RoundRobinConfig with locality_lb_config set natively.
+ * Load balancer config that holds ORCA parameters extracted from the ClientSideWeightedRoundRobin
+ * child config, plus a RoundRobinConfig with locality_lb_config set natively.
  */
 class WrrLocalityLbConfig : public Upstream::LoadBalancerConfig {
 public:

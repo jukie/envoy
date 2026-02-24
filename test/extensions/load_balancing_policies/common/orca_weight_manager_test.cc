@@ -1,7 +1,10 @@
 #include "source/extensions/load_balancing_policies/common/orca_weight_manager.h"
 
+#include "test/mocks/common.h"
+#include "test/mocks/stream_info/mocks.h"
 #include "test/mocks/upstream/host.h"
 
+#include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include "xds/data/orca/v3/orca_load_report.pb.h"
 
@@ -246,6 +249,104 @@ TEST(OrcaWeightManagerTest, GetWeightIfValidFromHost_Valid) {
                     .value());
   // non_empty_since_ is not updated.
   EXPECT_EQ(data->non_empty_since_.load(), MonotonicTime(std::chrono::seconds(1)));
+}
+
+// --- OrcaLoadReportHandler: updateClientSideDataFromOrcaLoadReport ---
+
+TEST(OrcaWeightManagerTest, UpdateClientSideData_Success) {
+  OrcaWeightManagerConfig config;
+  config.error_utilization_penalty = 0.0;
+  NiceMock<MockTimeSystem> time_system;
+  auto now = MonotonicTime(std::chrono::seconds(50));
+  ON_CALL(time_system, monotonicTime()).WillByDefault(testing::Return(now));
+
+  OrcaLoadReportHandler handler(config, time_system);
+  OrcaHostLbPolicyData data(nullptr);
+
+  xds::data::orca::v3::OrcaLoadReport report;
+  report.set_rps_fractional(100);
+  report.set_cpu_utilization(0.5);
+
+  EXPECT_EQ(absl::OkStatus(), handler.updateClientSideDataFromOrcaLoadReport(report, data));
+  EXPECT_EQ(200, data.weight_.load());
+  EXPECT_EQ(now, data.last_update_time_.load());
+  EXPECT_EQ(now, data.non_empty_since_.load());
+}
+
+TEST(OrcaWeightManagerTest, UpdateClientSideData_ErrorReturnsStatus) {
+  OrcaWeightManagerConfig config;
+  config.error_utilization_penalty = 0.0;
+  NiceMock<MockTimeSystem> time_system;
+
+  OrcaLoadReportHandler handler(config, time_system);
+  OrcaHostLbPolicyData data(nullptr);
+
+  xds::data::orca::v3::OrcaLoadReport report;
+  report.set_rps_fractional(0); // Invalid QPS.
+  report.set_cpu_utilization(0.5);
+
+  auto status = handler.updateClientSideDataFromOrcaLoadReport(report, data);
+  EXPECT_FALSE(status.ok());
+  EXPECT_EQ(absl::StatusCode::kInvalidArgument, status.code());
+  // Weight should remain at default since the update failed.
+  EXPECT_EQ(1, data.weight_.load());
+}
+
+// --- OrcaHostLbPolicyData: onOrcaLoadReport ---
+
+TEST(OrcaWeightManagerTest, OnOrcaLoadReport_Success) {
+  OrcaWeightManagerConfig config;
+  config.error_utilization_penalty = 0.0;
+  NiceMock<MockTimeSystem> time_system;
+  auto now = MonotonicTime(std::chrono::seconds(10));
+  ON_CALL(time_system, monotonicTime()).WillByDefault(testing::Return(now));
+
+  auto handler = std::make_shared<OrcaLoadReportHandler>(config, time_system);
+  OrcaHostLbPolicyData data(handler);
+
+  xds::data::orca::v3::OrcaLoadReport report;
+  report.set_rps_fractional(200);
+  report.set_application_utilization(0.4);
+
+  NiceMock<StreamInfo::MockStreamInfo> stream_info;
+  EXPECT_EQ(absl::OkStatus(), data.onOrcaLoadReport(report, stream_info));
+  EXPECT_EQ(500, data.weight_.load()); // 200 / 0.4 = 500
+}
+
+TEST(OrcaWeightManagerTest, OnOrcaLoadReport_InvalidReport) {
+  OrcaWeightManagerConfig config;
+  config.error_utilization_penalty = 0.0;
+  NiceMock<MockTimeSystem> time_system;
+
+  auto handler = std::make_shared<OrcaLoadReportHandler>(config, time_system);
+  OrcaHostLbPolicyData data(handler);
+
+  xds::data::orca::v3::OrcaLoadReport report;
+  // No QPS or utilization set.
+
+  NiceMock<StreamInfo::MockStreamInfo> stream_info;
+  auto status = data.onOrcaLoadReport(report, stream_info);
+  EXPECT_FALSE(status.ok());
+}
+
+// --- OrcaHostLbPolicyData: updateWeightNow ---
+
+TEST(OrcaWeightManagerTest, UpdateWeightNow_SetsNonEmptySinceOnlyOnce) {
+  OrcaHostLbPolicyData data(nullptr);
+  EXPECT_EQ(OrcaHostLbPolicyData::kDefaultNonEmptySince, data.non_empty_since_.load());
+
+  auto t1 = MonotonicTime(std::chrono::seconds(10));
+  data.updateWeightNow(100, t1);
+  EXPECT_EQ(100, data.weight_.load());
+  EXPECT_EQ(t1, data.non_empty_since_.load());
+  EXPECT_EQ(t1, data.last_update_time_.load());
+
+  // Second update should NOT change non_empty_since_.
+  auto t2 = MonotonicTime(std::chrono::seconds(20));
+  data.updateWeightNow(200, t2);
+  EXPECT_EQ(200, data.weight_.load());
+  EXPECT_EQ(t1, data.non_empty_since_.load()); // Still t1.
+  EXPECT_EQ(t2, data.last_update_time_.load());
 }
 
 } // namespace
