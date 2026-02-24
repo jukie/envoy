@@ -146,8 +146,11 @@ envoy_cc_test(
     deps = [
         "//source/extensions/load_balancing_policies/common:orca_weight_manager_lib",
         "//test/mocks:common_lib",
+        "//test/mocks/event:event_mocks",
         "//test/mocks/stream_info:stream_info_mocks",
         "//test/mocks/upstream:host_mocks",
+        "//test/mocks/upstream:priority_set_mocks",
+        "//test/test_common:logging_lib",
         "@xds//xds/data/orca/v3:pkg_cc_proto",
     ],
 )

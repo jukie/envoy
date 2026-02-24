@@ -1,8 +1,11 @@
 #include "source/extensions/load_balancing_policies/common/orca_weight_manager.h"
 
 #include "test/mocks/common.h"
+#include "test/mocks/event/mocks.h"
 #include "test/mocks/stream_info/mocks.h"
 #include "test/mocks/upstream/host.h"
+#include "test/mocks/upstream/priority_set.h"
+#include "test/test_common/logging.h"
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
@@ -347,6 +350,76 @@ TEST(OrcaWeightManagerTest, UpdateWeightNow_SetsNonEmptySinceOnlyOnce) {
   EXPECT_EQ(200, data.weight_.load());
   EXPECT_EQ(t1, data.non_empty_since_.load()); // Still t1.
   EXPECT_EQ(t2, data.last_update_time_.load());
+}
+
+// --- OrcaWeightManager: updateWeightsOnHosts ---
+
+// Helper to construct an OrcaWeightManager for unit testing.
+class OrcaWeightManagerDirectTest : public testing::Test {
+public:
+  void SetUp() override {
+    ON_CALL(time_system_, monotonicTime())
+        .WillByDefault(testing::Return(MonotonicTime(std::chrono::seconds(100))));
+    // MockTimer must be created before OrcaWeightManager so createTimer_ returns it.
+    new Event::MockTimer(&dispatcher_);
+    ON_CALL(priority_set_, hostSetsPerPriority())
+        .WillByDefault(testing::ReturnRef(priority_set_.host_sets_));
+  }
+
+  std::unique_ptr<OrcaWeightManager> createManager() {
+    return std::make_unique<OrcaWeightManager>(config_, priority_set_, time_system_, dispatcher_,
+                                               [this]() { weights_updated_ = true; });
+  }
+
+  OrcaWeightManagerConfig config_{
+      /*metric_names_for_computing_utilization=*/{},
+      /*error_utilization_penalty=*/0.0,
+      /*blackout_period=*/std::chrono::milliseconds(10000),
+      /*weight_expiration_period=*/std::chrono::milliseconds(180000),
+      /*weight_update_period=*/std::chrono::milliseconds(1000),
+  };
+  NiceMock<MockTimeSystem> time_system_;
+  NiceMock<Event::MockDispatcher> dispatcher_;
+  NiceMock<Upstream::MockPrioritySet> priority_set_;
+  bool weights_updated_ = false;
+};
+
+TEST_F(OrcaWeightManagerDirectTest, UpdateWeightsOnHosts_HostWithoutPolicyData) {
+  auto manager = createManager();
+
+  // Host without OrcaHostLbPolicyData.
+  auto host = std::make_shared<NiceMock<Upstream::MockHost>>();
+  ON_CALL(*host, weight()).WillByDefault(testing::Return(1));
+  Upstream::HostVector hosts{host};
+
+  // No valid ORCA weights → default weight = 1 → matches host weight → no update.
+  EXPECT_FALSE(manager->updateWeightsOnHosts(hosts));
+  EXPECT_FALSE(weights_updated_);
+}
+
+TEST_F(OrcaWeightManagerDirectTest, UpdateWeightsOnHosts_MixedHostsWithTraceLogging) {
+  // Enable trace logging so ENVOY_LOG(trace, ...) arguments (including getHostAddress) execute.
+  LogLevelSetter log_level(spdlog::level::trace);
+
+  auto manager = createManager();
+
+  // Host 1: valid ORCA data, past blackout and not expired.
+  auto host1 = std::make_shared<NiceMock<Upstream::MockHost>>();
+  host1->lb_policy_data_ = std::make_unique<OrcaHostLbPolicyData>(
+      manager->reportHandler(), 500,
+      /*non_empty_since=*/MonotonicTime(std::chrono::seconds(50)),
+      /*last_update_time=*/MonotonicTime(std::chrono::seconds(95)));
+  ON_CALL(*host1, weight()).WillByDefault(testing::Return(1));
+
+  // Host 2: no ORCA data.
+  auto host2 = std::make_shared<NiceMock<Upstream::MockHost>>();
+  ON_CALL(*host2, weight()).WillByDefault(testing::Return(1));
+
+  Upstream::HostVector hosts{host1, host2};
+
+  // host1 gets weight 500 from ORCA, host2 gets median (500) as default.
+  // Both change from 1 → 500, so weights are updated.
+  EXPECT_TRUE(manager->updateWeightsOnHosts(hosts));
 }
 
 } // namespace

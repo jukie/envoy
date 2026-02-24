@@ -155,6 +155,55 @@ TEST_P(WrrLocalityLoadBalancerTest, HostsWithoutOrcaReportsGetMedianWeight) {
   EXPECT_EQ(hostSet().hosts_[2]->weight(), 3000);
 }
 
+// Verifies that hosts without ORCA reports get the median weight with an odd number of weights.
+TEST_P(WrrLocalityLoadBalancerTest, HostsWithoutOrcaReportsGetOddMedianWeight) {
+  hostSet().healthy_hosts_ = {
+      makeTestHost(info_, "tcp://127.0.0.1:80"),
+      makeTestHost(info_, "tcp://127.0.0.1:81"),
+      makeTestHost(info_, "tcp://127.0.0.1:82"),
+      makeTestHost(info_, "tcp://127.0.0.1:83"),
+  };
+  hostSet().hosts_ = hostSet().healthy_hosts_;
+  init();
+  hostSet().runCallbacks({}, {});
+
+  // Inject reports on only the first three hosts at time 5s.
+  simTime().advanceTimeWait(std::chrono::seconds(5));
+  injectOrcaReport(hostSet().hosts_[0], 1000, 0.5);  // weight = 2000
+  injectOrcaReport(hostSet().hosts_[1], 1000, 0.25); // weight = 4000
+  injectOrcaReport(hostSet().hosts_[2], 1000, 1.0);  // weight = 1000
+
+  // Advance past blackout.
+  simTime().advanceTimeWait(std::chrono::seconds(15));
+  timer_->invokeCallback();
+
+  EXPECT_EQ(hostSet().hosts_[0]->weight(), 2000);
+  EXPECT_EQ(hostSet().hosts_[1]->weight(), 4000);
+  EXPECT_EQ(hostSet().hosts_[2]->weight(), 1000);
+  // Median of {2000, 4000, 1000} with odd count = 2000 (the middle element).
+  EXPECT_EQ(hostSet().hosts_[3]->weight(), 2000);
+}
+
+// Verifies that when no hosts have ORCA reports, all get the default weight of 1.
+TEST_P(WrrLocalityLoadBalancerTest, NoOrcaReportsAllHostsGetDefaultWeight) {
+  hostSet().healthy_hosts_ = {
+      makeTestHost(info_, "tcp://127.0.0.1:80"),
+      makeTestHost(info_, "tcp://127.0.0.1:81"),
+  };
+  hostSet().hosts_ = hostSet().healthy_hosts_;
+  init();
+  hostSet().runCallbacks({}, {});
+
+  // Advance past blackout without injecting any ORCA reports.
+  simTime().advanceTimeWait(std::chrono::seconds(20));
+  timer_->invokeCallback();
+
+  // All hosts should retain default weight of 1.
+  for (const auto& host : hostSet().hosts_) {
+    EXPECT_EQ(host->weight(), 1);
+  }
+}
+
 // Proves that updated weights affect host picking distribution through the worker LB.
 TEST_P(WrrLocalityLoadBalancerTest, WeightUpdateAffectsHostPicking) {
   hostSet().healthy_hosts_ = {
