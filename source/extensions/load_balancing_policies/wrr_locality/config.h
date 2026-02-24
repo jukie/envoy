@@ -42,7 +42,7 @@ public:
 
     const auto& lb_config = dynamic_cast<const WrrLocalityLbProto&>(config);
 
-    // Iterate through the endpoint picking policies to find CSWRR.
+    // Iterate through the endpoint picking policies to find ClientSideWeightedRoundRobin.
     for (const auto& endpoint_picking_policy : lb_config.endpoint_picking_policy().policies()) {
       auto* endpoint_picking_policy_factory =
           Config::Utility::getAndCheckFactory<Upstream::TypedLoadBalancerFactory>(
@@ -61,7 +61,7 @@ public:
               "picking policy.");
         }
 
-        // Parse the CSWRR child proto to extract ORCA parameters.
+        // Parse the ClientSideWeightedRoundRobin child proto to extract ORCA parameters.
         CswrrProto cswrr_proto;
         RETURN_IF_NOT_OK(Config::Utility::translateOpaqueConfig(
             endpoint_picking_policy.typed_extension_config().typed_config(),

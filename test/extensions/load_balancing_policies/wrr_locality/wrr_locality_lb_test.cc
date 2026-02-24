@@ -103,7 +103,7 @@ TEST_P(WrrLocalityLoadBalancerTest, OrcaReportsUpdateHostWeights) {
   }
 }
 
-// Verifies that different utilizations produce correct weight ratios.
+// Verifies that different utilization values produce correct weight ratios.
 TEST_P(WrrLocalityLoadBalancerTest, DifferentUtilizationsProduceCorrectWeights) {
   hostSet().healthy_hosts_ = {
       makeTestHost(info_, "tcp://127.0.0.1:80"),

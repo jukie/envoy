@@ -12,7 +12,7 @@ namespace LoadBalancingPolicies {
 namespace WrrLocality {
 namespace {
 
-// Helper to build a WrrLocality config message with CSWRR as the endpoint picking policy.
+// Helper to build a WrrLocality config message with ClientSideWeightedRoundRobin as the endpoint picking policy.
 envoy::extensions::load_balancing_policies::wrr_locality::v3::WrrLocality buildWrrLocalityConfig() {
   envoy::extensions::load_balancing_policies::client_side_weighted_round_robin::v3::
       ClientSideWeightedRoundRobin cswrr_config_msg;
@@ -80,7 +80,7 @@ TEST(WrrLocalityConfigTest, ValidateSuccessWithOrcaParameters) {
   NiceMock<Event::MockDispatcher> mock_thread_dispatcher;
   ON_CALL(context, mainThreadDispatcher()).WillByDefault(ReturnRef(mock_thread_dispatcher));
 
-  // Build CSWRR config with custom ORCA parameters.
+  // Build ClientSideWeightedRoundRobin config with custom ORCA parameters.
   envoy::extensions::load_balancing_policies::client_side_weighted_round_robin::v3::
       ClientSideWeightedRoundRobin cswrr_config_msg;
   cswrr_config_msg.mutable_blackout_period()->set_seconds(20);
