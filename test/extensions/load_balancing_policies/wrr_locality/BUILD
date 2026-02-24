@@ -27,6 +27,22 @@ envoy_extension_cc_test(
 )
 
 envoy_extension_cc_test(
+    name = "wrr_locality_lb_test",
+    srcs = ["wrr_locality_lb_test.cc"],
+    extension_names = ["envoy.load_balancing_policies.wrr_locality"],
+    rbe_pool = "6gig",
+    deps = [
+        "//source/extensions/load_balancing_policies/wrr_locality:wrr_locality_lb_lib",
+        "//test/extensions/load_balancing_policies/common:load_balancer_base_test_lib",
+        "//test/mocks/event:event_mocks",
+        "//test/mocks/stream_info:stream_info_mocks",
+        "//test/mocks/thread_local:thread_local_mocks",
+        "@envoy_api//envoy/extensions/load_balancing_policies/round_robin/v3:pkg_cc_proto",
+        "@xds//xds/data/orca/v3:pkg_cc_proto",
+    ],
+)
+
+envoy_extension_cc_test(
     name = "integration_test",
     size = "large",
     srcs = ["integration_test.cc"],

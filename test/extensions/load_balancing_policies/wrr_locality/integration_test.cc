@@ -19,8 +19,21 @@ namespace LoadBalancingPolicies {
 namespace WrrLocality {
 namespace {
 
-void configureClusterLoadBalancingPolicy(envoy::config::cluster::v3::Cluster& cluster) {
+void configureClusterLoadBalancingPolicy(envoy::config::cluster::v3::Cluster& cluster,
+                                         bool use_zone_aware = false) {
   auto* policy = cluster.mutable_load_balancing_policy();
+
+  std::string locality_config_yaml;
+  if (use_zone_aware) {
+    locality_config_yaml = R"EOF(
+              locality_lb_config:
+                zone_aware_lb_config:
+                  routing_enabled:
+                    value: 100
+                  min_cluster_size:
+                    value: 1
+    )EOF";
+  }
 
   // Configure WRR-Locality LB policy on the cluster level, with a
   // ClientSideWeightedRoundRobinLoadBalancer per-locality LB policy that disables the
@@ -28,7 +41,7 @@ void configureClusterLoadBalancingPolicy(envoy::config::cluster::v3::Cluster& cl
   // currently the only per-locality LB policy that works with WRR-Locality. Note that the field
   // `enable_oob_load_report` isn't being used at the moment in Envoy, making this configuration
   // the default ClientSideWeightedRoundRobinLoadBalancer settings.
-  const std::string policy_yaml = R"EOF(
+  const std::string policy_yaml = fmt::format(R"EOF(
       policies:
       - typed_extension_config:
           name: envoy.load_balancing_policies.wrr_locality
@@ -40,8 +53,9 @@ void configureClusterLoadBalancingPolicy(envoy::config::cluster::v3::Cluster& cl
                     name: envoy.load_balancing_policies.weighted_round_robin
                     typed_config:
                         "@type": type.googleapis.com/envoy.extensions.load_balancing_policies.client_side_weighted_round_robin.v3.ClientSideWeightedRoundRobin
-                        enable_oob_load_report: false
-      )EOF";
+                        enable_oob_load_report: false{}
+      )EOF",
+                                              locality_config_yaml);
 
   TestUtility::loadFromYaml(policy_yaml, *policy);
 }
@@ -368,6 +382,89 @@ TEST_P(WrrLocalityEdsIntegrationTest, AddRemoveLocality) {
     }
   }
 }
+
+// Testing the WRR-Locality LB policy with zone_aware_lb_config.
+class WrrLocalityZoneAwareIntegrationTest
+    : public testing::TestWithParam<Network::Address::IpVersion>,
+      public HttpIntegrationTest {
+public:
+  WrrLocalityZoneAwareIntegrationTest() : HttpIntegrationTest(Http::CodecType::HTTP1, GetParam()) {
+    setUpstreamCount(kLocalitiesNum);
+  }
+
+  void initializeConfig(const std::vector<uint32_t>& localities_weights) {
+    ASSERT(localities_weights.size() == kLocalitiesNum);
+    autonomous_upstream_ = true;
+    config_helper_.addConfigModifier(
+        [&localities_weights](envoy::config::bootstrap::v3::Bootstrap& bootstrap) {
+          auto* cluster_0 = bootstrap.mutable_static_resources()->mutable_clusters()->Mutable(0);
+          ASSERT(cluster_0->name() == "cluster_0");
+
+          constexpr absl::string_view locality_yaml = R"EOF(
+          lb_endpoints:
+          - endpoint:
+              address:
+                socket_address:
+                  address: {}
+                  port_value: 0
+          load_balancing_weight: {}
+          locality:
+            sub_zone: {}
+          )EOF";
+          const std::string local_address = Network::Test::getLoopbackAddressString(GetParam());
+
+          cluster_0->mutable_load_assignment()->clear_endpoints();
+          for (uint32_t i = 0; i < kLocalitiesNum; ++i) {
+            auto* locality = cluster_0->mutable_load_assignment()->mutable_endpoints()->Add();
+            TestUtility::loadFromYaml(fmt::format(locality_yaml, local_address,
+                                                  localities_weights[i], absl::StrCat("zone_", i)),
+                                      *locality);
+          }
+
+          // Use zone-aware config.
+          configureClusterLoadBalancingPolicy(*cluster_0, /*use_zone_aware=*/true);
+        });
+
+    HttpIntegrationTest::initialize();
+  }
+
+  static constexpr uint32_t kLocalitiesNum = 3;
+};
+
+INSTANTIATE_TEST_SUITE_P(IpVersions, WrrLocalityZoneAwareIntegrationTest,
+                         testing::ValuesIn(TestEnvironment::getIpVersionsForTest()));
+
+// Validate that WrrLocality with zone_aware_lb_config accepts traffic and
+// distributes it across localities (zone-aware routing details depend on zone
+// topology, so this is primarily a smoke test for the new config path).
+TEST_P(WrrLocalityZoneAwareIntegrationTest, ZoneAwareWithLocalityLbConfig) {
+  constexpr uint32_t requests_num = 30;
+  const std::vector<uint32_t> localities_weights({10, 10, 10});
+  initializeConfig(localities_weights);
+
+  static const Http::LowerCaseString myUpstreamIndexHeaderName("my_upstream_index");
+  for (uint32_t i = 0; i < kLocalitiesNum; ++i) {
+    std::unique_ptr<Http::TestResponseHeaderMapImpl> response_headers =
+        std::make_unique<Http::TestResponseHeaderMapImpl>(
+            Http::TestResponseHeaderMapImpl({{":status", "200"}}));
+    response_headers->setCopy(myUpstreamIndexHeaderName, absl::StrCat(i));
+    reinterpret_cast<AutonomousUpstream*>(fake_upstreams_[i].get())
+        ->setResponseHeaders(std::move(response_headers));
+  }
+
+  uint32_t success_count = 0;
+  for (uint32_t i = 0; i < requests_num; ++i) {
+    BufferingStreamDecoderPtr response = IntegrationUtil::makeSingleRequest(
+        lookupPort("http"), "GET", "/", "", downstream_protocol_, version_, "example.com");
+    ASSERT_TRUE(response->complete());
+    EXPECT_EQ("200", response->headers().getStatusValue());
+    success_count++;
+    cleanupUpstreamAndDownstream();
+  }
+  // All requests should succeed.
+  EXPECT_EQ(requests_num, success_count);
+}
+
 } // namespace
 } // namespace WrrLocality
 } // namespace LoadBalancingPolicies

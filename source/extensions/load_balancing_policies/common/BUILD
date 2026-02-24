@@ -45,6 +45,19 @@ envoy_cc_library(
 )
 
 envoy_cc_library(
+    name = "orca_weight_manager_lib",
+    srcs = ["orca_weight_manager.cc"],
+    hdrs = ["orca_weight_manager.h"],
+    deps = [
+        "//envoy/upstream:upstream_interface",
+        "//source/common/common:callback_impl_lib",
+        "//source/common/common:minimal_logger_lib",
+        "//source/common/orca:orca_load_metrics_lib",
+        "@xds//xds/data/orca/v3:pkg_cc_proto",
+    ],
+)
+
+envoy_cc_library(
     name = "load_balancer_lib",
     srcs = ["load_balancer_impl.cc"],
     hdrs = ["load_balancer_impl.h"],

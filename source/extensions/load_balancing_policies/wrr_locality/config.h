@@ -7,8 +7,9 @@
 #include "envoy/server/factory_context.h"
 #include "envoy/upstream/load_balancer.h"
 
-#include "source/common/common/logger.h"
-#include "source/extensions/load_balancing_policies/client_side_weighted_round_robin/client_side_weighted_round_robin_lb.h"
+#include "source/common/config/utility.h"
+#include "source/common/protobuf/utility.h"
+#include "source/extensions/load_balancing_policies/client_side_weighted_round_robin/config.h"
 #include "source/extensions/load_balancing_policies/common/factory_base.h"
 #include "source/extensions/load_balancing_policies/wrr_locality/wrr_locality_lb.h"
 
@@ -36,12 +37,14 @@ public:
   absl::StatusOr<Upstream::LoadBalancerConfigPtr>
   loadConfig(Server::Configuration::ServerFactoryContext& context,
              const Protobuf::Message& config) override {
+    using CswrrProto = envoy::extensions::load_balancing_policies::
+        client_side_weighted_round_robin::v3::ClientSideWeightedRoundRobin;
+
     const auto& lb_config = dynamic_cast<const WrrLocalityLbProto&>(config);
-    Upstream::TypedLoadBalancerFactory* endpoint_picking_policy_factory = nullptr;
-    // Iterate through the list of endpoint picking policies to find the first one that we know
-    // about.
+
+    // Iterate through the endpoint picking policies to find CSWRR.
     for (const auto& endpoint_picking_policy : lb_config.endpoint_picking_policy().policies()) {
-      endpoint_picking_policy_factory =
+      auto* endpoint_picking_policy_factory =
           Config::Utility::getAndCheckFactory<Upstream::TypedLoadBalancerFactory>(
               endpoint_picking_policy.typed_extension_config(),
               /*is_optional=*/true);
@@ -57,19 +60,42 @@ public:
               "ClientSideWeightedRoundRobinLoadBalancer as its endpoint "
               "picking policy.");
         }
-        // Load and validate the configuration.
-        auto sub_lb_proto_message = endpoint_picking_policy_factory->createEmptyConfigProto();
+
+        // Parse the CSWRR child proto to extract ORCA parameters.
+        CswrrProto cswrr_proto;
         RETURN_IF_NOT_OK(Config::Utility::translateOpaqueConfig(
             endpoint_picking_policy.typed_extension_config().typed_config(),
-            context.messageValidationVisitor(), *sub_lb_proto_message));
+            context.messageValidationVisitor(), cswrr_proto));
 
-        auto lb_config_or_error =
-            endpoint_picking_policy_factory->loadConfig(context, *sub_lb_proto_message);
-        RETURN_IF_NOT_OK(lb_config_or_error.status());
+        std::vector<std::string> metric_names(
+            cswrr_proto.metric_names_for_computing_utilization().begin(),
+            cswrr_proto.metric_names_for_computing_utilization().end());
+        double error_utilization_penalty = cswrr_proto.error_utilization_penalty().value();
+        auto blackout_period = std::chrono::milliseconds(
+            PROTOBUF_GET_MS_OR_DEFAULT(cswrr_proto, blackout_period, 10000));
+        auto weight_expiration_period = std::chrono::milliseconds(
+            PROTOBUF_GET_MS_OR_DEFAULT(cswrr_proto, weight_expiration_period, 180000));
+        auto weight_update_period = std::chrono::milliseconds(
+            PROTOBUF_GET_MS_OR_DEFAULT(cswrr_proto, weight_update_period, 1000));
 
-        auto wrr_locality_lb_config = std::make_unique<WrrLocalityLbConfig>(
-            *endpoint_picking_policy_factory, std::move(lb_config_or_error.value()));
-        return Upstream::LoadBalancerConfigPtr{wrr_locality_lb_config.release()};
+        // Build the RoundRobinConfig proto with locality_lb_config and slow_start_config.
+        RoundRobinConfig round_robin_config;
+        if (cswrr_proto.has_slow_start_config()) {
+          *round_robin_config.mutable_slow_start_config() = cswrr_proto.slow_start_config();
+        }
+
+        // Extract locality_lb_config from the WrrLocality proto, or synthesize a
+        // default locality_weighted_lb_config for backwards compatibility.
+        if (lb_config.has_locality_lb_config()) {
+          *round_robin_config.mutable_locality_lb_config() = lb_config.locality_lb_config();
+        } else {
+          round_robin_config.mutable_locality_lb_config()->mutable_locality_weighted_lb_config();
+        }
+
+        return Upstream::LoadBalancerConfigPtr{new WrrLocalityLbConfig(
+            std::move(metric_names), error_utilization_penalty, blackout_period,
+            weight_expiration_period, weight_update_period, std::move(round_robin_config),
+            context.mainThreadDispatcher(), context.threadLocal())};
       }
     }
 
