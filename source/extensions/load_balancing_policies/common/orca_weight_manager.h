@@ -25,7 +25,7 @@ namespace Common {
 using OrcaLoadReportProto = xds::data::orca::v3::OrcaLoadReport;
 
 /**
- * Configuration for OrcaWeightManager, extracted from CSWRR typed LB config.
+ * Configuration for OrcaWeightManager.
  */
 struct OrcaWeightManagerConfig {
   std::vector<std::string> metric_names_for_computing_utilization;
