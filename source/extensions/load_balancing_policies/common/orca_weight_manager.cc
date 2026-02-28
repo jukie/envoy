@@ -226,7 +226,7 @@ OrcaWeightManager::getWeightIfValidFromHost(const Upstream::Host& host,
   auto client_side_data = host.typedLbPolicyData<OrcaHostLbPolicyData>();
   if (!client_side_data.has_value()) {
     ENVOY_LOG_MISC(trace, "Host does not have OrcaHostLbPolicyData {}", getHostAddress(&host));
-    return std::nullopt;
+    return absl::nullopt;
   }
   return client_side_data->getWeightIfValid(max_non_empty_since, min_last_update_time);
 }

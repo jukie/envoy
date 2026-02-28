@@ -10,7 +10,6 @@
 #include "test/mocks/stream_info/mocks.h"
 #include "test/mocks/upstream/host.h"
 #include "test/mocks/upstream/priority_set.h"
-#include "test/test_common/logging.h"
 #include "test/test_common/simulated_time_system.h"
 
 #include "gmock/gmock.h"

@@ -102,13 +102,13 @@ struct OrcaHostLbPolicyData : public Envoy::Upstream::HostLbPolicyData {
                                             MonotonicTime min_last_update_time) {
     // If non_empty_since_ is too recent, we should use the default weight.
     if (max_non_empty_since < non_empty_since_.load()) {
-      return std::nullopt;
+      return absl::nullopt;
     }
     // If last update time is too old, we should use the default weight.
     if (last_update_time_.load() < min_last_update_time) {
       // Reset the non_empty_since_ time so the timer will start again.
       non_empty_since_.store(OrcaHostLbPolicyData::kDefaultNonEmptySince);
-      return std::nullopt;
+      return absl::nullopt;
     }
     return weight_;
   }
