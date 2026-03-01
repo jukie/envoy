@@ -2051,6 +2051,13 @@ envoy.load_balancing_policies.wrr_locality:
   status: alpha
   type_urls:
   - envoy.extensions.load_balancing_policies.wrr_locality.v3.WrrLocality
+envoy.load_balancing_policies.orca_locality:
+  categories:
+  - envoy.load_balancing_policies
+  security_posture: unknown
+  status: alpha
+  type_urls:
+  - envoy.extensions.load_balancing_policies.orca_locality.v3.OrcaLocalityLbConfig
 envoy.load_balancing_policies.dynamic_modules:
   categories:
   - envoy.load_balancing_policies

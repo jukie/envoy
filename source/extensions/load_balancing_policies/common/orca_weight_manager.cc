@@ -86,6 +86,11 @@ absl::Status OrcaLoadReportHandler::updateClientSideDataFromOrcaLoadReport(
     return weight.status();
   }
 
+  // Store the raw utilization for locality-level aggregation.
+  const double utilization =
+      getUtilizationFromOrcaReport(orca_load_report, metric_names_for_computing_utilization_);
+  client_side_data.updateUtilization(utilization);
+
   // Update client side data attached to the host.
   client_side_data.updateWeightNow(weight.value(), time_source_.monotonicTime());
   return absl::OkStatus();

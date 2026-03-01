@@ -33,6 +33,8 @@ public:
         lb_config, cluster_info, priority_set, runtime, random, time_source);
   }
 
+  bool managesOrcaWeights() const override { return true; }
+
   absl::StatusOr<Upstream::LoadBalancerConfigPtr>
   loadConfig(Server::Configuration::ServerFactoryContext& context,
              const Protobuf::Message& config) override {

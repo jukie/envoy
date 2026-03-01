@@ -96,6 +96,12 @@ struct OrcaHostLbPolicyData : public Envoy::Upstream::HostLbPolicyData {
     }
   }
 
+  // Store the raw utilization value from the ORCA load report.
+  void updateUtilization(double utilization) { last_utilization_.store(utilization); }
+
+  // Get the raw utilization value from the last ORCA load report.
+  double lastUtilization() const { return last_utilization_.load(); }
+
   // Get the weight if it was updated between max_non_empty_since and min_last_update_time,
   // otherwise return nullopt.
   absl::optional<uint32_t> getWeightIfValid(MonotonicTime max_non_empty_since,
@@ -114,6 +120,9 @@ struct OrcaHostLbPolicyData : public Envoy::Upstream::HostLbPolicyData {
   }
 
   OrcaLoadReportHandlerSharedPtr report_handler_;
+
+  // Raw utilization from the last ORCA load report, used by locality-level aggregation.
+  std::atomic<double> last_utilization_ = 0.0;
 
   // Weight as calculated from the last load report.
   std::atomic<uint32_t> weight_ = 1;
