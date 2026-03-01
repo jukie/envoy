@@ -190,6 +190,7 @@ TEST(OrcaHostLbPolicyDataTest, OnOrcaLoadReport_Success) {
   Envoy::StreamInfo::MockStreamInfo mock_stream_info;
   EXPECT_EQ(data.onOrcaLoadReport(report, mock_stream_info), absl::OkStatus());
   EXPECT_EQ(data.weight_.load(), 2000);
+  EXPECT_DOUBLE_EQ(data.lastUtilization(), 0.5);
   EXPECT_EQ(data.non_empty_since_.load(), MonotonicTime(std::chrono::seconds(30)));
   EXPECT_EQ(data.last_update_time_.load(), MonotonicTime(std::chrono::seconds(30)));
 }

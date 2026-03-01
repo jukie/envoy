@@ -200,6 +200,13 @@ removed_config_or_runtime:
 # *Normally occurs at the end of the* :ref:`deprecation period <deprecated>`
 
 new_features:
+- area: load_balancing
+  change: |
+    Added :ref:`ORCA locality load balancing policy <envoy_v3_api_msg_extensions.load_balancing_policies.orca_locality.v3.OrcaLocalityLbConfig>`
+    that uses ORCA backend utilization reports to balance traffic across localities. Spills from overloaded
+    localities to underloaded ones proportional to headroom while enforcing minimum local routing and probe
+    traffic. Supports child endpoint-picking policies including ``client_side_weighted_round_robin`` and
+    ``round_robin``.
 - area: golang
   change: |
     Added ``DownstreamSslConnection()`` method to the Golang HTTP filter's ``StreamInfo`` interface,

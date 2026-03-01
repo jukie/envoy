@@ -399,6 +399,14 @@ public:
     return nullptr;
   }
 
+  /**
+   * @return true if this load balancer manages ORCA weight updates on hosts (i.e., attaches
+   * OrcaHostLbPolicyData and runs its own OrcaWeightManager). When used as a child policy, a
+   * parent that also uses ORCA data should skip creating its own OrcaWeightManager and instead
+   * read the shared OrcaHostLbPolicyData that this policy attached.
+   */
+  virtual bool managesOrcaWeights() const { return false; }
+
   std::string category() const override { return "envoy.load_balancing_policies"; }
 };
 

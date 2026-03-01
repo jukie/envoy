@@ -19,11 +19,11 @@ namespace LoadBalancingPolicies {
 namespace Common {
 
 namespace {
-std::string getHostAddress(const Upstream::Host* host) {
+absl::string_view getHostAddress(const Upstream::Host* host) {
   if (host == nullptr || host->address() == nullptr) {
     return "unknown";
   }
-  return host->address()->asString();
+  return host->address()->asStringView();
 }
 } // namespace
 

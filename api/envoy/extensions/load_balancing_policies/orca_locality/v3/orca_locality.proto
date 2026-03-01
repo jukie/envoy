@@ -1,0 +1,100 @@
+syntax = "proto3";
+
+package envoy.extensions.load_balancing_policies.orca_locality.v3;
+
+import "envoy/config/cluster/v3/cluster.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/wrappers.proto";
+import "udpa/annotations/status.proto";
+import "validate/validate.proto";
+
+option java_package = "io.envoyproxy.envoy.extensions.load_balancing_policies.orca_locality.v3";
+option java_outer_classname = "OrcaLocalityProto";
+option java_multiple_files = true;
+option go_package = "github.com/envoyproxy/go-control-plane/envoy/extensions/load_balancing_policies/orca_locality/v3;orca_localityv3";
+option (udpa.annotations.file_status).package_version_status = ACTIVE;
+
+// [#protodoc-title: ORCA Locality Load Balancing Policy]
+// [#extension: envoy.load_balancing_policies.orca_locality]
+
+// ORCA-driven locality-picking policy that uses backend utilization reports
+// to balance load across localities while preferring the local zone.
+//
+// This policy computes per-locality utilization from ORCA load reports and
+// spills traffic from overloaded localities to underloaded ones proportional
+// to their available headroom (1 - utilization). It converges toward equal
+// utilization across all localities.
+//
+// Wraps a child endpoint-picking policy (e.g., client_side_weighted_round_robin,
+// round_robin, least_request) which handles host selection within a locality.
+// When no child is configured, uses built-in weighted random host selection.
+// [#next-free-field: 11]
+message OrcaLocalityLbConfig {
+
+  // The child LB policy for endpoint selection within the chosen locality.
+  // Optional. When set, delegates host selection within the chosen locality
+  // to the specified endpoint-picking policy. Recommended children:
+  //
+  // - ``client_side_weighted_round_robin``: ORCA-aware host selection. When
+  //   used, this policy does NOT create its own ORCA weight manager — the child
+  //   handles per-host ORCA weight management while this policy reads
+  //   utilization data for locality-level decisions.
+  // - ``round_robin``, ``least_request``: Simple host selection. This policy
+  //   creates its own ORCA weight manager to set host weights that these
+  //   children will respect.
+  //
+  // When absent, uses built-in weighted random host selection based on
+  // ORCA-derived host weights.
+  config.cluster.v3.LoadBalancingPolicy endpoint_picking_policy = 1;
+
+  // ORCA metric names used to compute host utilization. Checked in order:
+  // 1. application_utilization from ORCA report
+  // 2. These named metrics (first match wins)
+  // 3. cpu_utilization fallback
+  // If empty, uses the default ORCA utilization resolution order.
+  repeated string metric_names_for_computing_utilization = 2;
+
+  // How often to recompute per-locality utilization and update the traffic split.
+  // Smaller values react faster but cause more churn. Default: 1s.
+  google.protobuf.Duration update_period = 3;
+
+  // EMA smoothing factor for per-locality utilization (range 0.0-1.0).
+  // Higher values weight recent data more heavily. Lower values smooth more
+  // aggressively but react slower. Default: 0.3.
+  google.protobuf.DoubleValue ema_alpha = 4
+      [(validate.rules).double = {gt: 0.0, lte: 1.0}];
+
+  // Percentage of traffic to send to remote zones even when the local zone
+  // is balanced, to keep remote ORCA data fresh. Range [0, 100]. Default: 5.
+  google.protobuf.UInt32Value probe_traffic_percent = 5
+      [(validate.rules).uint32 = {lte: 100}];
+
+  // Per-locality utilization deviation threshold. When the absolute difference
+  // between local utilization and the global average is within this threshold,
+  // the policy snaps to local-only routing (minus probe traffic).
+  // Range [0.0, 1.0]. Default: 0.05 (5%).
+  google.protobuf.DoubleValue utilization_variance_threshold = 6
+      [(validate.rules).double = {gte: 0.0, lte: 1.0}];
+
+  // Minimum percentage of traffic to always keep local, regardless of
+  // utilization imbalance. Prevents runaway spilling. Range [0, 100]. Default: 50.
+  google.protobuf.UInt32Value minimum_local_percent = 7
+      [(validate.rules).uint32 = {lte: 100}];
+
+  // Period after which ORCA data for a host is considered stale and ignored.
+  // Hosts without fresh data are excluded from utilization calculations.
+  // Default: 180s.
+  google.protobuf.Duration weight_expiration_period = 8;
+
+  // Period after a host first reports ORCA data before its utilization is
+  // included in locality calculations. Prevents newly joined hosts from
+  // skewing averages. Default: 10s.
+  google.protobuf.Duration blackout_period = 9;
+
+  // Penalty applied to erroring hosts when computing ORCA-based host weights
+  // within a locality (used when the child policy is not ORCA-aware, e.g.,
+  // round_robin or least_request). A higher value penalizes erroring hosts more
+  // aggressively. Range: >= 0.0. Default: 1.0.
+  google.protobuf.DoubleValue error_utilization_penalty = 10
+      [(validate.rules).double = {gte: 0.0}];
+}

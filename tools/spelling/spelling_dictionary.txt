@@ -160,6 +160,7 @@ CRT
 CSDS
 CSRF
 CSS
+CSWRR
 CSV
 CTX
 CVC
@@ -189,6 +190,7 @@ EDESTRUCTION
 EDF
 EINVAL
 ELB
+EMA
 ENOENT
 ENV
 EOF
@@ -1532,6 +1534,7 @@ unary
 unconfigurable
 undef
 underflowing
+underloaded
 unfreed
 unicast
 unicode

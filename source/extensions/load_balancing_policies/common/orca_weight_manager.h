@@ -102,8 +102,22 @@ struct OrcaHostLbPolicyData : public Envoy::Upstream::HostLbPolicyData {
   // Get the raw utilization value from the last ORCA load report.
   double lastUtilization() const { return last_utilization_.load(); }
 
+  // Check whether this host's ORCA data is within the blackout period and not expired.
+  // Read-only: does not mutate any state. Use this when you only need a validity predicate
+  // and do NOT want to reset the blackout timer on expiry (e.g., locality utilization reads).
+  bool isDataValid(MonotonicTime max_non_empty_since, MonotonicTime min_last_update_time) const {
+    if (max_non_empty_since < non_empty_since_.load()) {
+      return false; // In blackout period.
+    }
+    if (last_update_time_.load() < min_last_update_time) {
+      return false; // Expired.
+    }
+    return true;
+  }
+
   // Get the weight if it was updated between max_non_empty_since and min_last_update_time,
-  // otherwise return nullopt.
+  // otherwise return nullopt. Resets the blackout timer when data is expired so the host
+  // re-enters the blackout period after it starts reporting again.
   absl::optional<uint32_t> getWeightIfValid(MonotonicTime max_non_empty_since,
                                             MonotonicTime min_last_update_time) {
     // If non_empty_since_ is too recent, we should use the default weight.
@@ -159,7 +173,7 @@ public:
   bool updateWeightsOnHosts(const Upstream::HostVector& hosts);
 
   // Accessor for the report handler (used by tests and for creating host data).
-  OrcaLoadReportHandlerSharedPtr reportHandler() { return report_handler_; }
+  const OrcaLoadReportHandlerSharedPtr& reportHandler() const { return report_handler_; }
 
   // Get weight based on host LB policy data if valid, otherwise return nullopt.
   static absl::optional<uint32_t> getWeightIfValidFromHost(const Upstream::Host& host,
