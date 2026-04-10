@@ -119,6 +119,13 @@ public:
                                         const StreamInfo::StreamInfo& /*stream_info*/) {
     return absl::OkStatus();
   }
+
+  /**
+   * @return true if OOB load reporting is configured for this host's LB policy.
+   * When true, per-request ORCA delivery to the LB policy is suppressed
+   * (the LB receives data via OOB streams instead).
+   */
+  virtual bool oobReportingConfigured() const { return false; }
 };
 
 using HostLbPolicyDataPtr = std::unique_ptr<HostLbPolicyData>;

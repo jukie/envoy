@@ -112,7 +112,8 @@ ClientSideWeightedRoundRobinLoadBalancer::ClientSideWeightedRoundRobinLoadBalanc
   orca_weight_manager_ =
       std::make_unique<Extensions::LoadBalancingPolicies::Common::OrcaWeightManager>(
           orca_config, priority_set, time_source, typed_lb_config->main_thread_dispatcher_,
-          [factory = factory_]() { factory->applyWeightsToAllWorkers(); });
+          [factory = factory_]() { factory->applyWeightsToAllWorkers(); }, random,
+          cluster_info.statsScope());
 }
 
 absl::Status ClientSideWeightedRoundRobinLoadBalancer::initialize() {

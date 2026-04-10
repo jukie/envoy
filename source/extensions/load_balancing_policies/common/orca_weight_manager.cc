@@ -19,15 +19,6 @@ namespace Extensions {
 namespace LoadBalancingPolicies {
 namespace Common {
 
-namespace {
-std::string getHostAddress(const Upstream::Host* host) {
-  if (host == nullptr || host->address() == nullptr) {
-    return "unknown";
-  }
-  return host->address()->asString();
-}
-} // namespace
-
 OrcaLoadReportHandler::OrcaLoadReportHandler(const OrcaWeightManagerConfig& config,
                                              TimeSource& time_source)
     : metric_names_for_computing_utilization_(config.metric_names_for_computing_utilization),
@@ -124,29 +115,60 @@ absl::Status OrcaHostLbPolicyData::onOrcaLoadReport(const Upstream::OrcaLoadRepo
 OrcaWeightManager::OrcaWeightManager(const OrcaWeightManagerConfig& config,
                                      const Upstream::PrioritySet& priority_set,
                                      TimeSource& time_source, Event::Dispatcher& dispatcher,
-                                     WeightsUpdatedCb on_weights_updated)
-    : report_handler_(std::make_shared<OrcaLoadReportHandler>(config, time_source)),
+                                     WeightsUpdatedCb on_weights_updated,
+                                     Random::RandomGenerator& random, Stats::Scope& stats_scope)
+    : dispatcher_(dispatcher), oob_reporting_period_(config.oob_reporting_period), random_(random),
+      report_handler_(std::make_shared<OrcaLoadReportHandler>(config, time_source)),
       priority_set_(priority_set), time_source_(time_source),
       blackout_period_(config.blackout_period),
       weight_expiration_period_(config.weight_expiration_period),
       weight_update_period_(config.weight_update_period),
-      on_weights_updated_(std::move(on_weights_updated)) {
+      on_weights_updated_(std::move(on_weights_updated)),
+      enable_oob_load_report_(config.enable_oob_load_report) {
   weight_calculation_timer_ = dispatcher.createTimer([this]() -> void {
     updateWeightsOnMainThread();
     weight_calculation_timer_->enableTimer(weight_update_period_);
   });
+  if (enable_oob_load_report_) {
+    // See the class-level doxygen in orca_weight_manager.h for the "at most
+    // one OOB-enabled manager per stats scope" invariant that this unscoped
+    // prefix relies on.
+    oob_stats_ = std::make_unique<Orca::OrcaOobStats>(
+        Orca::OrcaOobStats{ALL_ORCA_OOB_STATS(POOL_COUNTER_PREFIX(stats_scope, "orca_oob."),
+                                              POOL_GAUGE_PREFIX(stats_scope, "orca_oob."))});
+  }
+}
+
+OrcaWeightManager::~OrcaWeightManager() {
+  // OrcaOobSession::stop() calls client_->close(NoFlush), which can re-enter
+  // the session via connection close callbacks. Hand the session off to the
+  // dispatcher's deferred delete list instead of destroying it synchronously
+  // as the map is torn down. The dispatcher is assumed to outlive the
+  // manager (typical Envoy pattern — owned by the main thread dispatcher).
+  for (auto& [_, entry] : oob_sessions_) {
+    if (entry.session) {
+      entry.session->stop();
+      dispatcher_.deferredDelete(std::move(entry.session));
+    }
+  }
 }
 
 absl::Status OrcaWeightManager::initialize() {
+  if (enable_oob_load_report_ && oob_reporting_period_ < std::chrono::milliseconds(1)) {
+    return absl::InvalidArgumentError(
+        "orca: oob_reporting_period must be >= 1ms when OOB load reporting is enabled");
+  }
   // Ensure that all hosts have LB policy data.
   for (const auto& host_set : priority_set_.hostSetsPerPriority()) {
     addLbPolicyDataToHosts(host_set->hosts());
   }
 
   // Setup a callback to receive priority set updates.
-  priority_update_cb_ = priority_set_.addPriorityUpdateCb(
-      [this](uint32_t, const Upstream::HostVector& hosts_added, const Upstream::HostVector&) {
+  priority_update_cb_ =
+      priority_set_.addPriorityUpdateCb([this](uint32_t, const Upstream::HostVector& hosts_added,
+                                               const Upstream::HostVector& hosts_removed) {
         addLbPolicyDataToHosts(hosts_added);
+        stopOobSessions(hosts_removed);
         updateWeightsOnMainThread();
       });
 
@@ -194,7 +216,7 @@ bool OrcaWeightManager::updateWeightsOnHosts(const Upstream::HostVector& hosts) 
       weights.push_back(new_weight);
       if (new_weight != host_ptr->weight()) {
         host_ptr->weight(new_weight);
-        ENVOY_LOG(trace, "updateWeights hostWeight {} = {}", getHostAddress(host_ptr.get()),
+        ENVOY_LOG(trace, "updateWeights hostWeight {} = {}", host_ptr->address()->asString(),
                   host_ptr->weight());
         weights_updated = true;
       }
@@ -225,8 +247,8 @@ bool OrcaWeightManager::updateWeightsOnHosts(const Upstream::HostVector& hosts) 
     for (const auto& host_ptr : hosts_with_default_weight) {
       if (default_weight != host_ptr->weight()) {
         host_ptr->weight(default_weight);
-        ENVOY_LOG(trace, "updateWeights default hostWeight {} = {}", getHostAddress(host_ptr.get()),
-                  host_ptr->weight());
+        ENVOY_LOG(trace, "updateWeights default hostWeight {} = {}",
+                  host_ptr->address()->asString(), host_ptr->weight());
         weights_updated = true;
       }
     }
@@ -237,10 +259,91 @@ bool OrcaWeightManager::updateWeightsOnHosts(const Upstream::HostVector& hosts) 
 void OrcaWeightManager::addLbPolicyDataToHosts(const Upstream::HostVector& hosts) {
   for (const auto& host_ptr : hosts) {
     if (!host_ptr->typedLbPolicyData<OrcaHostLbPolicyData>().has_value()) {
-      ENVOY_LOG(trace, "Adding LB policy data to Host {}", getHostAddress(host_ptr.get()));
-      host_ptr->addLbPolicyData(std::make_unique<OrcaHostLbPolicyData>(report_handler_));
+      ENVOY_LOG(trace, "Adding LB policy data to Host {}", host_ptr->address()->asString());
+      host_ptr->addLbPolicyData(
+          std::make_unique<OrcaHostLbPolicyData>(report_handler_, enable_oob_load_report_));
+    }
+    if (enable_oob_load_report_) {
+      startOobSession(host_ptr);
     }
   }
+}
+
+Orca::OrcaOobSessionPtr OrcaWeightManager::createOobSession(const Upstream::HostSharedPtr& host,
+                                                            Orca::OrcaOobCallbacks& callbacks,
+                                                            Orca::OrcaOobStats& stats) {
+  return std::make_unique<Orca::OrcaOobSession>(host, dispatcher_, random_, oob_reporting_period_,
+                                                callbacks, stats);
+}
+
+void OrcaWeightManager::startOobSession(const Upstream::HostSharedPtr& host) {
+  if (!enable_oob_load_report_ || !oob_stats_) {
+    return;
+  }
+  // OOB reporting requires HTTP/2 (hardcoded in OrcaOobSession::createCodecClient).
+  // If the cluster does not advertise HTTP/2, skip session creation for this host
+  // to avoid a reconnect loop at runtime. Other hosts in the same manager continue
+  // to work normally.
+  if ((host->cluster().features() & Upstream::ClusterInfo::Features::HTTP2) == 0) {
+    ENVOY_LOG(warn, "orca: OOB reporting requires HTTP/2 cluster; skipping host {}",
+              host->address()->asString());
+    oob_stats_->non_h2_host_skipped_.inc();
+    return;
+  }
+  auto* host_raw = host.get();
+  if (oob_sessions_.contains(host_raw)) {
+    return;
+  }
+  auto callback = std::make_unique<OobCallbackAdapter>(*host_raw);
+  auto session = createOobSession(host, *callback, *oob_stats_);
+  session->start();
+  oob_sessions_[host_raw] = {std::move(callback), std::move(session)};
+}
+
+void OrcaWeightManager::stopOobSessions(const Upstream::HostVector& hosts_removed) {
+  for (const auto& host_ptr : hosts_removed) {
+    auto it = oob_sessions_.find(host_ptr.get());
+    if (it != oob_sessions_.end()) {
+      it->second.session->stop();
+      // Defer session destruction: stop() may re-enter via connection close
+      // callbacks, so it's unsafe to destroy the session synchronously here.
+      // See source/extensions/health_checkers/grpc/health_checker_impl.cc for
+      // the same pattern.
+      dispatcher_.deferredDelete(std::move(it->second.session));
+      oob_sessions_.erase(it);
+    }
+  }
+}
+
+void OrcaWeightManager::OobCallbackAdapter::onOrcaOobReport(
+    const xds::data::orca::v3::OrcaLoadReport& report) {
+  auto host_data = host_.typedLbPolicyData<OrcaHostLbPolicyData>();
+  if (host_data.has_value()) {
+    ASSERT(host_data->report_handler_ != nullptr);
+    auto status =
+        host_data->report_handler_->updateClientSideDataFromOrcaLoadReport(report, *host_data);
+    if (!status.ok()) {
+      ENVOY_LOG(debug, "OOB report handler failed for host {}: {}", host_.address()->asString(),
+                status.message());
+    }
+  }
+}
+
+void OrcaWeightManager::OobCallbackAdapter::onOrcaOobStreamFailure(
+    Grpc::Status::GrpcStatus status) {
+  // v1 limitation: a permanent failure leaves the (now inert) session sitting
+  // in oob_sessions_ until its host is removed. The session has already torn
+  // down its client via deferredDelete() and will not reconnect, so this is
+  // memory overhead rather than a resource leak -- a few hundred bytes per
+  // host whose backend doesn't implement OpenRcaService. We don't post back
+  // into the manager to drop the entry here because the callback fires from
+  // inside an HTTP decode callback and the idiomatic cancel-safe dispatch
+  // path would require adding a SchedulableCallback owned by this adapter
+  // plus careful self-destruction semantics. Deferred to follow-up.
+  // TODO(jukie): drop the session from oob_sessions_ on permanent failure so
+  // hosts with broken OOB support don't accrue zombie sessions.
+  ENVOY_LOG(debug, "OOB stream failure for host {}: status={}", host_.address()->asString(),
+            status);
 }
 
 absl::optional<uint32_t>
@@ -249,7 +352,7 @@ OrcaWeightManager::getWeightIfValidFromHost(const Upstream::Host& host,
                                             MonotonicTime min_last_update_time) {
   auto client_side_data = host.typedLbPolicyData<OrcaHostLbPolicyData>();
   if (!client_side_data.has_value()) {
-    ENVOY_LOG_MISC(trace, "Host does not have OrcaHostLbPolicyData {}", getHostAddress(&host));
+    ENVOY_LOG_MISC(trace, "Host does not have OrcaHostLbPolicyData {}", host.address()->asString());
     return absl::nullopt;
   }
   return client_side_data->getWeightIfValid(max_non_empty_since, min_last_update_time);

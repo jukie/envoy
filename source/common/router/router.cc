@@ -2390,10 +2390,13 @@ void Filter::maybeProcessOrcaLoadReport(const Envoy::Http::HeaderMap& headers_or
   ASSERT(upstream_host.has_value(), "upstream host is not available for upstream request");
 
   // Inline capacity of 2 covers the typical case of 1-2 LB policies per host.
+  // Skip recipients with OOB configured -- their weight updates come from the
+  // OOB stream, not the per-request path.
   absl::InlinedVector<Upstream::HostLbPolicyData*, 2> orca_recipients;
   for (size_t i = 0; i < upstream_host->lbPolicyDataCount(); ++i) {
     auto host_lb_policy_data = upstream_host->lbPolicyDataAt(i);
-    if (host_lb_policy_data.has_value() && host_lb_policy_data->receivesOrcaLoadReport()) {
+    if (host_lb_policy_data.has_value() && host_lb_policy_data->receivesOrcaLoadReport() &&
+        !host_lb_policy_data->oobReportingConfigured()) {
       orca_recipients.push_back(host_lb_policy_data.ptr());
     }
   }

@@ -977,4 +977,12 @@ new_features:
     not currently covered by the `Envoy security policy <https://github.com/envoyproxy/envoy/blob/main/SECURITY.md>`_.
     See :repo:`bazel/SSL.md <bazel/SSL.md>` for details.
 
+- area: load_balancing
+  change: |
+    Added out-of-band (OOB) ORCA load reporting support for load balancing policies. When a load
+    balancing policy configures OOB ORCA reporting, the ``OrcaWeightManager`` now establishes per-host
+    gRPC streaming sessions to receive backend utilization reports asynchronously, with backoff-based
+    reconnection. In-band ORCA load balancer delivery is suppressed in the router when OOB reporting
+    is configured for the selected host.
+
 deprecated:
