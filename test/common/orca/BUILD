@@ -42,6 +42,27 @@ envoy_cc_test(
     ],
 )
 
+envoy_cc_test(
+    name = "orca_oob_client_test",
+    srcs = ["orca_oob_client_test.cc"],
+    deps = [
+        "//envoy/common:backoff_strategy_interface",
+        "//envoy/grpc:status",
+        "//envoy/http:async_client_interface",
+        "//source/common/common:backoff_lib",
+        "//source/common/orca:orca_oob_client_lib",
+        "//source/common/stats:isolated_store_lib",
+        "//test/mocks:common_lib",
+        "//test/mocks/event:event_mocks",
+        "//test/mocks/grpc:grpc_mocks",
+        "//test/mocks/http:http_mocks",
+        "//test/test_common:logging_lib",
+        "//test/test_common:utility_lib",
+        "@xds//xds/data/orca/v3:pkg_cc_proto",
+        "@xds//xds/service/orca/v3:pkg_cc_proto",
+    ],
+)
+
 envoy_proto_library(
     name = "orca_parser_fuzz_proto",
     srcs = ["orca_parser_fuzz.proto"],
