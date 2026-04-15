@@ -114,11 +114,11 @@ TEST_F(OrcaOobClientTest, HappyPathLifecycleAndWireFormat) {
   // Construct the client with concrete values we can verify on the wire.
   auto client = std::make_unique<OrcaOobClient>(
       mock_async_client_, dispatcher_, std::chrono::milliseconds(7500),
-      std::vector<std::string>{"foo", "bar"},
-      Upstream::LoadBalancerContext::OverrideHost{"1.2.3.4:8080", /*strict=*/true}, stats_,
-      callbacks_, OrcaOobClient::defaultBackoffStrategy(random_));
+      std::vector<std::string>{"foo", "bar"}, "1.2.3.4:8080", stats_, callbacks_,
+      OrcaOobClient::defaultBackoffStrategy(random_));
 
-  // Verify override host plumbed through.
+  // Library pins the target by translating the address into a strict upstream
+  // override host on the async stream options.
   auto override = captured_opts.upstream_override_host_;
   EXPECT_EQ(override.host, "1.2.3.4:8080");
   EXPECT_TRUE(override.strict);
@@ -206,9 +206,8 @@ TEST_F(OrcaOobClientTest, ReportIntervalZeroWireEncoding) {
           Invoke([&](Buffer::InstancePtr& msg, bool) { captured_initial_msg = std::move(msg); }));
 
   OrcaOobClient client(mock_async_client_, dispatcher_, std::chrono::milliseconds(0),
-                       std::vector<std::string>{},
-                       Upstream::LoadBalancerContext::OverrideHost{"host:1", /*strict=*/true},
-                       stats_, callbacks_, OrcaOobClient::defaultBackoffStrategy(random_));
+                       std::vector<std::string>{}, "host:1", stats_, callbacks_,
+                       OrcaOobClient::defaultBackoffStrategy(random_));
 
   ASSERT_NE(captured_initial_msg, nullptr);
   const std::string payload = captured_initial_msg->toString();
@@ -220,24 +219,6 @@ TEST_F(OrcaOobClientTest, ReportIntervalZeroWireEncoding) {
   // Clean up without firing callback.
   EXPECT_CALL(mock_stream_, resetStream());
   EXPECT_CALL(callbacks_, onStreamClosed(_, _)).Times(0);
-}
-
-TEST(OrcaOobClientDeathTest, StrictHostPinningRequired) {
-  EXPECT_DEATH(
-      {
-        NiceMock<Event::MockDispatcher> dispatcher;
-        NiceMock<Random::MockRandomGenerator> random;
-        auto async_client = std::make_shared<NiceMock<Grpc::MockAsyncClient>>();
-        Stats::IsolatedStoreImpl scope;
-        auto stats = generateOrcaOobClientStats(*scope.rootScope(), "test_orca_oob.");
-        NiceMock<MockOrcaOobReportCallbacks> callbacks;
-
-        OrcaOobClient client(
-            async_client, dispatcher, std::chrono::milliseconds(30000), std::vector<std::string>{},
-            Upstream::LoadBalancerContext::OverrideHost{"1.2.3.4:8080", /*strict=*/false}, stats,
-            callbacks, OrcaOobClient::defaultBackoffStrategy(random));
-      },
-      "strict host pinning");
 }
 
 // Transient-failure retry path:
@@ -293,8 +274,7 @@ TEST_F(OrcaOobClientTest, TransientFailuresRampBackoff) {
 
   auto client = std::make_unique<OrcaOobClient>(
       mock_async_client_, dispatcher_, std::chrono::milliseconds(7500), std::vector<std::string>{},
-      Upstream::LoadBalancerContext::OverrideHost{"1.2.3.4:8080", /*strict=*/true}, stats_,
-      callbacks_, OrcaOobClient::defaultBackoffStrategy(random_));
+      "1.2.3.4:8080", stats_, callbacks_, OrcaOobClient::defaultBackoffStrategy(random_));
 
   // First null-start should have scheduled a retry with the base delay.
   const auto delay_after_first_failure = last_retry_delay_;
@@ -356,8 +336,7 @@ TEST_F(OrcaOobClientTest, ImmediateRetryAfterFirstMessage) {
 
   auto client = std::make_unique<OrcaOobClient>(
       mock_async_client_, dispatcher_, std::chrono::milliseconds(7500), std::vector<std::string>{},
-      Upstream::LoadBalancerContext::OverrideHost{"1.2.3.4:8080", /*strict=*/true}, stats_,
-      callbacks_, OrcaOobClient::defaultBackoffStrategy(random_));
+      "1.2.3.4:8080", stats_, callbacks_, OrcaOobClient::defaultBackoffStrategy(random_));
 
   auto* stream_callbacks =
       static_cast<Grpc::AsyncStreamCallbacks<xds::data::orca::v3::OrcaLoadReport>*>(client.get());
@@ -399,8 +378,7 @@ TEST_F(OrcaOobClientTest, UnimplementedIsTerminal) {
   // Sub-case A: UNIMPLEMENTED on a fresh stream (no report received yet).
   auto client = std::make_unique<OrcaOobClient>(
       mock_async_client_, dispatcher_, std::chrono::milliseconds(30000), std::vector<std::string>{},
-      Upstream::LoadBalancerContext::OverrideHost{"1.2.3.4:8080", /*strict=*/true}, stats_,
-      callbacks_, OrcaOobClient::defaultBackoffStrategy(random_));
+      "1.2.3.4:8080", stats_, callbacks_, OrcaOobClient::defaultBackoffStrategy(random_));
 
   auto* stream_callbacks =
       static_cast<Grpc::AsyncStreamCallbacks<xds::data::orca::v3::OrcaLoadReport>*>(client.get());
@@ -437,8 +415,7 @@ TEST_F(OrcaOobClientTest, UnimplementedAfterSuccessfulReport) {
 
   auto client = std::make_unique<OrcaOobClient>(
       mock_async_client_, dispatcher_, std::chrono::milliseconds(30000), std::vector<std::string>{},
-      Upstream::LoadBalancerContext::OverrideHost{"1.2.3.4:8080", /*strict=*/true}, stats_,
-      callbacks_, OrcaOobClient::defaultBackoffStrategy(random_));
+      "1.2.3.4:8080", stats_, callbacks_, OrcaOobClient::defaultBackoffStrategy(random_));
 
   auto* stream_callbacks =
       static_cast<Grpc::AsyncStreamCallbacks<xds::data::orca::v3::OrcaLoadReport>*>(client.get());
@@ -471,8 +448,7 @@ TEST_F(OrcaOobClientTest, CloseCancelsActiveStreamAndRetryTimerNoCallbackFires) 
 
   auto client = std::make_unique<OrcaOobClient>(
       mock_async_client_, dispatcher_, std::chrono::milliseconds(30000), std::vector<std::string>{},
-      Upstream::LoadBalancerContext::OverrideHost{"1.2.3.4:8080", /*strict=*/true}, stats_,
-      callbacks_, OrcaOobClient::defaultBackoffStrategy(random_));
+      "1.2.3.4:8080", stats_, callbacks_, OrcaOobClient::defaultBackoffStrategy(random_));
 
   {
     SCOPED_TRACE("Sub-scenario A: close() on a live stream");
@@ -511,8 +487,7 @@ TEST_F(OrcaOobClientTest, CloseWhileRetryTimerPendingNoCallbackFires) {
 
   auto client = std::make_unique<OrcaOobClient>(
       mock_async_client_, dispatcher_, std::chrono::milliseconds(30000), std::vector<std::string>{},
-      Upstream::LoadBalancerContext::OverrideHost{"1.2.3.4:8080", /*strict=*/true}, stats_,
-      callbacks_, OrcaOobClient::defaultBackoffStrategy(random_));
+      "1.2.3.4:8080", stats_, callbacks_, OrcaOobClient::defaultBackoffStrategy(random_));
 
   // Close while timer is pending.
   EXPECT_CALL(*retry_timer, disableTimer());

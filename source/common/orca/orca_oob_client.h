@@ -12,7 +12,6 @@
 #include "envoy/grpc/async_client.h"
 #include "envoy/stats/scope.h"
 #include "envoy/stats/stats_macros.h"
-#include "envoy/upstream/load_balancer.h"
 
 #include "source/common/common/logger.h"
 #include "source/common/grpc/typed_async_client.h"
@@ -82,9 +81,9 @@ public:
 /**
  * Single-subscriber client for the ORCA out-of-band metrics reporting
  * protocol. Opens one xds.service.orca.v3.OpenRcaService.StreamCoreMetrics
- * server-streaming RPC against a specific upstream host (via the
- * setUpstreamOverrideHost mechanism on Http::AsyncClient::StreamOptions) and
- * delivers decoded reports to a subscriber.
+ * server-streaming RPC against a specific upstream host (pinned internally
+ * via setUpstreamOverrideHost with strict=true on Http::AsyncClient::StreamOptions)
+ * and delivers decoded reports to a subscriber.
  *
  * This class is thread-affine to the dispatcher passed at construction. All
  * public methods including close() and the destructor MUST be invoked on
@@ -96,12 +95,14 @@ public:
   /**
    * Construct and eagerly open the stream. On construction the client:
    *   - Wraps the raw async client in a typed Grpc::AsyncClient.
-   *   - Takes ownership of request_cost_names and copies override_host.host
-   *     into owned storage.
-   *   - Requires override_host.strict == true.
+   *   - Takes ownership of request_cost_names and target_address.
    *   - Calls backoff->reset() to normalize initial state.
    *   - Creates the retry timer.
    *   - Invokes openStream() immediately.
+   *
+   * The caller is responsible for selecting a valid target_address; the
+   * library does not interpret it beyond passing it through as a strict
+   * upstream override host.
    *
    * @param async_client         gRPC transport (obtained from AsyncClientManager).
    * @param dispatcher           owns all callbacks and timers; must outlive the client.
@@ -109,9 +110,8 @@ public:
    *                             configured minimum (gRFC A51 default 30s).
    * @param request_cost_names   passed through to the server; moved into
    *                             owned storage.
-   * @param override_host        target host + strict flag. The library
-   *                             requires strict=true and RELEASE_ASSERTs
-   *                             otherwise; host string is copied.
+   * @param target_address       address of the upstream host to stream
+   *                             reports from; moved into owned storage.
    * @param stats                stats struct owned by caller; must outlive client.
    * @param callbacks            subscriber; must outlive client.
    * @param backoff              required (non-null). Use defaultBackoffStrategy()
@@ -119,8 +119,7 @@ public:
    */
   OrcaOobClient(Grpc::RawAsyncClientSharedPtr async_client, Event::Dispatcher& dispatcher,
                 std::chrono::milliseconds report_interval,
-                std::vector<std::string> request_cost_names,
-                Upstream::LoadBalancerContext::OverrideHost override_host,
+                std::vector<std::string> request_cost_names, std::string target_address,
                 OrcaOobClientStats& stats, OrcaOobReportCallbacks& callbacks,
                 BackOffStrategyPtr backoff);
 
@@ -160,7 +159,7 @@ private:
   Event::Dispatcher& dispatcher_;
   const std::chrono::milliseconds report_interval_;
   const std::vector<std::string> request_cost_names_;
-  const std::string override_host_address_;
+  const std::string target_address_;
   OrcaOobClientStats& stats_;
   OrcaOobReportCallbacks& callbacks_;
   BackOffStrategyPtr backoff_;
