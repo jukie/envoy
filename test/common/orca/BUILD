@@ -11,6 +11,34 @@ licenses(["notice"])  # Apache 2
 envoy_package()
 
 envoy_cc_test(
+    name = "orca_oob_session_test",
+    srcs = ["orca_oob_session_test.cc"],
+    rbe_pool = "6gig",
+    deps = [
+        "//source/common/buffer:buffer_lib",
+        "//source/common/buffer:zero_copy_input_stream_lib",
+        "//source/common/grpc:codec_lib",
+        "//source/common/grpc:common_lib",
+        "//source/common/http:codec_client_lib",
+        "//source/common/http:header_map_lib",
+        "//source/common/orca:orca_oob_session_lib",
+        "//test/common/http:common_lib",
+        "//test/common/upstream:utility_lib",
+        "//test/mocks:common_lib",
+        "//test/mocks/event:event_mocks",
+        "//test/mocks/http:http_mocks",
+        "//test/mocks/http:stream_encoder_mock",
+        "//test/mocks/network:network_mocks",
+        "//test/mocks/upstream:cluster_info_mocks",
+        "//test/mocks/upstream:host_mocks",
+        "//test/test_common:simulated_time_system_lib",
+        "//test/test_common:utility_lib",
+        "@xds//xds/data/orca/v3:pkg_cc_proto",
+        "@xds//xds/service/orca/v3:pkg_cc_proto",
+    ],
+)
+
+envoy_cc_test(
     name = "orca_load_metrics_test",
     srcs = ["orca_load_metrics_test.cc"],
     rbe_pool = "6gig",
