@@ -2174,6 +2174,70 @@ TEST_F(HostImplTest, CreateConnectionHappyEyeballsWithEmptyConfig) {
   EXPECT_EQ(host, connection->stream_info_.upstreamInfo()->upstreamHost());
 }
 
+// Verifies that createOrcaReportingConnection uses the host's data address (and not the health
+// check address) when no metadata is supplied, and returns the host as the host_description.
+TEST_F(HostImplTest, CreateOrcaReportingConnection) {
+  MockClusterMockPrioritySet cluster;
+  envoy::config::core::v3::Locality locality;
+  Network::Address::InstanceConstSharedPtr address =
+      *Network::Utility::resolveUrl("tcp://10.0.0.1:1234");
+  auto host = std::shared_ptr<Upstream::HostImpl>(*HostImpl::create(
+      cluster.info_, "lyft.com", address, nullptr, nullptr, 1,
+      std::make_shared<const envoy::config::core::v3::Locality>(locality),
+      envoy::config::endpoint::v3::Endpoint::HealthCheckConfig::default_instance(), 1,
+      envoy::config::core::v3::UNKNOWN));
+
+  testing::StrictMock<Event::MockDispatcher> dispatcher;
+  Network::TransportSocketOptionsConstSharedPtr transport_socket_options;
+
+  auto connection = new testing::StrictMock<Network::MockClientConnection>();
+  EXPECT_CALL(*connection, setBufferLimits(0));
+  // The ORCA OOB connection should target the host's data address.
+  EXPECT_CALL(dispatcher, createClientConnection_(address, _, _, _)).WillOnce(Return(connection));
+  EXPECT_CALL(*connection, connectionInfoSetter());
+  EXPECT_CALL(*connection, streamInfo());
+  Envoy::Upstream::Host::CreateConnectionData connection_data =
+      host->createOrcaReportingConnection(dispatcher, transport_socket_options, nullptr);
+  EXPECT_EQ(connection, connection_data.connection_.get());
+  EXPECT_EQ(host, connection_data.host_description_);
+  EXPECT_EQ(host, connection->stream_info_.upstreamInfo()->upstreamHost());
+}
+
+// Verifies that createOrcaReportingConnection honors the host's additional addresses (happy
+// eyeballs), connecting to the first address in the list.
+TEST_F(HostImplTest, CreateOrcaReportingConnectionHappyEyeballs) {
+  MockClusterMockPrioritySet cluster;
+  envoy::config::core::v3::Locality locality;
+  Network::Address::InstanceConstSharedPtr address =
+      *Network::Utility::resolveUrl("tcp://10.0.0.1:1234");
+  AddressVector address_list = {
+      address,
+      *Network::Utility::resolveUrl("tcp://10.0.0.1:1235"),
+  };
+  auto host = std::shared_ptr<Upstream::HostImpl>(*HostImpl::create(
+      cluster.info_, "lyft.com", address, nullptr, nullptr, 1,
+      std::make_shared<const envoy::config::core::v3::Locality>(locality),
+      envoy::config::endpoint::v3::Endpoint::HealthCheckConfig::default_instance(), 1,
+      envoy::config::core::v3::UNKNOWN, address_list));
+
+  testing::StrictMock<Event::MockDispatcher> dispatcher;
+  Network::TransportSocketOptionsConstSharedPtr transport_socket_options;
+
+  auto connection = new testing::StrictMock<Network::MockClientConnection>();
+  EXPECT_CALL(*connection, setBufferLimits(0));
+  EXPECT_CALL(*connection, addConnectionCallbacks(_));
+  EXPECT_CALL(*connection, connectionInfoSetter());
+  EXPECT_CALL(dispatcher, createClientConnection_(address_list[0], _, _, _))
+      .WillOnce(Return(connection));
+  EXPECT_CALL(dispatcher, createTimer_(_));
+  EXPECT_CALL(*connection, streamInfo());
+  Envoy::Upstream::Host::CreateConnectionData connection_data =
+      host->createOrcaReportingConnection(dispatcher, transport_socket_options, nullptr);
+  // The created connection will be wrapped in a HappyEyeballsConnectionImpl.
+  EXPECT_NE(connection, connection_data.connection_.get());
+  EXPECT_EQ(host, connection->stream_info_.upstreamInfo()->upstreamHost());
+}
+
 TEST_F(HostImplTest, HealthFlags) {
   MockClusterMockPrioritySet cluster;
   HostSharedPtr host = makeTestHost(cluster.info_, "tcp://10.0.0.1:1234", 1);

@@ -108,5 +108,45 @@ Upstream::Host::CreateConnectionData LogicalHost::createConnection(
       std::make_shared<RealHostDescription>(address, shared_from_this()));
 }
 
+Upstream::Host::CreateConnectionData LogicalHost::createOrcaReportingConnection(
+    Event::Dispatcher& dispatcher,
+    Network::TransportSocketOptionsConstSharedPtr transport_socket_options,
+    const envoy::config::core::v3::Metadata* metadata) const {
+  Network::Address::InstanceConstSharedPtr address;
+  SharedConstAddressVector address_list_or_null;
+  {
+    absl::MutexLock lock(address_lock_);
+    address = address_;
+    address_list_or_null = address_list_or_null_;
+  }
+
+  // Preserve LogicalHost's existing transport-socket-options behavior: prefer the override if
+  // configured, otherwise fall back to the caller-provided options.
+  const auto& effective_options = override_transport_socket_options_ != nullptr
+                                      ? override_transport_socket_options_
+                                      : transport_socket_options;
+
+  // Mirror createHealthCheckConnection's metadata-driven transport socket resolution, but target
+  // the host's normal data address. When metadata is provided, resolve a transport socket factory
+  // for it; otherwise fall back to per-connection resolution if filter-state-based matching is in
+  // use, else use the host's default factory.
+  Network::UpstreamTransportSocketFactory* factory = nullptr;
+  if (metadata != nullptr) {
+    factory = &resolveTransportSocketFactory(address, metadata, effective_options);
+  } else {
+    const bool needs_per_connection_resolution =
+        cluster().transportSocketMatcher().usesFilterState() && effective_options &&
+        !effective_options->downstreamSharedFilterStateObjects().empty();
+    factory = needs_per_connection_resolution
+                  ? &resolveTransportSocketFactory(address, this->metadata().get(),
+                                                   effective_options)
+                  : &transportSocketFactory();
+  }
+
+  return HostImplBase::createConnection(
+      dispatcher, cluster(), address, address_list_or_null, *factory, nullptr, effective_options,
+      std::make_shared<RealHostDescription>(address, shared_from_this()));
+}
+
 } // namespace Upstream
 } // namespace Envoy
