@@ -3,8 +3,10 @@
 #include <memory>
 #include <vector>
 
+#include "source/common/orca/orca_oob_session.h"
 #include "source/extensions/load_balancing_policies/common/orca_weight_manager.h"
 
+#include "test/common/stats/stat_test_utility.h"
 #include "test/mocks/common.h"
 #include "test/mocks/event/mocks.h"
 #include "test/mocks/stream_info/mocks.h"
@@ -288,6 +290,21 @@ makeWeightTrackingMockHost(uint32_t initial_weight = 1) {
   return host;
 }
 
+// Test factory: records each create() call and returns a null codec client.
+// OrcaOobSession treats a null codec client as a transient failure (logged and
+// retried via backoff), which keeps the test isolated from real socket /
+// connection plumbing.
+class FakeOrcaOobCodecClientFactory : public OrcaOobCodecClientFactory {
+public:
+  Http::CodecClientPtr create(Upstream::Host::CreateConnectionData&& /*connection_data*/,
+                              Event::Dispatcher& /*dispatcher*/) const override {
+    ++create_calls_;
+    return nullptr;
+  }
+
+  mutable uint32_t create_calls_{0};
+};
+
 class OrcaWeightManagerTest : public testing::Test {
 protected:
   void SetUp() override {
@@ -298,16 +315,28 @@ protected:
     config_.weight_update_period = std::chrono::milliseconds(1000);
   }
 
+  // Helper to build the manager with the test's configured dependencies. By
+  // default no factory is injected because OOB is disabled; pass a non-null
+  // factory when enabling OOB.
+  std::unique_ptr<OrcaWeightManager>
+  makeManager(OrcaOobCodecClientFactoryPtr factory = nullptr) {
+    return std::make_unique<OrcaWeightManager>(
+        config_, priority_set_, time_system_, dispatcher_, random_, *stats_store_.rootScope(),
+        /*transport_socket_options=*/nullptr, std::move(factory),
+        [this]() { weights_updated_ = true; });
+  }
+
   OrcaWeightManagerConfig config_;
   NiceMock<Upstream::MockPrioritySet> priority_set_;
   NiceMock<Event::MockDispatcher> dispatcher_;
+  NiceMock<Random::MockRandomGenerator> random_;
+  Stats::TestUtil::TestStore stats_store_;
   Event::SimulatedTimeSystem time_system_;
   bool weights_updated_ = false;
 };
 
 TEST_F(OrcaWeightManagerTest, UpdateWeightsOnHosts_AllValid) {
-  auto manager = std::make_unique<OrcaWeightManager>(
-      config_, priority_set_, time_system_, dispatcher_, [this]() { weights_updated_ = true; });
+  auto manager = makeManager();
 
   Upstream::HostVector hosts;
   for (int i = 0; i < 3; ++i) {
@@ -328,8 +357,7 @@ TEST_F(OrcaWeightManagerTest, UpdateWeightsOnHosts_AllValid) {
 }
 
 TEST_F(OrcaWeightManagerTest, UpdateWeightsOnHosts_Mixed) {
-  auto manager = std::make_unique<OrcaWeightManager>(
-      config_, priority_set_, time_system_, dispatcher_, [this]() { weights_updated_ = true; });
+  auto manager = makeManager();
 
   Upstream::HostVector hosts;
   // First host has valid weight.
@@ -355,8 +383,7 @@ TEST_F(OrcaWeightManagerTest, UpdateWeightsOnHosts_Mixed) {
 }
 
 TEST_F(OrcaWeightManagerTest, UpdateWeightsOnHosts_AllDefault) {
-  auto manager = std::make_unique<OrcaWeightManager>(
-      config_, priority_set_, time_system_, dispatcher_, [this]() { weights_updated_ = true; });
+  auto manager = makeManager();
 
   Upstream::HostVector hosts;
   for (int i = 0; i < 2; ++i) {
@@ -372,8 +399,7 @@ TEST_F(OrcaWeightManagerTest, UpdateWeightsOnHosts_AllDefault) {
 }
 
 TEST_F(OrcaWeightManagerTest, UpdateWeightsOnHosts_EvenMedian) {
-  auto manager = std::make_unique<OrcaWeightManager>(
-      config_, priority_set_, time_system_, dispatcher_, [this]() { weights_updated_ = true; });
+  auto manager = makeManager();
 
   Upstream::HostVector hosts;
   auto h1 = makeWeightTrackingMockHost();
@@ -438,8 +464,7 @@ TEST_F(OrcaWeightManagerTest, Initialize_AttachesHostDataToExistingHosts) {
   }
 
   auto* timer = new NiceMock<Event::MockTimer>(&dispatcher_);
-  auto manager = std::make_unique<OrcaWeightManager>(
-      config_, priority_set_, time_system_, dispatcher_, [this]() { weights_updated_ = true; });
+  auto manager = makeManager();
 
   EXPECT_CALL(*timer, enableTimer(config_.weight_update_period, nullptr));
   auto status = manager->initialize();
@@ -455,8 +480,7 @@ TEST_F(OrcaWeightManagerTest, Initialize_AttachesHostDataToExistingHosts) {
 
 TEST_F(OrcaWeightManagerTest, Initialize_StartsWeightCalculationTimer) {
   auto* timer = new NiceMock<Event::MockTimer>(&dispatcher_);
-  auto manager = std::make_unique<OrcaWeightManager>(
-      config_, priority_set_, time_system_, dispatcher_, [this]() { weights_updated_ = true; });
+  auto manager = makeManager();
 
   EXPECT_CALL(*timer, enableTimer(config_.weight_update_period, nullptr));
   auto status = manager->initialize();
@@ -465,8 +489,7 @@ TEST_F(OrcaWeightManagerTest, Initialize_StartsWeightCalculationTimer) {
 
 TEST_F(OrcaWeightManagerTest, Initialize_PriorityUpdateCallbackAttachesDataToNewHosts) {
   auto* timer = new NiceMock<Event::MockTimer>(&dispatcher_);
-  auto manager = std::make_unique<OrcaWeightManager>(
-      config_, priority_set_, time_system_, dispatcher_, [this]() { weights_updated_ = true; });
+  auto manager = makeManager();
 
   EXPECT_CALL(*timer, enableTimer(config_.weight_update_period, nullptr));
   auto status = manager->initialize();
@@ -491,8 +514,7 @@ TEST_F(OrcaWeightManagerTest, Initialize_PriorityUpdateCallbackAttachesDataToNew
 
 TEST_F(OrcaWeightManagerTest, TimerCallback_UpdatesWeightsAndReenablesTimer) {
   auto* timer = new NiceMock<Event::MockTimer>(&dispatcher_);
-  auto manager = std::make_unique<OrcaWeightManager>(
-      config_, priority_set_, time_system_, dispatcher_, [this]() { weights_updated_ = true; });
+  auto manager = makeManager();
 
   EXPECT_CALL(*timer, enableTimer(config_.weight_update_period, nullptr));
   auto status = manager->initialize();
@@ -521,8 +543,7 @@ TEST_F(OrcaWeightManagerTest, TimerCallback_UpdatesWeightsAndReenablesTimer) {
 
 TEST_F(OrcaWeightManagerTest, UpdateWeightsOnMainThread_CallbackFiredOnChange) {
   new NiceMock<Event::MockTimer>(&dispatcher_);
-  auto manager = std::make_unique<OrcaWeightManager>(
-      config_, priority_set_, time_system_, dispatcher_, [this]() { weights_updated_ = true; });
+  auto manager = makeManager();
 
   // Set up hosts with valid weights that differ from current weight.
   auto* host_set = priority_set_.getMockHostSet(0);
@@ -545,8 +566,7 @@ TEST_F(OrcaWeightManagerTest, UpdateWeightsOnMainThread_CallbackFiredOnChange) {
 
 TEST_F(OrcaWeightManagerTest, UpdateWeightsOnMainThread_NoCallbackWhenNoChange) {
   new NiceMock<Event::MockTimer>(&dispatcher_);
-  auto manager = std::make_unique<OrcaWeightManager>(
-      config_, priority_set_, time_system_, dispatcher_, [this]() { weights_updated_ = true; });
+  auto manager = makeManager();
 
   // Hosts with no data — default weight is 1, same as initial.
   auto* host_set = priority_set_.getMockHostSet(0);
@@ -563,8 +583,7 @@ TEST_F(OrcaWeightManagerTest, UpdateWeightsOnMainThread_NoCallbackWhenNoChange) 
 
 TEST_F(OrcaWeightManagerTest, UpdateWeightsOnMainThread_MultiplePriorities) {
   new NiceMock<Event::MockTimer>(&dispatcher_);
-  auto manager = std::make_unique<OrcaWeightManager>(
-      config_, priority_set_, time_system_, dispatcher_, [this]() { weights_updated_ = true; });
+  auto manager = makeManager();
 
   // Priority 0: host with valid weight.
   auto* host_set0 = priority_set_.getMockHostSet(0);
@@ -594,8 +613,7 @@ TEST_F(OrcaWeightManagerTest, UpdateWeightsOnMainThread_MultiplePriorities) {
 
 TEST_F(OrcaWeightManagerTest, AddLbPolicyDataToHosts_SkipsHostsWithExistingData) {
   auto* timer = new NiceMock<Event::MockTimer>(&dispatcher_);
-  auto manager = std::make_unique<OrcaWeightManager>(
-      config_, priority_set_, time_system_, dispatcher_, [this]() { weights_updated_ = true; });
+  auto manager = makeManager();
 
   auto* host_set = priority_set_.getMockHostSet(0);
   Upstream::HostVector hosts;
@@ -631,8 +649,7 @@ TEST_F(OrcaWeightManagerTest, AddLbPolicyDataToHosts_SkipsHostsWithExistingData)
 
 TEST_F(OrcaWeightManagerTest, OddMedian) {
   new NiceMock<Event::MockTimer>(&dispatcher_);
-  auto manager = std::make_unique<OrcaWeightManager>(
-      config_, priority_set_, time_system_, dispatcher_, [this]() { weights_updated_ = true; });
+  auto manager = makeManager();
 
   Upstream::HostVector hosts;
   // 3 hosts with valid weights: 10, 20, 30 → median = 20.
@@ -654,6 +671,260 @@ TEST_F(OrcaWeightManagerTest, OddMedian) {
   EXPECT_EQ(hosts[1]->weight(), 20);
   EXPECT_EQ(hosts[2]->weight(), 30);
   EXPECT_EQ(hosts[3]->weight(), 20); // Odd median of [10, 20, 30].
+}
+
+// ============================================================
+// OrcaWeightManager OOB integration tests
+// ============================================================
+
+class OrcaWeightManagerOobTest : public OrcaWeightManagerTest {
+protected:
+  void SetUp() override {
+    OrcaWeightManagerTest::SetUp();
+    config_.oob_enabled = true;
+    config_.oob_reporting_period = std::chrono::milliseconds(10000);
+    config_.oob_request_cost_names = {"cost.foo"};
+  }
+
+  // Build a manager with OOB enabled and a tracked fake codec client factory.
+  // The factory pointer remains valid because the manager owns it via
+  // OrcaOobCodecClientFactoryPtr.
+  std::unique_ptr<OrcaWeightManager> makeOobManager() {
+    auto factory = std::make_unique<FakeOrcaOobCodecClientFactory>();
+    factory_ = factory.get();
+    return makeManager(std::move(factory));
+  }
+
+  FakeOrcaOobCodecClientFactory* factory_{nullptr};
+};
+
+// OOB disabled (the default OrcaWeightManagerTest config): we should never
+// schedule a stagger timer or invoke the codec client factory, even when hosts
+// arrive via the priority update.
+TEST_F(OrcaWeightManagerTest, OobDisabled_NoSessionsOrTimers) {
+  // Weight calculation timer.
+  new NiceMock<Event::MockTimer>(&dispatcher_);
+  auto manager = makeManager();
+  auto status = manager->initialize();
+  ASSERT_TRUE(status.ok());
+
+  auto* host_set = priority_set_.getMockHostSet(0);
+  Upstream::HostVector new_hosts;
+  for (int i = 0; i < 2; ++i) {
+    new_hosts.push_back(makeWeightTrackingMockHost());
+  }
+  host_set->hosts_ = new_hosts;
+  host_set->runCallbacks(new_hosts, {});
+
+  // No active sessions, no stream events, factory never called.
+  EXPECT_EQ(0, manager->oobStatsForTest().active_sessions_.value());
+  EXPECT_EQ(0U, manager->oobStatsForTest().stream_opens_.value());
+}
+
+// NOTE: MockTimer's ctor sets up an EXPECT_CALL(...).WillOnce(Return(this))
+// expectation. gmock matches expectations LIFO, so the LAST allocated MockTimer
+// satisfies the FIRST createTimer() call. Tests below allocate timers in the
+// REVERSE order they will be consumed by the production code:
+//   1. session goaway-drain timer (allocated first, consumed last)
+//   2. session retry timer
+//   3. stagger timer
+//   4. weight calculation timer (allocated last, consumed first by ctor)
+
+// OOB enabled + host added: a stagger timer is scheduled, but the codec
+// factory is NOT yet invoked. The factory only runs once the timer fires.
+TEST_F(OrcaWeightManagerOobTest, HostAdded_SchedulesPendingTimer_NoImmediateStart) {
+  // Stagger timer (consumed second).
+  auto* stagger_timer = new NiceMock<Event::MockTimer>(&dispatcher_);
+  // Weight calc timer (consumed first by manager ctor).
+  new NiceMock<Event::MockTimer>(&dispatcher_);
+
+  auto manager = makeOobManager();
+  auto status = manager->initialize();
+  ASSERT_TRUE(status.ok());
+
+  // Random returns 0 by default → stagger delay should be 0ms (still scheduled
+  // through the timer, not invoked synchronously).
+  EXPECT_CALL(*stagger_timer, enableTimer(testing::_, testing::_));
+
+  auto* host_set = priority_set_.getMockHostSet(0);
+  auto host = makeWeightTrackingMockHost();
+  host_set->hosts_ = {host};
+  host_set->runCallbacks({host}, {});
+
+  // Factory has NOT been called yet — the stagger timer needs to fire first.
+  EXPECT_EQ(0U, factory_->create_calls_);
+  EXPECT_EQ(0, manager->oobStatsForTest().active_sessions_.value());
+}
+
+// Stagger timer fires → session is created and the factory is invoked at
+// least once.
+TEST_F(OrcaWeightManagerOobTest, StaggerTimerFires_FactoryInvokedAndSessionActive) {
+  // OrcaOobSession internally allocates a goaway drain timer (consumed last).
+  new NiceMock<Event::MockTimer>(&dispatcher_);
+  // OrcaOobSession internally allocates a retry timer.
+  new NiceMock<Event::MockTimer>(&dispatcher_);
+  // Stagger timer.
+  auto* stagger_timer = new NiceMock<Event::MockTimer>(&dispatcher_);
+  // Weight calc timer (consumed first).
+  new NiceMock<Event::MockTimer>(&dispatcher_);
+
+  auto manager = makeOobManager();
+  auto status = manager->initialize();
+  ASSERT_TRUE(status.ok());
+
+  auto* host_set = priority_set_.getMockHostSet(0);
+  auto host = makeWeightTrackingMockHost();
+  host_set->hosts_ = {host};
+  host_set->runCallbacks({host}, {});
+
+  // Fire the stagger timer — this calls startOobSession() which constructs
+  // an OrcaOobSession and invokes the codec factory.
+  stagger_timer->invokeCallback();
+
+  EXPECT_GE(factory_->create_calls_, 1U);
+  EXPECT_EQ(1, manager->oobStatsForTest().active_sessions_.value());
+}
+
+// Host removed BEFORE the stagger timer fires: the timer is cancelled and the
+// factory is never invoked.
+TEST_F(OrcaWeightManagerOobTest, HostRemovedWhilePending_TimerCancelled) {
+  // Stagger timer (consumed second).
+  new NiceMock<Event::MockTimer>(&dispatcher_);
+  // Weight calc timer (consumed first).
+  new NiceMock<Event::MockTimer>(&dispatcher_);
+
+  auto manager = makeOobManager();
+  auto status = manager->initialize();
+  ASSERT_TRUE(status.ok());
+
+  auto* host_set = priority_set_.getMockHostSet(0);
+  auto host = makeWeightTrackingMockHost();
+  host_set->hosts_ = {host};
+  host_set->runCallbacks({host}, {});
+  EXPECT_EQ(0U, factory_->create_calls_);
+
+  // Now remove the host before the stagger timer fires.
+  host_set->hosts_.clear();
+  host_set->runCallbacks({}, {host});
+
+  // Factory must NOT have been called.
+  EXPECT_EQ(0U, factory_->create_calls_);
+  EXPECT_EQ(0, manager->oobStatsForTest().active_sessions_.value());
+}
+
+// Host removed AFTER the stagger timer fires (i.e. session active): the
+// session is closed and deferred-deleted, and the active-sessions gauge is
+// decremented.
+TEST_F(OrcaWeightManagerOobTest, HostRemovedWhileActive_SessionClosedAndGaugeDecremented) {
+  // Session goaway drain + retry timers (consumed last and second-last).
+  new NiceMock<Event::MockTimer>(&dispatcher_);
+  new NiceMock<Event::MockTimer>(&dispatcher_);
+  // Stagger timer.
+  auto* stagger_timer = new NiceMock<Event::MockTimer>(&dispatcher_);
+  // Weight calc timer (consumed first).
+  new NiceMock<Event::MockTimer>(&dispatcher_);
+
+  auto manager = makeOobManager();
+  auto status = manager->initialize();
+  ASSERT_TRUE(status.ok());
+
+  auto* host_set = priority_set_.getMockHostSet(0);
+  auto host = makeWeightTrackingMockHost();
+  host_set->hosts_ = {host};
+  host_set->runCallbacks({host}, {});
+
+  stagger_timer->invokeCallback();
+  EXPECT_EQ(1, manager->oobStatsForTest().active_sessions_.value());
+
+  // We expect at least one deferred-delete call when the host is removed (the
+  // session itself; the codec client factory returns null so there's no codec
+  // client to deferred-delete).
+  EXPECT_CALL(dispatcher_, deferredDelete_(testing::_)).Times(testing::AtLeast(1));
+
+  host_set->hosts_.clear();
+  host_set->runCallbacks({}, {host});
+
+  EXPECT_EQ(0, manager->oobStatsForTest().active_sessions_.value());
+}
+
+// Pre-existing hosts are scheduled when initialize() runs.
+TEST_F(OrcaWeightManagerOobTest, ExistingHostsScheduledOnInitialize) {
+  // Two stagger timers (consumed after the weight calc timer, in LIFO order).
+  new NiceMock<Event::MockTimer>(&dispatcher_);
+  new NiceMock<Event::MockTimer>(&dispatcher_);
+  // Weight calc timer (consumed first).
+  new NiceMock<Event::MockTimer>(&dispatcher_);
+
+  auto* host_set = priority_set_.getMockHostSet(0);
+  Upstream::HostVector hosts;
+  for (int i = 0; i < 2; ++i) {
+    hosts.push_back(makeWeightTrackingMockHost());
+  }
+  host_set->hosts_ = hosts;
+
+  auto manager = makeOobManager();
+  auto status = manager->initialize();
+  ASSERT_TRUE(status.ok());
+
+  // Stagger timers were scheduled but not fired → no factory calls and no
+  // active sessions yet.
+  EXPECT_EQ(0U, factory_->create_calls_);
+  EXPECT_EQ(0, manager->oobStatsForTest().active_sessions_.value());
+
+  // Each host should have OrcaHostLbPolicyData attached.
+  for (const auto& h : hosts) {
+    EXPECT_TRUE(h->typedLbPolicyData<OrcaHostLbPolicyData>().has_value());
+  }
+}
+
+// Duplicate add notifications (e.g. priority moves) must not double-schedule.
+TEST_F(OrcaWeightManagerOobTest, DuplicateHostAdd_DoesNotDoubleSchedule) {
+  // Only ONE stagger timer expected even though we run the callback twice
+  // with the same host. If a second stagger were scheduled, the MockDispatcher
+  // would have no matching MockTimer ready (RetiresOnSaturation already
+  // consumed both expectations) and the test would fail with an unmatched
+  // call.
+  new NiceMock<Event::MockTimer>(&dispatcher_); // stagger
+  new NiceMock<Event::MockTimer>(&dispatcher_); // weight calc
+
+  auto manager = makeOobManager();
+  auto status = manager->initialize();
+  ASSERT_TRUE(status.ok());
+
+  auto* host_set = priority_set_.getMockHostSet(0);
+  auto host = makeWeightTrackingMockHost();
+  host_set->hosts_ = {host};
+
+  host_set->runCallbacks({host}, {});
+  // Same host, second notification — must not allocate another stagger timer.
+  host_set->runCallbacks({host}, {});
+}
+
+// Manager destruction with active sessions cleans them up via deferredDelete.
+TEST_F(OrcaWeightManagerOobTest, DestructionDeferredDeletesActiveSessions) {
+  // Session goaway drain + retry timers.
+  new NiceMock<Event::MockTimer>(&dispatcher_);
+  new NiceMock<Event::MockTimer>(&dispatcher_);
+  // Stagger timer.
+  auto* stagger_timer = new NiceMock<Event::MockTimer>(&dispatcher_);
+  // Weight calc timer (consumed first).
+  new NiceMock<Event::MockTimer>(&dispatcher_);
+
+  auto manager = makeOobManager();
+  auto status = manager->initialize();
+  ASSERT_TRUE(status.ok());
+
+  auto* host_set = priority_set_.getMockHostSet(0);
+  auto host = makeWeightTrackingMockHost();
+  host_set->hosts_ = {host};
+  host_set->runCallbacks({host}, {});
+
+  stagger_timer->invokeCallback();
+  EXPECT_EQ(1, manager->oobStatsForTest().active_sessions_.value());
+
+  // Destructor must defer-delete the session.
+  EXPECT_CALL(dispatcher_, deferredDelete_(testing::_)).Times(testing::AtLeast(1));
+  manager.reset();
 }
 
 } // namespace

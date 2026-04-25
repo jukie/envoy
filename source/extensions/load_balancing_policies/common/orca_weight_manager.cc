@@ -5,10 +5,13 @@
 #include <limits>
 #include <memory>
 #include <string>
+#include <utility>
 
 #include "envoy/upstream/upstream.h"
 
+#include "source/common/common/backoff_strategy.h"
 #include "source/common/orca/orca_load_metrics.h"
+#include "source/common/orca/orca_oob_session.h"
 #include "source/common/runtime/runtime_features.h"
 
 #include "absl/status/status.h"
@@ -20,12 +23,21 @@ namespace LoadBalancingPolicies {
 namespace Common {
 
 namespace {
+
+constexpr absl::string_view kOrcaOobStatsPrefix = "orca_oob.";
+
+// Backoff bounds for OOB stream retries. Modeled after typical xDS / health
+// checker reconnect backoffs.
+constexpr uint64_t kOobBackoffBaseIntervalMs = 1000;
+constexpr uint64_t kOobBackoffMaxIntervalMs = 30000;
+
 std::string getHostAddress(const Upstream::Host* host) {
   if (host == nullptr || host->address() == nullptr) {
     return "unknown";
   }
   return host->address()->asString();
 }
+
 } // namespace
 
 OrcaLoadReportHandler::OrcaLoadReportHandler(const OrcaWeightManagerConfig& config,
@@ -121,32 +133,82 @@ absl::Status OrcaHostLbPolicyData::onOrcaLoadReport(const Upstream::OrcaLoadRepo
   return report_handler_->updateClientSideDataFromOrcaLoadReport(report, *this);
 }
 
-OrcaWeightManager::OrcaWeightManager(const OrcaWeightManagerConfig& config,
-                                     const Upstream::PrioritySet& priority_set,
-                                     TimeSource& time_source, Event::Dispatcher& dispatcher,
-                                     WeightsUpdatedCb on_weights_updated)
+Http::CodecClientPtr
+ProdOrcaOobCodecClientFactory::create(Upstream::Host::CreateConnectionData&& connection_data,
+                                      Event::Dispatcher& dispatcher) const {
+  // ORCA OOB streams use HTTP/2 to multiplex framing on a single connection.
+  return std::make_unique<Http::CodecClientProd>(
+      Http::CodecType::HTTP2, std::move(connection_data.connection_),
+      connection_data.host_description_, dispatcher, random_, transport_socket_options_);
+}
+
+OrcaOobStats OrcaWeightManager::generateOrcaOobStats(Stats::Scope& scope) {
+  return {ALL_ORCA_OOB_STATS(POOL_COUNTER_PREFIX(scope, kOrcaOobStatsPrefix),
+                             POOL_GAUGE_PREFIX(scope, kOrcaOobStatsPrefix))};
+}
+
+OrcaWeightManager::OrcaWeightManager(
+    const OrcaWeightManagerConfig& config, const Upstream::PrioritySet& priority_set,
+    TimeSource& time_source, Event::Dispatcher& dispatcher, Random::RandomGenerator& random,
+    Stats::Scope& stats_scope,
+    Network::TransportSocketOptionsConstSharedPtr transport_socket_options,
+    OrcaOobCodecClientFactoryPtr codec_client_factory, WeightsUpdatedCb on_weights_updated)
     : report_handler_(std::make_shared<OrcaLoadReportHandler>(config, time_source)),
-      priority_set_(priority_set), time_source_(time_source),
+      priority_set_(priority_set), time_source_(time_source), dispatcher_(dispatcher),
+      random_(random), stats_scope_(stats_scope),
+      transport_socket_options_(std::move(transport_socket_options)),
+      codec_client_factory_(std::move(codec_client_factory)),
       blackout_period_(config.blackout_period),
       weight_expiration_period_(config.weight_expiration_period),
-      weight_update_period_(config.weight_update_period),
+      weight_update_period_(config.weight_update_period), oob_enabled_(config.oob_enabled),
+      oob_reporting_period_(config.oob_reporting_period),
+      oob_request_cost_names_(config.oob_request_cost_names),
+      oob_stats_(generateOrcaOobStats(stats_scope_)),
       on_weights_updated_(std::move(on_weights_updated)) {
-  weight_calculation_timer_ = dispatcher.createTimer([this]() -> void {
+  // OOB requires a codec client factory whenever it is enabled.
+  if (oob_enabled_) {
+    ASSERT(codec_client_factory_ != nullptr);
+    ASSERT(oob_reporting_period_.count() > 0);
+  }
+  weight_calculation_timer_ = dispatcher_.createTimer([this]() -> void {
     updateWeightsOnMainThread();
     weight_calculation_timer_->enableTimer(weight_update_period_);
   });
+}
+
+OrcaWeightManager::~OrcaWeightManager() {
+  // Cancel any pending stagger timers (their TimerPtr destructors disable the
+  // underlying timer); deferred-delete every active session so they tear down
+  // their codec clients on the next dispatcher iteration without re-entering
+  // user callbacks from inside our destructor frame.
+  pending_oob_session_timers_.clear();
+  for (auto& kv : oob_sessions_) {
+    if (kv.second != nullptr) {
+      kv.second->close();
+      dispatcher_.deferredDelete(std::move(kv.second));
+    }
+  }
+  oob_sessions_.clear();
 }
 
 absl::Status OrcaWeightManager::initialize() {
   // Ensure that all hosts have LB policy data.
   for (const auto& host_set : priority_set_.hostSetsPerPriority()) {
     addLbPolicyDataToHosts(host_set->hosts());
+    if (oob_enabled_) {
+      onHostsAdded(host_set->hosts());
+    }
   }
 
   // Setup a callback to receive priority set updates.
   priority_update_cb_ = priority_set_.addPriorityUpdateCb(
-      [this](uint32_t, const Upstream::HostVector& hosts_added, const Upstream::HostVector&) {
+      [this](uint32_t, const Upstream::HostVector& hosts_added,
+             const Upstream::HostVector& hosts_removed) {
         addLbPolicyDataToHosts(hosts_added);
+        if (oob_enabled_) {
+          onHostsRemoved(hosts_removed);
+          onHostsAdded(hosts_added);
+        }
         updateWeightsOnMainThread();
       });
 
@@ -253,6 +315,195 @@ OrcaWeightManager::getWeightIfValidFromHost(const Upstream::Host& host,
     return absl::nullopt;
   }
   return client_side_data->getWeightIfValid(max_non_empty_since, min_last_update_time);
+}
+
+// ============================================================
+// OOB session management
+// ============================================================
+
+void OrcaWeightManager::onHostsAdded(const Upstream::HostVector& hosts) {
+  if (!oob_enabled_) {
+    return;
+  }
+  for (const auto& host_ptr : hosts) {
+    schedulePendingOobSession(host_ptr);
+  }
+}
+
+void OrcaWeightManager::onHostsRemoved(const Upstream::HostVector& hosts) {
+  if (!oob_enabled_) {
+    return;
+  }
+  for (const auto& host_ptr : hosts) {
+    Upstream::HostConstSharedPtr key = host_ptr;
+    // Always evict any pending stagger entry: this both cancels a pre-fire
+    // timer AND clears the post-fire marker we leave behind to prevent
+    // self-destructing-from-callback UB.
+    if (pending_oob_session_timers_.erase(key) > 0) {
+      ENVOY_LOG(debug, "Cancelled / cleaned up OOB session timer for {}",
+                getHostAddress(host_ptr.get()));
+    }
+    auto it = oob_sessions_.find(key);
+    if (it != oob_sessions_.end()) {
+      ENVOY_LOG(debug, "Closing active OOB session for {}", getHostAddress(host_ptr.get()));
+      Envoy::Orca::OrcaOobSessionPtr session = std::move(it->second);
+      oob_sessions_.erase(it);
+      oob_stats_.active_sessions_.set(oob_sessions_.size());
+      if (session != nullptr) {
+        session->close();
+        dispatcher_.deferredDelete(std::move(session));
+      }
+    }
+  }
+}
+
+void OrcaWeightManager::schedulePendingOobSession(const Upstream::HostSharedPtr& host) {
+  Upstream::HostConstSharedPtr key = host;
+  // If we already have a pending start or active session for this host, do
+  // nothing — schedulers must be idempotent against duplicate add notifications
+  // (e.g. priority moves).
+  if (pending_oob_session_timers_.contains(key) || oob_sessions_.contains(key)) {
+    return;
+  }
+
+  // Capture the host as a shared_ptr so it lives at least until the timer
+  // fires. We deliberately avoid capturing `this` only with the host weak_ptr
+  // because the timer is owned by the manager; if the manager dies, the
+  // TimerPtr is destroyed before the callback can fire.
+  //
+  // We deliberately do NOT erase the timer from pending_oob_session_timers_
+  // from inside its own callback: doing so would destroy the TimerPtr we are
+  // executing under (UB in MockTimer, fragile in prod). Instead, leave the
+  // entry in the map as a "fired but not yet swept" marker and let
+  // startOobSession transfer the host into oob_sessions_. The host removal
+  // path handles both pending and active maps. The timer object itself is
+  // one-shot at this point and lives harmlessly in the map until it is
+  // either rescheduled (we never do) or evicted on host removal / manager
+  // destruction.
+  Event::TimerPtr timer = dispatcher_.createTimer([this, host]() -> void {
+    if (!pending_oob_session_timers_.contains(host)) {
+      // Host was removed (and entry erased) between scheduling and firing.
+      return;
+    }
+    startOobSession(host);
+  });
+
+  const std::chrono::milliseconds delay = computeStaggerDelay();
+  timer->enableTimer(delay);
+  pending_oob_session_timers_.emplace(std::move(key), std::move(timer));
+  ENVOY_LOG(debug, "Scheduled OOB session start for {} in {}ms", getHostAddress(host.get()),
+            delay.count());
+}
+
+std::chrono::milliseconds OrcaWeightManager::computeStaggerDelay() {
+  // Spread initial sessions uniformly across the first reporting period, so a
+  // freshly-loaded cluster doesn't reach for every upstream connection at the
+  // same instant. This mirrors the initial-jitter strategy used by the active
+  // health checkers.
+  const uint64_t period_ms = static_cast<uint64_t>(oob_reporting_period_.count());
+  if (period_ms == 0) {
+    return std::chrono::milliseconds(0);
+  }
+  return std::chrono::milliseconds(random_.random() % period_ms);
+}
+
+void OrcaWeightManager::startOobSession(const Upstream::HostSharedPtr& host) {
+  if (!oob_enabled_) {
+    return;
+  }
+  ENVOY_LOG(debug, "Starting OOB session for {}", getHostAddress(host.get()));
+
+  Upstream::HostConstSharedPtr key = host;
+  // Defensive: if the same host already has an active session, do nothing
+  // (e.g. a duplicate add raced through). The pending timer entry is left in
+  // place and will be cleaned up on host removal or manager destruction.
+  if (oob_sessions_.contains(key)) {
+    return;
+  }
+
+  // Per-attempt codec client factory: this lambda is invoked by OrcaOobSession
+  // every time it needs to (re)open a connection. CRITICAL: do not call this
+  // from outside that context; it constructs a CodecClientProd which connects
+  // synchronously.
+  auto create_codec_client_cb = [this, host]() -> Http::CodecClientPtr {
+    Upstream::Host::CreateConnectionData connection_data = host->createOrcaReportingConnection(
+        dispatcher_, transport_socket_options_, host->metadata().get());
+    return codec_client_factory_->create(std::move(connection_data), dispatcher_);
+  };
+
+  // We deliberately use HostConstSharedPtr keys (not raw pointers) so that the
+  // session callbacks below remain tied to the same host identity even if the
+  // priority set replaces the HostSharedPtr.
+  auto on_report_cb = [this, key](const xds::data::orca::v3::OrcaLoadReport& report) {
+    oob_stats_.reports_received_.inc();
+    auto data_opt = key->typedLbPolicyData<OrcaHostLbPolicyData>();
+    if (!data_opt.has_value()) {
+      // Host has no LB policy data attached (shouldn't happen post-initialize);
+      // still count the report as an error so it's visible.
+      oob_stats_.report_errors_.inc();
+      ENVOY_LOG(warn, "OOB report received for host without OrcaHostLbPolicyData {}",
+                getHostAddress(key.get()));
+      return;
+    }
+    const absl::Status status =
+        report_handler_->updateClientSideDataFromOrcaLoadReport(report, *data_opt);
+    if (!status.ok()) {
+      oob_stats_.report_errors_.inc();
+      ENVOY_LOG(debug, "OOB report failed to update host {}: {}", getHostAddress(key.get()),
+                status.message());
+    }
+  };
+
+  auto on_lifecycle_cb = [this](Envoy::Orca::OrcaOobLifecycleEvent event) {
+    switch (event) {
+    case Envoy::Orca::OrcaOobLifecycleEvent::StreamOpen:
+      oob_stats_.stream_opens_.inc();
+      break;
+    case Envoy::Orca::OrcaOobLifecycleEvent::StreamFailure:
+      oob_stats_.stream_failures_.inc();
+      break;
+    }
+  };
+
+  // Terminal callback: drop the session from oob_sessions_ and deferred-delete
+  // it. It is safe to do work in this frame (the session promises not to
+  // touch its own members after firing this callback), but we MUST NOT
+  // destroy the session synchronously here — defer it through the dispatcher.
+  auto on_terminated_cb = [this, key](Grpc::Status::GrpcStatus status, absl::string_view message) {
+    oob_stats_.stream_terminated_.inc();
+    auto it = oob_sessions_.find(key);
+    if (it == oob_sessions_.end()) {
+      // Session was already removed (e.g. host removal raced with terminal
+      // callback). Nothing more to do.
+      return;
+    }
+    ENVOY_LOG(debug, "OOB session terminated for {}: status={} message={}",
+              getHostAddress(key.get()), status, message);
+    Envoy::Orca::OrcaOobSessionPtr session = std::move(it->second);
+    oob_sessions_.erase(it);
+    oob_stats_.active_sessions_.set(oob_sessions_.size());
+    if (session != nullptr) {
+      dispatcher_.deferredDelete(std::move(session));
+    }
+  };
+
+  // Backoff strategy used by the session for retries on transient failure.
+  // Each session gets its own strategy instance because BackOffStrategy is
+  // stateful.
+  auto backoff = std::make_unique<JitteredExponentialBackOffStrategy>(
+      kOobBackoffBaseIntervalMs, kOobBackoffMaxIntervalMs, random_);
+
+  auto session = std::make_unique<Envoy::Orca::OrcaOobSession>(
+      std::move(create_codec_client_cb), dispatcher_, oob_reporting_period_,
+      oob_request_cost_names_, std::move(on_report_cb), std::move(on_terminated_cb),
+      std::move(on_lifecycle_cb), std::move(backoff));
+
+  // Insert before start() so that re-entrant terminal callbacks (e.g. if a
+  // factory throws synchronously) can still find the session in the map.
+  Envoy::Orca::OrcaOobSession* session_raw = session.get();
+  oob_sessions_.emplace(key, std::move(session));
+  oob_stats_.active_sessions_.set(oob_sessions_.size());
+  session_raw->start();
 }
 
 } // namespace Common

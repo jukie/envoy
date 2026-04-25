@@ -6,13 +6,21 @@
 #include <string>
 #include <vector>
 
+#include "envoy/common/random_generator.h"
 #include "envoy/event/dispatcher.h"
 #include "envoy/event/timer.h"
+#include "envoy/http/codec.h"
+#include "envoy/network/transport_socket.h"
+#include "envoy/stats/scope.h"
+#include "envoy/stats/stats_macros.h"
 #include "envoy/upstream/upstream.h"
 
 #include "source/common/common/callback_impl.h"
 #include "source/common/common/logger.h"
+#include "source/common/http/codec_client.h"
+#include "source/common/orca/orca_oob_session.h"
 
+#include "absl/container/flat_hash_map.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "xds/data/orca/v3/orca_load_report.pb.h"
@@ -33,6 +41,32 @@ struct OrcaWeightManagerConfig {
   std::chrono::milliseconds blackout_period;
   std::chrono::milliseconds weight_expiration_period;
   std::chrono::milliseconds weight_update_period;
+
+  // Out-of-band ORCA reporting configuration.
+  // When `oob_enabled` is true, the manager will open per-host ORCA OOB streams
+  // (xds.service.orca.v3.OpenRcaService.StreamCoreMetrics) to receive load
+  // reports out-of-band and feed them into the same OrcaLoadReportHandler.
+  bool oob_enabled{false};
+  std::chrono::milliseconds oob_reporting_period{};
+  std::vector<std::string> oob_request_cost_names;
+};
+
+/**
+ * All OrcaWeightManager OOB stats. @see stats_macros.h
+ */
+#define ALL_ORCA_OOB_STATS(COUNTER, GAUGE)                                                         \
+  COUNTER(reports_received)                                                                        \
+  COUNTER(report_errors)                                                                           \
+  COUNTER(stream_failures)                                                                         \
+  COUNTER(stream_opens)                                                                            \
+  COUNTER(stream_terminated)                                                                       \
+  GAUGE(active_sessions, Accumulate)
+
+/**
+ * Definition of all OrcaWeightManager OOB stats. @see stats_macros.h
+ */
+struct OrcaOobStats {
+  ALL_ORCA_OOB_STATS(GENERATE_COUNTER_STRUCT, GENERATE_GAUGE_STRUCT)
 };
 
 struct OrcaHostLbPolicyData;
@@ -130,8 +164,50 @@ struct OrcaHostLbPolicyData : public Envoy::Upstream::HostLbPolicyData {
 };
 
 /**
+ * Per-attempt codec client factory used by OrcaWeightManager when creating
+ * OrcaOobSession instances. The factory takes the connection data produced by
+ * `Host::createOrcaReportingConnection` and wraps it in an Http::CodecClient.
+ *
+ * NOTE: production implementations construct CodecClientProd, which initiates
+ * the underlying connection synchronously inside its constructor. The factory
+ * must therefore only be invoked from inside the per-attempt lambda passed to
+ * the OrcaOobSession (i.e. AFTER the staggered start timer fires).
+ */
+class OrcaOobCodecClientFactory {
+public:
+  virtual ~OrcaOobCodecClientFactory() = default;
+  virtual Http::CodecClientPtr create(Upstream::Host::CreateConnectionData&& connection_data,
+                                      Event::Dispatcher& dispatcher) const PURE;
+};
+
+using OrcaOobCodecClientFactoryPtr = std::unique_ptr<OrcaOobCodecClientFactory>;
+
+/**
+ * Production OrcaOobCodecClientFactory implementation that builds an HTTP/2
+ * CodecClientProd around the supplied connection.
+ */
+class ProdOrcaOobCodecClientFactory : public OrcaOobCodecClientFactory {
+public:
+  ProdOrcaOobCodecClientFactory(Random::RandomGenerator& random,
+                                Network::TransportSocketOptionsConstSharedPtr transport_socket_options)
+      : random_(random), transport_socket_options_(std::move(transport_socket_options)) {}
+
+  Http::CodecClientPtr create(Upstream::Host::CreateConnectionData&& connection_data,
+                              Event::Dispatcher& dispatcher) const override;
+
+private:
+  Random::RandomGenerator& random_;
+  const Network::TransportSocketOptionsConstSharedPtr transport_socket_options_;
+};
+
+/**
  * Manages ORCA-based weight computation for hosts in a priority set.
  * Extracted from ClientSideWeightedRoundRobinLoadBalancer to allow reuse.
+ *
+ * When out-of-band ORCA reporting is enabled in the config, this manager owns
+ * one OrcaOobSession per host in the priority set. Sessions are scheduled with
+ * a staggered start so that newly added hosts do not all reach for their
+ * upstream connection at the same instant.
  */
 class OrcaWeightManager : protected Logger::Loggable<Logger::Id::upstream> {
 public:
@@ -139,7 +215,13 @@ public:
 
   OrcaWeightManager(const OrcaWeightManagerConfig& config,
                     const Upstream::PrioritySet& priority_set, TimeSource& time_source,
-                    Event::Dispatcher& dispatcher, WeightsUpdatedCb on_weights_updated);
+                    Event::Dispatcher& dispatcher, Random::RandomGenerator& random,
+                    Stats::Scope& stats_scope,
+                    Network::TransportSocketOptionsConstSharedPtr transport_socket_options,
+                    OrcaOobCodecClientFactoryPtr codec_client_factory,
+                    WeightsUpdatedCb on_weights_updated);
+
+  ~OrcaWeightManager();
 
   // Attach host data, register priority-update callback, start timer.
   absl::Status initialize();
@@ -153,6 +235,9 @@ public:
   // Accessor for the report handler (used by tests and for creating host data).
   OrcaLoadReportHandlerSharedPtr reportHandler() { return report_handler_; }
 
+  // Accessor for stats (test-only).
+  const OrcaOobStats& oobStatsForTest() const { return oob_stats_; }
+
   // Get weight based on host LB policy data if valid, otherwise return nullopt.
   static absl::optional<uint32_t> getWeightIfValidFromHost(const Upstream::Host& host,
                                                            MonotonicTime max_non_empty_since,
@@ -162,20 +247,53 @@ private:
   // Add LB policy data to all hosts that don't already have it.
   void addLbPolicyDataToHosts(const Upstream::HostVector& hosts);
 
+  // OOB session lifecycle helpers.
+  void onHostsAdded(const Upstream::HostVector& hosts);
+  void onHostsRemoved(const Upstream::HostVector& hosts);
+  // Schedule a staggered start for `host` if OOB is enabled and there is no
+  // pending timer or active session for this host.
+  void schedulePendingOobSession(const Upstream::HostSharedPtr& host);
+  // Construct and start the OrcaOobSession for `host`. Called from the stagger
+  // timer callback.
+  void startOobSession(const Upstream::HostSharedPtr& host);
+  // Compute a randomized stagger delay in [0, oob_reporting_period_).
+  std::chrono::milliseconds computeStaggerDelay();
+
+  static OrcaOobStats generateOrcaOobStats(Stats::Scope& scope);
+
   OrcaLoadReportHandlerSharedPtr report_handler_;
   const Upstream::PrioritySet& priority_set_;
   TimeSource& time_source_;
+  Event::Dispatcher& dispatcher_;
+  Random::RandomGenerator& random_;
+  Stats::Scope& stats_scope_;
+  const Network::TransportSocketOptionsConstSharedPtr transport_socket_options_;
+  OrcaOobCodecClientFactoryPtr codec_client_factory_;
 
   // Timing parameters for the weight update.
   std::chrono::milliseconds blackout_period_;
   std::chrono::milliseconds weight_expiration_period_;
   std::chrono::milliseconds weight_update_period_;
 
+  // OOB configuration (cached from OrcaWeightManagerConfig).
+  const bool oob_enabled_;
+  const std::chrono::milliseconds oob_reporting_period_;
+  const std::vector<std::string> oob_request_cost_names_;
+
+  OrcaOobStats oob_stats_;
+
   Event::TimerPtr weight_calculation_timer_;
   // Callback for priority_set_ updates.
   Envoy::Common::CallbackHandlePtr priority_update_cb_;
   // Callback invoked when weights are updated.
   WeightsUpdatedCb on_weights_updated_;
+
+  // Active OrcaOobSession per host. Sessions are deferred-deleted on removal /
+  // terminal callback.
+  absl::flat_hash_map<Upstream::HostConstSharedPtr, Envoy::Orca::OrcaOobSessionPtr> oob_sessions_;
+  // Stagger timers awaiting their initial firing per host. A host has at most
+  // one entry in this map OR in oob_sessions_, never both.
+  absl::flat_hash_map<Upstream::HostConstSharedPtr, Event::TimerPtr> pending_oob_session_timers_;
 };
 
 } // namespace Common

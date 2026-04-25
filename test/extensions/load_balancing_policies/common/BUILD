@@ -110,7 +110,9 @@ envoy_cc_test(
     name = "orca_weight_manager_test",
     srcs = ["orca_weight_manager_test.cc"],
     deps = [
+        "//source/common/orca:orca_oob_session_lib",
         "//source/extensions/load_balancing_policies/common:orca_weight_manager_lib",
+        "//test/common/stats:stat_test_utility_lib",
         "//test/mocks:common_lib",
         "//test/mocks/event:event_mocks",
         "//test/mocks/stream_info:stream_info_mocks",
