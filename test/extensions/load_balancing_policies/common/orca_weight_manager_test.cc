@@ -312,10 +312,10 @@ makeWeightTrackingMockHost(uint32_t initial_weight = 1) {
 // connection plumbing.
 class FakeOrcaOobCodecClientFactory : public OrcaOobCodecClientFactory {
 public:
-  Http::CodecClientPtr
-  create(Upstream::Host::CreateConnectionData&& /*connection_data*/,
-         Event::Dispatcher& /*dispatcher*/, Random::RandomGenerator& /*random*/,
-         Network::TransportSocketOptionsConstSharedPtr /*transport_socket_options*/) const override {
+  Http::CodecClientPtr create(
+      Upstream::Host::CreateConnectionData&& /*connection_data*/, Event::Dispatcher& /*dispatcher*/,
+      Random::RandomGenerator& /*random*/,
+      Network::TransportSocketOptionsConstSharedPtr /*transport_socket_options*/) const override {
     ++create_calls_;
     return nullptr;
   }
@@ -336,8 +336,7 @@ protected:
   // Helper to build the manager with the test's configured dependencies. By
   // default no factory is injected because OOB is disabled; pass a non-null
   // factory when enabling OOB.
-  std::unique_ptr<OrcaWeightManager>
-  makeManager(OrcaOobCodecClientFactoryPtr factory = nullptr) {
+  std::unique_ptr<OrcaWeightManager> makeManager(OrcaOobCodecClientFactoryPtr factory = nullptr) {
     return std::make_unique<OrcaWeightManager>(
         config_, priority_set_, time_system_, dispatcher_, random_, *stats_store_.rootScope(),
         /*transport_socket_options=*/nullptr, std::move(factory),
@@ -950,10 +949,10 @@ public:
       std::shared_ptr<Upstream::MockClusterInfo> cluster_info)
       : cluster_info_(std::move(cluster_info)) {}
 
-  Http::CodecClientPtr
-  create(Upstream::Host::CreateConnectionData&& /*connection_data*/, Event::Dispatcher& dispatcher,
-         Random::RandomGenerator& /*random*/,
-         Network::TransportSocketOptionsConstSharedPtr /*transport_socket_options*/) const override {
+  Http::CodecClientPtr create(
+      Upstream::Host::CreateConnectionData&& /*connection_data*/, Event::Dispatcher& dispatcher,
+      Random::RandomGenerator& /*random*/,
+      Network::TransportSocketOptionsConstSharedPtr /*transport_socket_options*/) const override {
     auto attempt = std::make_unique<OobAttempt>();
     attempt->network_connection = new NiceMock<Network::MockClientConnection>();
     attempt->codec = new NiceMock<Http::MockClientConnection>();
@@ -1001,9 +1000,8 @@ protected:
   // Drive a single end-to-end attempt: bring a pending host live by firing
   // the stagger timer, then return the OobAttempt for the freshly opened
   // attempt so the caller can deliver headers/data/trailers.
-  OobAttempt&
-  startSessionForHost(const std::shared_ptr<NiceMock<Upstream::MockHost>>& host,
-                      NiceMock<Event::MockTimer>* stagger_timer) {
+  OobAttempt& startSessionForHost(const std::shared_ptr<NiceMock<Upstream::MockHost>>& host,
+                                  NiceMock<Event::MockTimer>* stagger_timer) {
     auto* host_set = priority_set_.getMockHostSet(0);
     host_set->hosts_ = {host};
     host_set->runCallbacks({host}, {});
@@ -1013,14 +1011,13 @@ protected:
   }
 
   void respondHeadersOk(OobAttempt& attempt) {
-    auto headers = std::make_unique<Http::TestResponseHeaderMapImpl>(
-        Http::TestResponseHeaderMapImpl({{":status", "200"},
-                                         {"content-type", "application/grpc"}}));
+    auto headers =
+        std::make_unique<Http::TestResponseHeaderMapImpl>(Http::TestResponseHeaderMapImpl(
+            {{":status", "200"}, {"content-type", "application/grpc"}}));
     attempt.response_decoder->decodeHeaders(std::move(headers), false);
   }
 
-  void respondReport(OobAttempt& attempt,
-                     const xds::data::orca::v3::OrcaLoadReport& report) {
+  void respondReport(OobAttempt& attempt, const xds::data::orca::v3::OrcaLoadReport& report) {
     auto frame = Grpc::Common::serializeToGrpcFrame(report);
     attempt.response_decoder->decodeData(*frame, /*end_stream=*/false);
   }
@@ -1131,8 +1128,7 @@ TEST_F(OrcaWeightManagerOobWireTest, TerminalCallback_ErasesSessionAndDecrements
 
   // Drive UNIMPLEMENTED trailers — the only status that crosses the
   // session's terminal boundary into the manager's on_terminated_cb.
-  respondTrailers(attempt, Grpc::Status::WellKnownGrpcStatus::Unimplemented,
-                  "no service");
+  respondTrailers(attempt, Grpc::Status::WellKnownGrpcStatus::Unimplemented, "no service");
 
   // Production on_terminated_cb ran:
   //  - bumped stream_terminated counter

@@ -17,6 +17,7 @@
 #include "source/common/grpc/status.h"
 #include "source/common/http/codes.h"
 #include "source/common/http/header_map_impl.h"
+#include "source/common/http/headers.h"
 #include "source/common/http/message_impl.h"
 #include "source/common/http/utility.h"
 
@@ -41,14 +42,14 @@ OrcaOobSession::OrcaOobSession(OrcaOobCreateCodecClientCb create_codec_client,
                                Event::Dispatcher& dispatcher,
                                std::chrono::milliseconds report_interval,
                                std::vector<std::string> request_cost_names,
-                               OrcaOobReportCb on_report,
+                               bool upstream_secure_transport, OrcaOobReportCb on_report,
                                OrcaOobTerminatedCb on_terminated,
-                               OrcaOobLifecycleCb on_lifecycle_event,
-                               BackOffStrategyPtr backoff)
+                               OrcaOobLifecycleCb on_lifecycle_event, BackOffStrategyPtr backoff)
     : create_codec_client_(std::move(create_codec_client)), dispatcher_(dispatcher),
       report_interval_(report_interval), request_cost_names_(std::move(request_cost_names)),
-      on_report_(std::move(on_report)), on_terminated_(std::move(on_terminated)),
-      on_lifecycle_event_(std::move(on_lifecycle_event)), backoff_(std::move(backoff)) {
+      upstream_secure_transport_(upstream_secure_transport), on_report_(std::move(on_report)),
+      on_terminated_(std::move(on_terminated)), on_lifecycle_event_(std::move(on_lifecycle_event)),
+      backoff_(std::move(backoff)) {
   ASSERT(create_codec_client_ != nullptr);
   ASSERT(on_report_ != nullptr);
   ASSERT(on_terminated_ != nullptr);
@@ -130,15 +131,16 @@ void OrcaOobSession::connectAndStream() {
 
   auto headers_message = Grpc::Common::prepareHeaders(kDefaultAuthority, kOrcaOobServiceFullName,
                                                       kStreamCoreMetricsMethod, absl::nullopt);
-  // Intentionally do not set :scheme here: the reference gRPC health
-  // checker leaves it to the codec, and tying the leaf to either http or
-  // https would prevent the owner from supplying a TLS-aware codec client.
+  headers_message->headers().setReferenceScheme(upstream_secure_transport_
+                                                    ? Http::Headers::get().SchemeValues.Https
+                                                    : Http::Headers::get().SchemeValues.Http);
   // The stream is server-streaming with no per-call timeout; the report
   // interval governs frequency.
   auto status = request_encoder_->encodeHeaders(headers_message->headers(), false);
-  // encodeHeaders only fails if required headers are missing; we set them
-  // all above.
-  ASSERT(status.ok());
+  if (!status.ok()) {
+    handleTransientFailure(absl::StrCat("failed to encode headers: ", status.message()));
+    return;
+  }
 
   xds::service::orca::v3::OrcaLoadReportRequest request;
   if (report_interval_.count() > 0) {
@@ -194,6 +196,9 @@ void OrcaOobSession::handleTransientFailure(absl::string_view reason) {
   ENVOY_LOG(debug, "OrcaOobSession: transient failure: {}", reason);
   const bool use_immediate_retry = immediate_retry_available_;
   immediate_retry_available_ = false;
+  if (goaway_drain_timer_) {
+    goaway_drain_timer_->disableTimer();
+  }
   tearing_down_ = true;
   resetStreamState();
   tearDownCodecClient();

@@ -2276,8 +2276,8 @@ TEST_F(HostImplTest, CreateOrcaReportingConnectionWithMetadataResolvesTransportS
       cluster.info_->transport_socket_matcher_.get());
   ASSERT_NE(matcher, nullptr);
   EXPECT_CALL(*matcher, resolve(&orca_metadata, _, transport_socket_options))
-      .WillOnce(Return(TransportSocketMatcher::MatchData(*matcher->socket_factory_,
-                                                         matcher->stats_, "orca-test")));
+      .WillOnce(Return(TransportSocketMatcher::MatchData(*matcher->socket_factory_, matcher->stats_,
+                                                         "orca-test")));
 
   testing::StrictMock<Event::MockDispatcher> dispatcher;
   auto connection = new testing::StrictMock<Network::MockClientConnection>();

@@ -204,9 +204,9 @@ absl::Status OrcaWeightManager::initialize() {
   }
 
   // Setup a callback to receive priority set updates.
-  priority_update_cb_ = priority_set_.addPriorityUpdateCb(
-      [this](uint32_t, const Upstream::HostVector& hosts_added,
-             const Upstream::HostVector& hosts_removed) {
+  priority_update_cb_ =
+      priority_set_.addPriorityUpdateCb([this](uint32_t, const Upstream::HostVector& hosts_added,
+                                               const Upstream::HostVector& hosts_removed) {
         addLbPolicyDataToHosts(hosts_added);
         if (oob_enabled_) {
           onHostsRemoved(hosts_removed);
@@ -515,8 +515,9 @@ void OrcaWeightManager::startOobSession(const Upstream::HostSharedPtr& host) {
 
   auto session = std::make_unique<Envoy::Orca::OrcaOobSession>(
       std::move(create_codec_client_cb), dispatcher_, oob_reporting_period_,
-      oob_request_cost_names_, std::move(on_report_cb), std::move(on_terminated_cb),
-      std::move(on_lifecycle_cb), std::move(backoff));
+      oob_request_cost_names_, host->transportSocketFactory().implementsSecureTransport(),
+      std::move(on_report_cb), std::move(on_terminated_cb), std::move(on_lifecycle_cb),
+      std::move(backoff));
 
   // Insert before start() so that re-entrant terminal callbacks (e.g. if a
   // factory throws synchronously) can still find the session in the map.

@@ -137,10 +137,10 @@ Upstream::Host::CreateConnectionData LogicalHost::createOrcaReportingConnection(
     const bool needs_per_connection_resolution =
         cluster().transportSocketMatcher().usesFilterState() && effective_options &&
         !effective_options->downstreamSharedFilterStateObjects().empty();
-    factory = needs_per_connection_resolution
-                  ? &resolveTransportSocketFactory(address, this->metadata().get(),
-                                                   effective_options)
-                  : &transportSocketFactory();
+    factory =
+        needs_per_connection_resolution
+            ? &resolveTransportSocketFactory(address, this->metadata().get(), effective_options)
+            : &transportSocketFactory();
   }
 
   return HostImplBase::createConnection(

@@ -206,8 +206,8 @@ TEST_F(LogicalHostOrcaReportingConnectionTest, OverrideTransportSocketOptionsAre
   // Construct override options with filter state so that the (no-metadata) per-connection
   // resolution branch fires and we can observe which options the matcher receives.
   ON_CALL(*transport_socket_matcher_, usesFilterState()).WillByDefault(Return(true));
-  auto filter_state = std::make_shared<StreamInfo::FilterStateImpl>(
-      StreamInfo::FilterState::LifeSpan::Connection);
+  auto filter_state =
+      std::make_shared<StreamInfo::FilterStateImpl>(StreamInfo::FilterState::LifeSpan::Connection);
   filter_state->setData("envoy.network.namespace",
                         std::make_shared<Router::StringAccessorImpl>("/run/netns/override"),
                         StreamInfo::FilterState::StateType::ReadOnly,

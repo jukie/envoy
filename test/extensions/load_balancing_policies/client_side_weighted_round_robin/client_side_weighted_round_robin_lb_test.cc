@@ -747,8 +747,8 @@ public:
   // created during initialization so callers can assert on stagger-timer
   // creation.
   void buildLb() {
-    lb_config_ = std::make_unique<ClientSideWeightedRoundRobinLbConfig>(
-        proto_, dispatcher_, mock_tls_);
+    lb_config_ =
+        std::make_unique<ClientSideWeightedRoundRobinLbConfig>(proto_, dispatcher_, mock_tls_);
     EXPECT_CALL(mock_tls_, allocateSlot());
     // Track all timer creations so we can compare against the baseline of
     // the single weight-calculation timer created by the OrcaWeightManager.
@@ -765,8 +765,8 @@ public:
     auto worker_lb = std::make_shared<ClientSideWeightedRoundRobinLoadBalancer::WorkerLocalLb>(
         priority_set_, /*local_priority_set=*/nullptr, stats_, runtime_, random_, common_config_,
         lb_config_->round_robin_overrides_, time_system_, /*tls_shim=*/absl::nullopt);
-    friend_ = std::make_shared<ClientSideWeightedRoundRobinLoadBalancerFriend>(std::move(lb),
-                                                                                std::move(worker_lb));
+    friend_ = std::make_shared<ClientSideWeightedRoundRobinLoadBalancerFriend>(
+        std::move(lb), std::move(worker_lb));
     ASSERT_EQ(friend_->initialize(), absl::OkStatus());
   }
 

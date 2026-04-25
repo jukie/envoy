@@ -36,8 +36,7 @@ using OrcaOobCreateCodecClientCb = std::function<Http::CodecClientPtr()>;
  * Invoked for every successfully decoded ORCA load report received on the
  * stream. The reference is only valid for the duration of the call.
  */
-using OrcaOobReportCb =
-    std::function<void(const xds::data::orca::v3::OrcaLoadReport&)>;
+using OrcaOobReportCb = std::function<void(const xds::data::orca::v3::OrcaLoadReport&)>;
 
 /**
  * Invoked exactly once when the session has reached a terminal state and
@@ -45,8 +44,7 @@ using OrcaOobReportCb =
  * fires; the caller is expected to deferred-delete it. The grpc_status and
  * message describe the reason.
  */
-using OrcaOobTerminatedCb =
-    std::function<void(Grpc::Status::GrpcStatus, absl::string_view)>;
+using OrcaOobTerminatedCb = std::function<void(Grpc::Status::GrpcStatus, absl::string_view)>;
 
 /**
  * Lifecycle event signal so the owner can update host metadata (e.g. mark a
@@ -97,13 +95,11 @@ class OrcaOobSession : public Event::DeferredDeletable,
                        public Http::ConnectionCallbacks,
                        protected Logger::Loggable<Logger::Id::upstream> {
 public:
-  OrcaOobSession(OrcaOobCreateCodecClientCb create_codec_client,
-                 Event::Dispatcher& dispatcher,
+  OrcaOobSession(OrcaOobCreateCodecClientCb create_codec_client, Event::Dispatcher& dispatcher,
                  std::chrono::milliseconds report_interval,
-                 std::vector<std::string> request_cost_names,
+                 std::vector<std::string> request_cost_names, bool upstream_secure_transport,
                  OrcaOobReportCb on_report, OrcaOobTerminatedCb on_terminated,
-                 OrcaOobLifecycleCb on_lifecycle_event,
-                 BackOffStrategyPtr backoff);
+                 OrcaOobLifecycleCb on_lifecycle_event, BackOffStrategyPtr backoff);
   // IMPORTANT: callers must release the session via dispatcher.deferredDelete().
   // Direct destruction is only safe outside any session-originated callback frame
   // because the dtor synchronously closes and destroys the underlying CodecClient.
@@ -178,14 +174,14 @@ private:
   // Tear down the codec client via deferredDelete. Safe to call when null.
   void tearDownCodecClient();
   // Process the gRPC status reported by trailers/headers.
-  void onRpcComplete(Grpc::Status::GrpcStatus status, absl::string_view message,
-                     bool end_stream);
+  void onRpcComplete(Grpc::Status::GrpcStatus status, absl::string_view message, bool end_stream);
 
   // Construction-time state.
   OrcaOobCreateCodecClientCb create_codec_client_;
   Event::Dispatcher& dispatcher_;
   const std::chrono::milliseconds report_interval_;
   const std::vector<std::string> request_cost_names_;
+  const bool upstream_secure_transport_;
   OrcaOobReportCb on_report_;
   OrcaOobTerminatedCb on_terminated_;
   OrcaOobLifecycleCb on_lifecycle_event_;

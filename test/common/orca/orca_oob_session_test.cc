@@ -59,9 +59,7 @@ struct AttemptMocks {
   // The OrcaLoadReportRequest parsed off the wire when the session sent
   // its first (and only) data frame on this attempt.
   xds::service::orca::v3::OrcaLoadReportRequest parsed_request;
-  // Captured :scheme pseudo-header value, or empty if the session did not
-  // set one. The reference gRPC health checker leaves this to the codec,
-  // and the OrcaOobSession should follow that pattern.
+  // Captured :scheme pseudo-header value.
   std::string captured_scheme;
 };
 
@@ -84,7 +82,8 @@ public:
   }
 
   void createSession(std::chrono::milliseconds report_interval = std::chrono::milliseconds(1000),
-                     std::vector<std::string> request_costs = {"cpu_utilization"}) {
+                     std::vector<std::string> request_costs = {"cpu_utilization"},
+                     bool upstream_secure_transport = false) {
     // MockTimer(MockDispatcher*) registers an EXPECT_CALL on the dispatcher's
     // createTimer_; expectations match LIFO. The session constructs the
     // retry timer first and the GOAWAY drain timer second, so we must
@@ -94,10 +93,8 @@ public:
     retry_timer_ = new NiceMock<Event::MockTimer>(&dispatcher_);
     session_ = std::make_unique<OrcaOobSession>(
         [this]() -> Http::CodecClientPtr { return makeCodecClient(); }, dispatcher_,
-        report_interval, std::move(request_costs),
-        [this](const xds::data::orca::v3::OrcaLoadReport& report) {
-          reports_.push_back(report);
-        },
+        report_interval, std::move(request_costs), upstream_secure_transport,
+        [this](const xds::data::orca::v3::OrcaLoadReport& report) { reports_.push_back(report); },
         [this](Grpc::Status::GrpcStatus status, absl::string_view message) {
           terminated_status_ = status;
           terminated_message_ = std::string(message);
@@ -152,8 +149,9 @@ public:
   }
 
   void respondHeadersOk(AttemptMocks& attempt) {
-    auto headers = std::make_unique<Http::TestResponseHeaderMapImpl>(
-        Http::TestResponseHeaderMapImpl({{":status", "200"}, {"content-type", "application/grpc"}}));
+    auto headers =
+        std::make_unique<Http::TestResponseHeaderMapImpl>(Http::TestResponseHeaderMapImpl(
+            {{":status", "200"}, {"content-type", "application/grpc"}}));
     attempt.response_decoder->decodeHeaders(std::move(headers), false);
   }
 
@@ -197,9 +195,8 @@ public:
 
 // Open stream, server replies with headers + a single OrcaLoadReport
 // frame; lifecycle StreamOpen fires and the report callback observes the
-// payload. Also asserts that the session encoded the report interval and
-// requested cost names into the OrcaLoadReportRequest body, and that it
-// did not pin the :scheme pseudo-header (the codec defaults it).
+// payload. Also asserts that the session encoded the report interval,
+// requested cost names, and upstream scheme into the request.
 TEST_F(OrcaOobSessionTest, HappyPathReceivesReport) {
   createSession(std::chrono::milliseconds(1000), {"cpu_utilization"});
   session_->start();
@@ -216,8 +213,7 @@ TEST_F(OrcaOobSessionTest, HappyPathReceivesReport) {
   ASSERT_EQ(1, req.request_cost_names_size());
   EXPECT_EQ("cpu_utilization", req.request_cost_names(0));
 
-  // The session must NOT pin :scheme; the codec is responsible for that.
-  EXPECT_TRUE(attempts_[0]->captured_scheme.empty());
+  EXPECT_EQ("http", attempts_[0]->captured_scheme);
 
   respondHeadersOk(*attempts_[0]);
   ASSERT_EQ(1u, lifecycle_events_.size());
@@ -230,6 +226,16 @@ TEST_F(OrcaOobSessionTest, HappyPathReceivesReport) {
   ASSERT_EQ(1u, reports_.size());
   EXPECT_DOUBLE_EQ(0.42, reports_[0].cpu_utilization());
   EXPECT_FALSE(terminated_);
+
+  session_->close();
+}
+
+TEST_F(OrcaOobSessionTest, SecureUpstreamSetsHttpsScheme) {
+  createSession(std::chrono::milliseconds(1000), {"cpu_utilization"},
+                /*upstream_secure_transport=*/true);
+  session_->start();
+  ASSERT_EQ(1u, attempts_.size());
+  EXPECT_EQ("https", attempts_[0]->captured_scheme);
 
   session_->close();
 }
@@ -253,8 +259,7 @@ TEST_F(OrcaOobSessionTest, SubSecondReportIntervalSplitsSecondsAndNanos) {
 // Non-default cost names propagate into the request, in order. This guards
 // against accidentally dropping or reordering entries.
 TEST_F(OrcaOobSessionTest, RequestCostNamesAreEncoded) {
-  createSession(std::chrono::milliseconds(1000),
-                {"named_metrics.foo", "named_metrics.bar"});
+  createSession(std::chrono::milliseconds(1000), {"named_metrics.foo", "named_metrics.bar"});
   session_->start();
   ASSERT_EQ(1u, attempts_.size());
   ASSERT_TRUE(attempts_[0]->encode_data_called);
@@ -325,10 +330,8 @@ TEST_F(OrcaOobSessionTest, UnimplementedHeadersOnlyIsTerminal) {
   createSession();
   EXPECT_CALL(*retry_timer_, enableTimer(_, _)).Times(0);
   session_->start();
-  auto headers = std::make_unique<Http::TestResponseHeaderMapImpl>(
-      Http::TestResponseHeaderMapImpl({{":status", "200"},
-                                       {"content-type", "application/grpc"},
-                                       {"grpc-status", "12"}}));
+  auto headers = std::make_unique<Http::TestResponseHeaderMapImpl>(Http::TestResponseHeaderMapImpl(
+      {{":status", "200"}, {"content-type", "application/grpc"}, {"grpc-status", "12"}}));
   attempts_[0]->response_decoder->decodeHeaders(std::move(headers), true);
   EXPECT_TRUE(terminated_);
   EXPECT_EQ(Grpc::Status::WellKnownGrpcStatus::Unimplemented, terminated_status_);
@@ -443,6 +446,26 @@ TEST_F(OrcaOobSessionTest, GoAwayNoErrorDrainsThenReconnects) {
   // budget applies.
   EXPECT_CALL(*retry_timer_, enableTimer(std::chrono::milliseconds(0), _));
   goaway_timer_->invokeCallback();
+
+  retry_timer_->invokeCallback();
+  EXPECT_EQ(2u, attempts_.size());
+}
+
+// If the draining attempt fails before the GOAWAY drain deadline, the stale
+// drain timer must be disabled so it cannot fire against a later retry.
+TEST_F(OrcaOobSessionTest, GoAwayNoErrorEarlyFailureDisablesDrainTimer) {
+  createSession();
+  EXPECT_CALL(*goaway_timer_, enableTimer(OrcaOobSession::kGoAwayDrainDeadline, _));
+  EXPECT_CALL(*backoff_, nextBackOffMs()).WillOnce(Return(321));
+  EXPECT_CALL(*retry_timer_, enableTimer(std::chrono::milliseconds(321), _));
+
+  session_->start();
+  respondHeadersOk(*attempts_[0]);
+  attempts_[0]->codec_client->raiseGoAway(Http::GoAwayErrorCode::NoError);
+
+  EXPECT_CALL(*goaway_timer_, disableTimer());
+  triggerStreamReset(*attempts_[0], Http::StreamResetReason::RemoteReset);
+  testing::Mock::VerifyAndClearExpectations(goaway_timer_);
 
   retry_timer_->invokeCallback();
   EXPECT_EQ(2u, attempts_.size());
