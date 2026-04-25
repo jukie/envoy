@@ -1,9 +1,11 @@
 #include "source/common/network/transport_socket_options_impl.h"
+#include "source/common/network/utility.h"
 #include "source/common/router/string_accessor_impl.h"
 #include "source/common/stream_info/filter_state_impl.h"
 #include "source/extensions/clusters/common/logical_host.h"
 
 #include "test/mocks/event/mocks.h"
+#include "test/mocks/network/connection.h"
 #include "test/mocks/network/transport_socket.h"
 #include "test/mocks/upstream/cluster_info.h"
 #include "test/mocks/upstream/host.h"
@@ -16,6 +18,7 @@ using testing::_;
 using testing::NiceMock;
 using testing::Return;
 using testing::ReturnRef;
+using testing::StrictMock;
 
 namespace Envoy {
 namespace Extensions {
@@ -163,6 +166,115 @@ TEST_F(LogicalHostTransportSocketResolutionTest, OverrideTransportSocketOptionsT
   const auto& effective_options = override_options != nullptr ? override_options : passed_options;
 
   EXPECT_TRUE(needsPerConnectionResolution(effective_options));
+}
+
+// Test fixture for end-to-end exercise of LogicalHost::createOrcaReportingConnection. Constructs a
+// real LogicalHost backed by a NiceMock<MockClusterInfo> so we can drive the
+// transport-socket-matcher resolve() expectations and observe the dispatcher's
+// createClientConnection_ calls.
+class LogicalHostOrcaReportingConnectionTest : public testing::Test {
+public:
+  void SetUp() override {
+    cluster_info_ = std::make_shared<NiceMock<Upstream::MockClusterInfo>>();
+    transport_socket_matcher_ = dynamic_cast<Upstream::MockTransportSocketMatcher*>(
+        cluster_info_->transport_socket_matcher_.get());
+    ASSERT_NE(transport_socket_matcher_, nullptr);
+    address_ = *Network::Utility::resolveUrl("tcp://10.0.0.1:1234");
+  }
+
+  Upstream::LogicalHostSharedPtr makeLogicalHost(
+      const Network::TransportSocketOptionsConstSharedPtr& override_transport_socket_options) {
+    envoy::config::endpoint::v3::LocalityLbEndpoints locality_lb_endpoints;
+    envoy::config::endpoint::v3::LbEndpoint lb_endpoint;
+    auto host_or_error = Upstream::LogicalHost::create(
+        cluster_info_, "lyft.com", address_, /*address_list=*/{}, locality_lb_endpoints,
+        lb_endpoint, override_transport_socket_options);
+    EXPECT_TRUE(host_or_error.ok());
+    return std::shared_ptr<Upstream::LogicalHost>(std::move(host_or_error.value()));
+  }
+
+  std::shared_ptr<NiceMock<Upstream::MockClusterInfo>> cluster_info_;
+  Upstream::MockTransportSocketMatcher* transport_socket_matcher_;
+  Network::Address::InstanceConstSharedPtr address_;
+};
+
+// Verifies that LogicalHost::createOrcaReportingConnection forwards the override transport socket
+// options (set at LogicalHost construction time) into the resolve() call rather than the
+// caller-supplied options. This mirrors LogicalHost::createConnection's existing override
+// precedence behavior.
+TEST_F(LogicalHostOrcaReportingConnectionTest, OverrideTransportSocketOptionsArePreferred) {
+  // Construct override options with filter state so that the (no-metadata) per-connection
+  // resolution branch fires and we can observe which options the matcher receives.
+  ON_CALL(*transport_socket_matcher_, usesFilterState()).WillByDefault(Return(true));
+  auto filter_state = std::make_shared<StreamInfo::FilterStateImpl>(
+      StreamInfo::FilterState::LifeSpan::Connection);
+  filter_state->setData("envoy.network.namespace",
+                        std::make_shared<Router::StringAccessorImpl>("/run/netns/override"),
+                        StreamInfo::FilterState::StateType::ReadOnly,
+                        StreamInfo::FilterState::LifeSpan::Connection,
+                        StreamInfo::StreamSharingMayImpactPooling::SharedWithUpstreamConnection);
+  Network::TransportSocketOptionsConstSharedPtr override_options =
+      std::make_shared<Network::TransportSocketOptionsImpl>(
+          "", std::vector<std::string>{}, std::vector<std::string>{}, std::vector<std::string>{},
+          absl::nullopt, filter_state->objectsSharedWithUpstreamConnection());
+
+  // The caller-supplied options must NOT be the ones forwarded; LogicalHost should prefer the
+  // override.
+  Network::TransportSocketOptionsConstSharedPtr caller_options =
+      std::make_shared<Network::TransportSocketOptionsImpl>(
+          "caller-name", std::vector<std::string>{}, std::vector<std::string>{},
+          std::vector<std::string>{});
+
+  auto host = makeLogicalHost(override_options);
+
+  // Expect resolve() to be called with the override options pointer (not caller_options) since
+  // metadata is null but per-connection resolution kicks in via filter-state-bearing
+  // effective_options.
+  EXPECT_CALL(*transport_socket_matcher_, resolve(_, _, override_options))
+      .WillOnce(Return(Upstream::TransportSocketMatcher::MatchData(
+          *transport_socket_matcher_->socket_factory_, transport_socket_matcher_->stats_,
+          "override-options")));
+
+  NiceMock<Event::MockDispatcher> dispatcher;
+  auto* connection = new NiceMock<Network::MockClientConnection>();
+  // Critical: ORCA OOB connection must target the host's data address (10.0.0.1:1234) -- not a
+  // health-check or override address.
+  EXPECT_CALL(dispatcher, createClientConnection_(address_, _, _, _)).WillOnce(Return(connection));
+
+  auto data = host->createOrcaReportingConnection(dispatcher, caller_options, /*metadata=*/nullptr);
+  EXPECT_EQ(connection, data.connection_.get());
+  // The host_description_ should be a RealHostDescription wrapping the logical host.
+  ASSERT_NE(data.host_description_, nullptr);
+  EXPECT_EQ(address_->asString(), data.host_description_->address()->asString());
+}
+
+// Verifies that when metadata is supplied, LogicalHost::createOrcaReportingConnection routes
+// transport socket factory selection through the matcher's resolve() with that metadata,
+// regardless of the per-connection-resolution heuristics.
+TEST_F(LogicalHostOrcaReportingConnectionTest, MetadataDrivesTransportSocketResolution) {
+  auto host = makeLogicalHost(/*override_transport_socket_options=*/nullptr);
+
+  envoy::config::core::v3::Metadata orca_metadata;
+  auto& fields = (*orca_metadata.mutable_filter_metadata())["envoy.test.orca"];
+  (*fields.mutable_fields())["key"].set_string_value("value");
+
+  Network::TransportSocketOptionsConstSharedPtr caller_options =
+      std::make_shared<Network::TransportSocketOptionsImpl>(
+          "caller-name", std::vector<std::string>{}, std::vector<std::string>{},
+          std::vector<std::string>{});
+
+  // Expect the matcher to see the supplied metadata pointer and the caller's options.
+  EXPECT_CALL(*transport_socket_matcher_, resolve(&orca_metadata, _, caller_options))
+      .WillOnce(Return(Upstream::TransportSocketMatcher::MatchData(
+          *transport_socket_matcher_->socket_factory_, transport_socket_matcher_->stats_,
+          "metadata-resolved")));
+
+  NiceMock<Event::MockDispatcher> dispatcher;
+  auto* connection = new NiceMock<Network::MockClientConnection>();
+  EXPECT_CALL(dispatcher, createClientConnection_(address_, _, _, _)).WillOnce(Return(connection));
+
+  auto data = host->createOrcaReportingConnection(dispatcher, caller_options, &orca_metadata);
+  EXPECT_EQ(connection, data.connection_.get());
 }
 
 } // namespace Clusters

@@ -217,6 +217,26 @@ public:
       const envoy::config::core::v3::Metadata* metadata) const PURE;
 
   /**
+   * Create an ORCA out-of-band reporting connection for this host. This is used by load reporting
+   * machinery (e.g. ORCA OOB streams) to open a dedicated connection to the host's normal data
+   * address, separate from request-serving connection pools and from health checking connections.
+   *
+   * The default implementation connects to the host's data address with transport socket
+   * resolution mirroring createHealthCheckConnection() when metadata is supplied.
+   *
+   * @param dispatcher supplies the owning dispatcher.
+   * @param transport_socket_options supplies the transport options that will be set on the new
+   * connection.
+   * @param metadata supplies optional metadata used to select the transport socket factory; when
+   * nullptr the host's default transport socket factory is used.
+   * @return the connection data.
+   */
+  virtual CreateConnectionData createOrcaReportingConnection(
+      Event::Dispatcher& dispatcher,
+      Network::TransportSocketOptionsConstSharedPtr transport_socket_options,
+      const envoy::config::core::v3::Metadata* metadata) const PURE;
+
+  /**
    * @return host specific gauges.
    */
   virtual std::vector<std::pair<absl::string_view, Stats::PrimitiveGaugeReference>>

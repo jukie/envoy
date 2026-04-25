@@ -601,6 +601,22 @@ Host::CreateConnectionData HostImplBase::createHealthCheckConnection(
                           transport_socket_options, shared_from_this());
 }
 
+Host::CreateConnectionData HostImplBase::createOrcaReportingConnection(
+    Event::Dispatcher& dispatcher,
+    Network::TransportSocketOptionsConstSharedPtr transport_socket_options,
+    const envoy::config::core::v3::Metadata* metadata) const {
+  // Mirrors createHealthCheckConnection(), but targets the host's normal data address (and its
+  // additional addresses where applicable) instead of the health check address. This is used to
+  // open a dedicated ORCA out-of-band reporting stream alongside, but independent of, request
+  // pools and health checking.
+  Network::UpstreamTransportSocketFactory& factory =
+      (metadata != nullptr)
+          ? resolveTransportSocketFactory(address(), metadata, transport_socket_options)
+          : transportSocketFactory();
+  return createConnection(dispatcher, cluster(), address(), addressListOrNull(), factory, nullptr,
+                          transport_socket_options, shared_from_this());
+}
+
 absl::optional<Network::Address::InstanceConstSharedPtr> HostImplBase::maybeGetProxyRedirectAddress(
     const Network::TransportSocketOptionsConstSharedPtr transport_socket_options,
     HostDescriptionConstSharedPtr host,
