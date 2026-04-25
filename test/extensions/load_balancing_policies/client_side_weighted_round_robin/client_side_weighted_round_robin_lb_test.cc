@@ -90,6 +90,13 @@ public:
     return lb_->orca_weight_manager_->reportHandler();
   }
 
+  // Test-only accessor for the OOB stats struct held by the OrcaWeightManager.
+  // Used to assert that no OOB sessions were spun up when the proto's
+  // `enable_oob_load_report` is unset/false.
+  const Extensions::LoadBalancingPolicies::Common::OrcaOobStats& oobStatsForTest() const {
+    return lb_->orca_weight_manager_->oobStatsForTest();
+  }
+
 private:
   std::shared_ptr<ClientSideWeightedRoundRobinLoadBalancer> lb_;
   std::shared_ptr<ClientSideWeightedRoundRobinLoadBalancer::WorkerLocalLb> worker_lb_;
@@ -152,17 +159,21 @@ public:
   envoy::extensions::load_balancing_policies::client_side_weighted_round_robin::v3::
       ClientSideWeightedRoundRobin client_side_weighted_round_robin_config_;
 
-  std::shared_ptr<PrioritySetImpl> local_priority_set_;
-  std::shared_ptr<ClientSideWeightedRoundRobinLoadBalancerFriend> lb_;
-  HostsPerLocalityConstSharedPtr empty_locality_;
-  HostVector empty_host_vector_;
-
+  // NOTE: declaration order matters for destruction. The OrcaWeightManager
+  // owned by `lb_` retains references to `cluster_info_.statsScope()`, the
+  // dispatcher, and the thread-local slot allocator. Those have to outlive
+  // `lb_`, so they are declared BEFORE it.
   NiceMock<MockLoadBalancerContext> lb_context_;
   NiceMock<Event::MockDispatcher> dispatcher_;
   NiceMock<Envoy::ThreadLocal::MockInstance> mock_tls_;
   NiceMock<MockClusterInfo> cluster_info_;
   ClientSideWeightedRoundRobinLbConfig lb_config_ = ClientSideWeightedRoundRobinLbConfig(
       client_side_weighted_round_robin_config_, dispatcher_, mock_tls_);
+
+  std::shared_ptr<PrioritySetImpl> local_priority_set_;
+  std::shared_ptr<ClientSideWeightedRoundRobinLoadBalancerFriend> lb_;
+  HostsPerLocalityConstSharedPtr empty_locality_;
+  HostVector empty_host_vector_;
 };
 
 //////////////////////////////////////////////////////
@@ -510,6 +521,34 @@ TEST(ClientSideWeightedRoundRobinConfigTest, SlowStartConfigPropagatesToOverride
                    0.25);
 }
 
+// When `enable_oob_load_report` is unset, the typed config defaults to
+// OOB-disabled and the reporting period falls back to the proto default of 10s.
+TEST(ClientSideWeightedRoundRobinConfigTest, OobDisabledByDefault) {
+  envoy::extensions::load_balancing_policies::client_side_weighted_round_robin::v3::
+      ClientSideWeightedRoundRobin proto;
+  NiceMock<Event::MockDispatcher> dispatcher;
+  ThreadLocal::MockInstance tls;
+  ClientSideWeightedRoundRobinLbConfig typed(proto, dispatcher, tls);
+  EXPECT_FALSE(typed.oob_enabled);
+  // Even with OOB disabled, the period reflects the proto's documented default
+  // (10s) so that flipping enable_oob_load_report on requires no other change.
+  EXPECT_EQ(typed.oob_reporting_period, std::chrono::seconds(10));
+}
+
+// When the proto sets `enable_oob_load_report=true` and a custom reporting
+// period, both fields propagate into the typed config.
+TEST(ClientSideWeightedRoundRobinConfigTest, OobEnabledPropagates) {
+  envoy::extensions::load_balancing_policies::client_side_weighted_round_robin::v3::
+      ClientSideWeightedRoundRobin proto;
+  proto.mutable_enable_oob_load_report()->set_value(true);
+  proto.mutable_oob_reporting_period()->set_seconds(5);
+  NiceMock<Event::MockDispatcher> dispatcher;
+  ThreadLocal::MockInstance tls;
+  ClientSideWeightedRoundRobinLbConfig typed(proto, dispatcher, tls);
+  EXPECT_TRUE(typed.oob_enabled);
+  EXPECT_EQ(typed.oob_reporting_period, std::chrono::seconds(5));
+}
+
 // Unit tests for ClientSideWeightedRoundRobinLoadBalancer implementation.
 
 TEST(ClientSideWeightedRoundRobinLoadBalancerTest,
@@ -683,6 +722,121 @@ TEST(ClientSideWeightedRoundRobinLoadBalancerTest,
                 orca_load_report, {"named_metrics.foo"}, 2.0)
                 .value(),
             1428);
+}
+
+// ===========================================================================
+// OOB wiring tests (Agent D).
+//
+// These verify that the CSWRR load balancer correctly wires the proto's
+// `enable_oob_load_report` and `oob_reporting_period` fields through to the
+// OrcaWeightManager. We use the fixture-based test pattern to get a real
+// MockClusterInfo (which provides a stats scope) and a NiceMock dispatcher
+// (which counts createTimer_ calls so we can tell weight-calc-only paths from
+// stagger-timer paths).
+// ===========================================================================
+
+// Local fixture variant that lets each test build its own typed config from a
+// freshly mutated proto. The base ClientSideWeightedRoundRobinLoadBalancerTest
+// fixture builds `lb_config_` at member-init time (before the test body
+// mutates the proto), which means flipping OOB on inside a test body would not
+// be observed. This fixture instead constructs the typed config inside each
+// test, after the proto has been configured.
+class ClientSideWeightedRoundRobinOobWiringTest : public testing::Test {
+public:
+  // Build a fresh LB instance from the current proto. Counts the timers
+  // created during initialization so callers can assert on stagger-timer
+  // creation.
+  void buildLb() {
+    lb_config_ = std::make_unique<ClientSideWeightedRoundRobinLbConfig>(
+        proto_, dispatcher_, mock_tls_);
+    EXPECT_CALL(mock_tls_, allocateSlot());
+    // Track all timer creations so we can compare against the baseline of
+    // the single weight-calculation timer created by the OrcaWeightManager.
+    ON_CALL(dispatcher_, createTimer_(testing::_))
+        .WillByDefault(testing::Invoke([this](Event::TimerCb) -> Event::Timer* {
+          ++timers_created_;
+          return new NiceMock<Event::MockTimer>();
+        }));
+    auto lb = std::make_shared<ClientSideWeightedRoundRobinLoadBalancer>(
+        *lb_config_, cluster_info_, priority_set_, runtime_, random_, time_system_);
+    // The worker-local LB is irrelevant for the wiring being verified here;
+    // construct a dummy one solely so the friend class can hold ownership of
+    // the real LB and route initialize() / private accessors through.
+    auto worker_lb = std::make_shared<ClientSideWeightedRoundRobinLoadBalancer::WorkerLocalLb>(
+        priority_set_, /*local_priority_set=*/nullptr, stats_, runtime_, random_, common_config_,
+        lb_config_->round_robin_overrides_, time_system_, /*tls_shim=*/absl::nullopt);
+    friend_ = std::make_shared<ClientSideWeightedRoundRobinLoadBalancerFriend>(std::move(lb),
+                                                                                std::move(worker_lb));
+    ASSERT_EQ(friend_->initialize(), absl::OkStatus());
+  }
+
+  // Convenience accessor.
+  const Extensions::LoadBalancingPolicies::Common::OrcaOobStats& oobStatsForTest() const {
+    return friend_->oobStatsForTest();
+  }
+
+  envoy::extensions::load_balancing_policies::client_side_weighted_round_robin::v3::
+      ClientSideWeightedRoundRobin proto_;
+
+  // Order matters: cluster_info_ / dispatcher_ / mock_tls_ MUST outlive
+  // `friend_` because the OrcaWeightManager owned by the LB holds references
+  // to cluster_info_.statsScope() and dispatcher_.
+  Event::SimulatedTimeSystem time_system_;
+  Stats::IsolatedStoreImpl stats_store_;
+  ClusterLbStatNames stat_names_{stats_store_.symbolTable()};
+  ClusterLbStats stats_{stat_names_, *stats_store_.rootScope()};
+  envoy::config::cluster::v3::Cluster::CommonLbConfig common_config_;
+  NiceMock<Runtime::MockLoader> runtime_;
+  NiceMock<Random::MockRandomGenerator> random_;
+  NiceMock<MockPrioritySet> priority_set_;
+  NiceMock<Event::MockDispatcher> dispatcher_;
+  NiceMock<Envoy::ThreadLocal::MockInstance> mock_tls_;
+  NiceMock<MockClusterInfo> cluster_info_;
+  std::unique_ptr<ClientSideWeightedRoundRobinLbConfig> lb_config_;
+  std::shared_ptr<ClientSideWeightedRoundRobinLoadBalancerFriend> friend_;
+  uint64_t timers_created_{0};
+};
+
+// With OOB disabled (the default), adding hosts to the priority set must not
+// schedule any OOB sessions, even though the manager is fully constructed.
+// The active_sessions_ gauge stays at zero and only the single weight-update
+// timer is ever created.
+TEST_F(ClientSideWeightedRoundRobinOobWiringTest, OobDisabledCreatesNoSessions) {
+  // Pre-populate the priority set with one host so initialize() would have
+  // something to schedule sessions against if it were going to.
+  MockHostSet* host_set = priority_set_.getMockHostSet(0);
+  host_set->hosts_ = {
+      makeTestHost(std::make_shared<NiceMock<MockClusterInfo>>(), "tcp://127.0.0.1:80")};
+
+  buildLb();
+
+  // Exactly one timer created: the OrcaWeightManager's weight-calculation
+  // timer. No stagger timers because oob_enabled_ is false.
+  EXPECT_EQ(timers_created_, 1);
+  EXPECT_EQ(oobStatsForTest().active_sessions_.value(), 0);
+}
+
+// With OOB enabled and a host in the priority set at initialize() time, the
+// OrcaWeightManager schedules a stagger timer per host. We do not let the
+// timer fire (that would synchronously open a real upstream connection); we
+// just verify the timer was created so the wiring is observable end-to-end.
+TEST_F(ClientSideWeightedRoundRobinOobWiringTest, OobEnabledSchedulesStaggerTimer) {
+  proto_.mutable_enable_oob_load_report()->set_value(true);
+  proto_.mutable_oob_reporting_period()->set_seconds(5);
+
+  MockHostSet* host_set = priority_set_.getMockHostSet(0);
+  host_set->hosts_ = {
+      makeTestHost(std::make_shared<NiceMock<MockClusterInfo>>(), "tcp://127.0.0.1:80")};
+
+  buildLb();
+
+  // Two timers created: weight-calculation timer + one stagger timer for the
+  // single host. This is the observable signal that the OOB-enabled config
+  // path was taken in OrcaWeightManager (compare against
+  // OobDisabledCreatesNoSessions which only sees the weight-calc timer).
+  EXPECT_EQ(timers_created_, 2);
+  // Sessions are not active yet because the stagger timer has not fired.
+  EXPECT_EQ(oobStatsForTest().active_sessions_.value(), 0);
 }
 
 } // namespace

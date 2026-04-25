@@ -38,6 +38,12 @@ public:
   std::chrono::milliseconds weight_expiration_period;
   std::chrono::milliseconds weight_update_period;
 
+  // Out-of-band ORCA reporting configuration sourced from the CSWRR proto.
+  // When `oob_enabled` is true, the OrcaWeightManager opens per-host ORCA OOB
+  // streams using `oob_reporting_period` as the requested interval.
+  bool oob_enabled{false};
+  std::chrono::milliseconds oob_reporting_period{};
+
   // Round robin proto overrides that we want to propagate to the worker RR LB (e.g., slow start).
   RoundRobinConfig round_robin_overrides_;
 

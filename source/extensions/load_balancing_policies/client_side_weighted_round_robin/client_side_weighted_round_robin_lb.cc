@@ -41,6 +41,14 @@ ClientSideWeightedRoundRobinLbConfig::ClientSideWeightedRoundRobinLbConfig(
   weight_update_period =
       std::chrono::milliseconds(PROTOBUF_GET_MS_OR_DEFAULT(lb_proto, weight_update_period, 1000));
 
+  // OOB ORCA reporting. The proto field is a BoolValue so we use .value() which
+  // defaults to false when unset. The reporting period defaults to 10s per the
+  // proto comment. Even when OOB is disabled we parse the period so the field
+  // stays in sync with the proto, but the OrcaWeightManager will ignore it.
+  oob_enabled = lb_proto.enable_oob_load_report().value();
+  oob_reporting_period = std::chrono::milliseconds(
+      PROTOBUF_GET_MS_OR_DEFAULT(lb_proto, oob_reporting_period, 10000));
+
   if (lb_proto.has_slow_start_config()) {
     *round_robin_overrides_.mutable_slow_start_config() = lb_proto.slow_start_config();
   }
@@ -108,10 +116,22 @@ ClientSideWeightedRoundRobinLoadBalancer::ClientSideWeightedRoundRobinLoadBalanc
       typed_lb_config->blackout_period,
       typed_lb_config->weight_expiration_period,
       typed_lb_config->weight_update_period,
+      typed_lb_config->oob_enabled,
+      typed_lb_config->oob_reporting_period,
+      // CSWRR has no proto knob for OOB request_cost_names yet; pass empty.
+      /*oob_request_cost_names=*/{},
   };
+  // Per-cluster transport socket options for the OOB stream are not currently
+  // exposed through the CSWRR proto; pass nullptr until a knob is added.
+  // The codec client factory is stateless after recent code review, so a fresh
+  // ProdOrcaOobCodecClientFactory instance is fine.
   orca_weight_manager_ =
       std::make_unique<Extensions::LoadBalancingPolicies::Common::OrcaWeightManager>(
-          orca_config, priority_set, time_source, typed_lb_config->main_thread_dispatcher_,
+          orca_config, priority_set, time_source, typed_lb_config->main_thread_dispatcher_, random,
+          cluster_info.statsScope(),
+          /*transport_socket_options=*/nullptr,
+          std::make_unique<
+              Extensions::LoadBalancingPolicies::Common::ProdOrcaOobCodecClientFactory>(),
           [factory = factory_]() { factory->applyWeightsToAllWorkers(); });
 }
 
