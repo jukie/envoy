@@ -45,7 +45,7 @@ ClientSideWeightedRoundRobinLbConfig::ClientSideWeightedRoundRobinLbConfig(
   // defaults to false when unset. The reporting period defaults to 10s per the
   // proto comment. Even when OOB is disabled we parse the period so the field
   // stays in sync with the proto, but the OrcaWeightManager will ignore it.
-  oob_enabled = lb_proto.enable_oob_load_report().value();
+  enable_oob_load_report = lb_proto.enable_oob_load_report().value();
   oob_reporting_period = std::chrono::milliseconds(
       PROTOBUF_GET_MS_OR_DEFAULT(lb_proto, oob_reporting_period, 10000));
 
@@ -116,9 +116,12 @@ ClientSideWeightedRoundRobinLoadBalancer::ClientSideWeightedRoundRobinLoadBalanc
       typed_lb_config->blackout_period,
       typed_lb_config->weight_expiration_period,
       typed_lb_config->weight_update_period,
-      typed_lb_config->oob_enabled,
+      typed_lb_config->enable_oob_load_report,
       typed_lb_config->oob_reporting_period,
-      // CSWRR has no proto knob for OOB request_cost_names yet; pass empty.
+      // TODO(jukie): expose OOB request_cost_names via a CSWRR proto field.
+      // See https://github.com/grpc/proposal/blob/master/A51-custom-backend-metrics.md
+      // for the gRPC equivalent that informs which named cost metrics the
+      // backend should attach to ORCA reports.
       /*oob_request_cost_names=*/{},
   };
   // Per-cluster transport socket options for the OOB stream are not currently

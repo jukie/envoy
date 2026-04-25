@@ -529,7 +529,7 @@ TEST(ClientSideWeightedRoundRobinConfigTest, OobDisabledByDefault) {
   NiceMock<Event::MockDispatcher> dispatcher;
   ThreadLocal::MockInstance tls;
   ClientSideWeightedRoundRobinLbConfig typed(proto, dispatcher, tls);
-  EXPECT_FALSE(typed.oob_enabled);
+  EXPECT_FALSE(typed.enable_oob_load_report);
   // Even with OOB disabled, the period reflects the proto's documented default
   // (10s) so that flipping enable_oob_load_report on requires no other change.
   EXPECT_EQ(typed.oob_reporting_period, std::chrono::seconds(10));
@@ -545,7 +545,7 @@ TEST(ClientSideWeightedRoundRobinConfigTest, OobEnabledPropagates) {
   NiceMock<Event::MockDispatcher> dispatcher;
   ThreadLocal::MockInstance tls;
   ClientSideWeightedRoundRobinLbConfig typed(proto, dispatcher, tls);
-  EXPECT_TRUE(typed.oob_enabled);
+  EXPECT_TRUE(typed.enable_oob_load_report);
   EXPECT_EQ(typed.oob_reporting_period, std::chrono::seconds(5));
 }
 
