@@ -133,13 +133,14 @@ absl::Status OrcaHostLbPolicyData::onOrcaLoadReport(const Upstream::OrcaLoadRepo
   return report_handler_->updateClientSideDataFromOrcaLoadReport(report, *this);
 }
 
-Http::CodecClientPtr
-ProdOrcaOobCodecClientFactory::create(Upstream::Host::CreateConnectionData&& connection_data,
-                                      Event::Dispatcher& dispatcher) const {
+Http::CodecClientPtr ProdOrcaOobCodecClientFactory::create(
+    Upstream::Host::CreateConnectionData&& connection_data, Event::Dispatcher& dispatcher,
+    Random::RandomGenerator& random,
+    Network::TransportSocketOptionsConstSharedPtr transport_socket_options) const {
   // ORCA OOB streams use HTTP/2 to multiplex framing on a single connection.
   return std::make_unique<Http::CodecClientProd>(
       Http::CodecType::HTTP2, std::move(connection_data.connection_),
-      connection_data.host_description_, dispatcher, random_, transport_socket_options_);
+      connection_data.host_description_, dispatcher, random, std::move(transport_socket_options));
 }
 
 OrcaOobStats OrcaWeightManager::generateOrcaOobStats(Stats::Scope& scope) {
@@ -430,7 +431,13 @@ void OrcaWeightManager::startOobSession(const Upstream::HostSharedPtr& host) {
   auto create_codec_client_cb = [this, host]() -> Http::CodecClientPtr {
     Upstream::Host::CreateConnectionData connection_data = host->createOrcaReportingConnection(
         dispatcher_, transport_socket_options_, host->metadata().get());
-    return codec_client_factory_->create(std::move(connection_data), dispatcher_);
+    // Pass `random_` and `transport_socket_options_` through at the call site
+    // rather than holding them on the factory. This guarantees a single source
+    // of truth for these dependencies (this manager) and prevents accidental
+    // drift between the manager's connection-creation path and the factory's
+    // codec-client construction path.
+    return codec_client_factory_->create(std::move(connection_data), dispatcher_, random_,
+                                         transport_socket_options_);
   };
 
   // We deliberately use HostConstSharedPtr keys (not raw pointers) so that the
@@ -484,6 +491,17 @@ void OrcaWeightManager::startOobSession(const Upstream::HostSharedPtr& host) {
     Envoy::Orca::OrcaOobSessionPtr session = std::move(it->second);
     oob_sessions_.erase(it);
     oob_stats_.active_sessions_.set(oob_sessions_.size());
+    // Clear the post-fire stagger marker we leave behind in
+    // pending_oob_session_timers_ (see schedulePendingOobSession for the
+    // rationale on why the entry is left in place after the timer fires).
+    // Erasing here is safe because we are NOT executing inside the timer's
+    // own callback frame: the timer fired long ago, the session opened, ran,
+    // and is only now hitting its terminal callback — the TimerPtr we are
+    // about to destroy is no longer on the stack. Erasing is necessary so
+    // that a subsequent priority-shuffle re-add of this same host will not
+    // be silently swallowed by schedulePendingOobSession's "already pending"
+    // guard.
+    pending_oob_session_timers_.erase(key);
     if (session != nullptr) {
       dispatcher_.deferredDelete(std::move(session));
     }

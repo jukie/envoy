@@ -312,8 +312,10 @@ makeWeightTrackingMockHost(uint32_t initial_weight = 1) {
 // connection plumbing.
 class FakeOrcaOobCodecClientFactory : public OrcaOobCodecClientFactory {
 public:
-  Http::CodecClientPtr create(Upstream::Host::CreateConnectionData&& /*connection_data*/,
-                              Event::Dispatcher& /*dispatcher*/) const override {
+  Http::CodecClientPtr
+  create(Upstream::Host::CreateConnectionData&& /*connection_data*/,
+         Event::Dispatcher& /*dispatcher*/, Random::RandomGenerator& /*random*/,
+         Network::TransportSocketOptionsConstSharedPtr /*transport_socket_options*/) const override {
     ++create_calls_;
     return nullptr;
   }
@@ -941,14 +943,17 @@ struct OobAttempt {
 // factory holds a cluster info handle (so it can construct the host
 // description used by CodecClient) and keeps every per-attempt mock alive
 // for the duration of the test.
+// TODO: factor with test/common/orca/orca_oob_session_test.cc
 class WireDrivingOrcaOobCodecClientFactory : public OrcaOobCodecClientFactory {
 public:
   explicit WireDrivingOrcaOobCodecClientFactory(
       std::shared_ptr<Upstream::MockClusterInfo> cluster_info)
       : cluster_info_(std::move(cluster_info)) {}
 
-  Http::CodecClientPtr create(Upstream::Host::CreateConnectionData&& /*connection_data*/,
-                              Event::Dispatcher& dispatcher) const override {
+  Http::CodecClientPtr
+  create(Upstream::Host::CreateConnectionData&& /*connection_data*/, Event::Dispatcher& dispatcher,
+         Random::RandomGenerator& /*random*/,
+         Network::TransportSocketOptionsConstSharedPtr /*transport_socket_options*/) const override {
     auto attempt = std::make_unique<OobAttempt>();
     attempt->network_connection = new NiceMock<Network::MockClientConnection>();
     attempt->codec = new NiceMock<Http::MockClientConnection>();
@@ -1171,6 +1176,65 @@ TEST_F(OrcaWeightManagerOobWireTest, UnimplementedStopsRetries_NoFurtherSession)
   // session: factory.create() count is unchanged from the single
   // initial attempt.
   EXPECT_EQ(1U, factory_->attempts_.size());
+  EXPECT_EQ(0, manager->oobStatsForTest().active_sessions_.value());
+}
+
+// Test 4: after a terminal callback evicts the session, a subsequent
+// host-add notification (e.g. a priority shuffle re-adding the same
+// HostSharedPtr) MUST be able to schedule a fresh stagger. Regression test
+// for the "fired marker" zombie that previously prevented re-scheduling
+// because pending_oob_session_timers_ still held the post-fire marker.
+//
+// Timer LIFO note: MockTimer ctor stacks expectations so the LAST allocated
+// is consumed FIRST. Required consumption order (chronological):
+//   1. weight calc (manager ctor)
+//   2. stagger_1 (first runCallbacks)
+//   3. retry_1, 4. goaway_1 (OrcaOobSession ctor for first session)
+//   5. stagger_2 (re-add after terminal)
+//   6. retry_2, 7. goaway_2 (OrcaOobSession ctor for second session)
+// Therefore allocate in the REVERSE of that order below.
+TEST_F(OrcaWeightManagerOobWireTest, TerminalCallback_AllowsReschedulingOnReAdd) {
+  new NiceMock<Event::MockTimer>(&dispatcher_); // 7. session goaway drain (2)
+  new NiceMock<Event::MockTimer>(&dispatcher_); // 6. session retry (2)
+  auto* stagger_timer_2 = new NiceMock<Event::MockTimer>(&dispatcher_); // 5. stagger (2)
+  new NiceMock<Event::MockTimer>(&dispatcher_); // 4. session goaway drain (1)
+  new NiceMock<Event::MockTimer>(&dispatcher_); // 3. session retry (1)
+  auto* stagger_timer_1 = new NiceMock<Event::MockTimer>(&dispatcher_); // 2. stagger (1)
+  new NiceMock<Event::MockTimer>(&dispatcher_); // 1. weight calc (manager ctor)
+
+  auto manager = makeWireManager();
+  auto status = manager->initialize();
+  ASSERT_TRUE(status.ok());
+
+  auto host = makeWeightTrackingMockHost();
+  auto& attempt = startSessionForHost(host, stagger_timer_1);
+  ASSERT_EQ(1U, factory_->attempts_.size());
+
+  respondHeadersOk(attempt);
+
+  // Drive UNIMPLEMENTED so the session terminates and the manager's
+  // on_terminated_cb runs (which must clear the pending marker).
+  EXPECT_CALL(dispatcher_, deferredDelete_(testing::_)).Times(testing::AtLeast(1));
+  respondTrailers(attempt, Grpc::Status::WellKnownGrpcStatus::Unimplemented);
+  EXPECT_EQ(0, manager->oobStatsForTest().active_sessions_.value());
+
+  // Re-add the same host (without an intervening remove) — simulates a
+  // priority shuffle that re-presents an existing host. With the marker
+  // cleared this MUST schedule a new stagger; without the fix the
+  // schedulePendingOobSession early-out would silently swallow the add.
+  auto* host_set = priority_set_.getMockHostSet(0);
+  host_set->runCallbacks({host}, {});
+
+  // Fire the new stagger timer — a second factory.create() must occur,
+  // proving that the marker was cleared and a fresh session was scheduled.
+  stagger_timer_2->invokeCallback();
+  EXPECT_EQ(2U, factory_->attempts_.size());
+  EXPECT_EQ(1, manager->oobStatsForTest().active_sessions_.value());
+
+  // Tear down the second session via host removal.
+  EXPECT_CALL(dispatcher_, deferredDelete_(testing::_)).Times(testing::AtLeast(1));
+  host_set->hosts_.clear();
+  host_set->runCallbacks({}, {host});
   EXPECT_EQ(0, manager->oobStatsForTest().active_sessions_.value());
 }
 

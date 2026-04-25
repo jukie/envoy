@@ -172,33 +172,37 @@ struct OrcaHostLbPolicyData : public Envoy::Upstream::HostLbPolicyData {
  * the underlying connection synchronously inside its constructor. The factory
  * must therefore only be invoked from inside the per-attempt lambda passed to
  * the OrcaOobSession (i.e. AFTER the staggered start timer fires).
+ *
+ * The `random` and `transport_socket_options` are passed in at the call site by
+ * the manager so that there is a single source of truth for these dependencies
+ * (the manager itself), rather than duplicating them on the factory. This
+ * prevents accidental drift between the manager's connection-creation path
+ * and the codec-client construction path.
  */
 class OrcaOobCodecClientFactory {
 public:
   virtual ~OrcaOobCodecClientFactory() = default;
-  virtual Http::CodecClientPtr create(Upstream::Host::CreateConnectionData&& connection_data,
-                                      Event::Dispatcher& dispatcher) const PURE;
+  virtual Http::CodecClientPtr
+  create(Upstream::Host::CreateConnectionData&& connection_data, Event::Dispatcher& dispatcher,
+         Random::RandomGenerator& random,
+         Network::TransportSocketOptionsConstSharedPtr transport_socket_options) const PURE;
 };
 
 using OrcaOobCodecClientFactoryPtr = std::unique_ptr<OrcaOobCodecClientFactory>;
 
 /**
  * Production OrcaOobCodecClientFactory implementation that builds an HTTP/2
- * CodecClientProd around the supplied connection.
+ * CodecClientProd around the supplied connection. Holds no state of its own;
+ * `random` and `transport_socket_options` are supplied by the caller (the
+ * OrcaWeightManager) at each invocation.
  */
 // Wired up by CSWRR in client_side_weighted_round_robin_lb.cc — see Agent D.
 class ProdOrcaOobCodecClientFactory : public OrcaOobCodecClientFactory {
 public:
-  ProdOrcaOobCodecClientFactory(Random::RandomGenerator& random,
-                                Network::TransportSocketOptionsConstSharedPtr transport_socket_options)
-      : random_(random), transport_socket_options_(std::move(transport_socket_options)) {}
-
-  Http::CodecClientPtr create(Upstream::Host::CreateConnectionData&& connection_data,
-                              Event::Dispatcher& dispatcher) const override;
-
-private:
-  Random::RandomGenerator& random_;
-  const Network::TransportSocketOptionsConstSharedPtr transport_socket_options_;
+  Http::CodecClientPtr
+  create(Upstream::Host::CreateConnectionData&& connection_data, Event::Dispatcher& dispatcher,
+         Random::RandomGenerator& random,
+         Network::TransportSocketOptionsConstSharedPtr transport_socket_options) const override;
 };
 
 /**
