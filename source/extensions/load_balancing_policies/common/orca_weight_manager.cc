@@ -189,6 +189,8 @@ OrcaWeightManager::~OrcaWeightManager() {
     }
   }
   oob_sessions_.clear();
+  // Defensive: ensure the gauge reflects the empty session map after teardown.
+  oob_stats_.active_sessions_.set(0);
 }
 
 absl::Status OrcaWeightManager::initialize() {

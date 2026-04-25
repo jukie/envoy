@@ -186,6 +186,7 @@ using OrcaOobCodecClientFactoryPtr = std::unique_ptr<OrcaOobCodecClientFactory>;
  * Production OrcaOobCodecClientFactory implementation that builds an HTTP/2
  * CodecClientProd around the supplied connection.
  */
+// Wired up by CSWRR in client_side_weighted_round_robin_lb.cc — see Agent D.
 class ProdOrcaOobCodecClientFactory : public OrcaOobCodecClientFactory {
 public:
   ProdOrcaOobCodecClientFactory(Random::RandomGenerator& random,

@@ -1,20 +1,36 @@
 #include <chrono>
 #include <cstdint>
 #include <memory>
+#include <string>
+#include <utility>
 #include <vector>
 
+#include "envoy/grpc/status.h"
+
+#include "source/common/buffer/buffer_impl.h"
+#include "source/common/grpc/common.h"
+#include "source/common/http/codec_client.h"
+#include "source/common/http/header_map_impl.h"
 #include "source/common/orca/orca_oob_session.h"
 #include "source/extensions/load_balancing_policies/common/orca_weight_manager.h"
 
+#include "test/common/http/common.h"
 #include "test/common/stats/stat_test_utility.h"
+#include "test/common/upstream/utility.h"
 #include "test/mocks/common.h"
 #include "test/mocks/event/mocks.h"
+#include "test/mocks/http/mocks.h"
+#include "test/mocks/http/stream_encoder.h"
+#include "test/mocks/network/mocks.h"
 #include "test/mocks/stream_info/mocks.h"
+#include "test/mocks/upstream/cluster_info.h"
 #include "test/mocks/upstream/host.h"
 #include "test/mocks/upstream/priority_set.h"
 #include "test/test_common/simulated_time_system.h"
 #include "test/test_common/test_runtime.h"
+#include "test/test_common/utility.h"
 
+#include "absl/strings/str_cat.h"
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include "xds/data/orca/v3/orca_load_report.pb.h"
@@ -898,6 +914,264 @@ TEST_F(OrcaWeightManagerOobTest, DuplicateHostAdd_DoesNotDoubleSchedule) {
   host_set->runCallbacks({host}, {});
   // Same host, second notification — must not allocate another stagger timer.
   host_set->runCallbacks({host}, {});
+}
+
+// ============================================================
+// OrcaWeightManager OOB session-callback tests (driven via wire)
+//
+// These tests use a smart codec-client factory that constructs a real
+// CodecClientForTest backed by mock connections, so the production
+// on_report_cb / on_terminated_cb / on_lifecycle_cb closures captured
+// inside startOobSession() are exercised end-to-end. Mirrors the pattern
+// in test/common/orca/orca_oob_session_test.cc.
+// ============================================================
+
+// Per-attempt mocks: every codec-client construction stashes one of these
+// so the test can drive headers/data/trailers over the response decoder
+// for that attempt.
+struct OobAttempt {
+  NiceMock<Network::MockClientConnection>* network_connection{nullptr};
+  NiceMock<Http::MockClientConnection>* codec{nullptr};
+  NiceMock<Http::MockRequestEncoder> request_encoder;
+  Http::ResponseDecoder* response_decoder{nullptr};
+  CodecClientForTest* codec_client{nullptr};
+};
+
+// Smart factory that builds a real CodecClientForTest per attempt. The
+// factory holds a cluster info handle (so it can construct the host
+// description used by CodecClient) and keeps every per-attempt mock alive
+// for the duration of the test.
+class WireDrivingOrcaOobCodecClientFactory : public OrcaOobCodecClientFactory {
+public:
+  explicit WireDrivingOrcaOobCodecClientFactory(
+      std::shared_ptr<Upstream::MockClusterInfo> cluster_info)
+      : cluster_info_(std::move(cluster_info)) {}
+
+  Http::CodecClientPtr create(Upstream::Host::CreateConnectionData&& /*connection_data*/,
+                              Event::Dispatcher& dispatcher) const override {
+    auto attempt = std::make_unique<OobAttempt>();
+    attempt->network_connection = new NiceMock<Network::MockClientConnection>();
+    attempt->codec = new NiceMock<Http::MockClientConnection>();
+    EXPECT_CALL(*attempt->codec, newStream(testing::_))
+        .WillOnce(testing::DoAll(Envoy::SaveArgAddress(&attempt->response_decoder),
+                                 testing::ReturnRef(attempt->request_encoder)));
+    // Accept (and ignore) the request the session sends; we only care
+    // about what the manager does with reports.
+    EXPECT_CALL(attempt->request_encoder, encodeHeaders(testing::_, false))
+        .WillOnce(testing::Return(Http::okStatus()));
+    EXPECT_CALL(attempt->request_encoder, encodeData(testing::_, true));
+
+    Network::ClientConnectionPtr conn{attempt->network_connection};
+    auto codec_client = std::make_unique<CodecClientForTest>(
+        Http::CodecType::HTTP2, std::move(conn), attempt->codec, nullptr,
+        Upstream::makeTestHost(cluster_info_, "tcp://127.0.0.1:9000"), dispatcher);
+    attempt->codec_client = codec_client.get();
+    attempts_.push_back(std::move(attempt));
+    return codec_client;
+  }
+
+  // Mutable so the const create() above can append.
+  mutable std::vector<std::unique_ptr<OobAttempt>> attempts_;
+
+private:
+  std::shared_ptr<Upstream::MockClusterInfo> cluster_info_;
+};
+
+class OrcaWeightManagerOobWireTest : public OrcaWeightManagerTest {
+protected:
+  void SetUp() override {
+    OrcaWeightManagerTest::SetUp();
+    config_.oob_enabled = true;
+    config_.oob_reporting_period = std::chrono::milliseconds(10000);
+    config_.oob_request_cost_names = {"cpu_utilization"};
+    cluster_info_ = std::make_shared<NiceMock<Upstream::MockClusterInfo>>();
+  }
+
+  std::unique_ptr<OrcaWeightManager> makeWireManager() {
+    auto factory = std::make_unique<WireDrivingOrcaOobCodecClientFactory>(cluster_info_);
+    factory_ = factory.get();
+    return makeManager(std::move(factory));
+  }
+
+  // Drive a single end-to-end attempt: bring a pending host live by firing
+  // the stagger timer, then return the OobAttempt for the freshly opened
+  // attempt so the caller can deliver headers/data/trailers.
+  OobAttempt&
+  startSessionForHost(const std::shared_ptr<NiceMock<Upstream::MockHost>>& host,
+                      NiceMock<Event::MockTimer>* stagger_timer) {
+    auto* host_set = priority_set_.getMockHostSet(0);
+    host_set->hosts_ = {host};
+    host_set->runCallbacks({host}, {});
+    stagger_timer->invokeCallback();
+    EXPECT_FALSE(factory_->attempts_.empty());
+    return *factory_->attempts_.back();
+  }
+
+  void respondHeadersOk(OobAttempt& attempt) {
+    auto headers = std::make_unique<Http::TestResponseHeaderMapImpl>(
+        Http::TestResponseHeaderMapImpl({{":status", "200"},
+                                         {"content-type", "application/grpc"}}));
+    attempt.response_decoder->decodeHeaders(std::move(headers), false);
+  }
+
+  void respondReport(OobAttempt& attempt,
+                     const xds::data::orca::v3::OrcaLoadReport& report) {
+    auto frame = Grpc::Common::serializeToGrpcFrame(report);
+    attempt.response_decoder->decodeData(*frame, /*end_stream=*/false);
+  }
+
+  void respondTrailers(OobAttempt& attempt, Grpc::Status::GrpcStatus status,
+                       const std::string& message = "") {
+    auto trailers = std::make_unique<Http::TestResponseTrailerMapImpl>(
+        Http::TestResponseTrailerMapImpl({{"grpc-status", absl::StrCat(status)}}));
+    if (!message.empty()) {
+      trailers->addCopy(Http::Headers::get().GrpcMessage, message);
+    }
+    attempt.response_decoder->decodeTrailers(std::move(trailers));
+  }
+
+  std::shared_ptr<NiceMock<Upstream::MockClusterInfo>> cluster_info_;
+  WireDrivingOrcaOobCodecClientFactory* factory_{nullptr};
+};
+
+// Test 1: a successful ORCA report received over the wire increments the
+// reports_received counter AND propagates into OrcaHostLbPolicyData via
+// the report handler (i.e. report_handler_ was actually invoked).
+TEST_F(OrcaWeightManagerOobWireTest, ReportReceived_IncrementsCounterAndUpdatesHostData) {
+  // Session goaway drain + retry timers (consumed last by LIFO).
+  new NiceMock<Event::MockTimer>(&dispatcher_);
+  new NiceMock<Event::MockTimer>(&dispatcher_);
+  // Stagger timer.
+  auto* stagger_timer = new NiceMock<Event::MockTimer>(&dispatcher_);
+  // Weight calc timer (consumed first by manager ctor).
+  new NiceMock<Event::MockTimer>(&dispatcher_);
+
+  auto manager = makeWireManager();
+  auto status = manager->initialize();
+  ASSERT_TRUE(status.ok());
+
+  auto host = makeWeightTrackingMockHost();
+  auto& attempt = startSessionForHost(host, stagger_timer);
+
+  // Open the stream.
+  respondHeadersOk(attempt);
+  EXPECT_EQ(1U, manager->oobStatsForTest().stream_opens_.value());
+  EXPECT_EQ(0U, manager->oobStatsForTest().reports_received_.value());
+
+  // Anchor "now" so the report-handler's weight calc updates timestamps
+  // we can later verify against.
+  time_system_.setMonotonicTime(MonotonicTime(std::chrono::seconds(60)));
+
+  // Deliver a valid ORCA report. The report handler will compute a
+  // weight (rps_fractional=1000, application_utilization=0.5 → 2000) and
+  // stamp timestamps onto the host's OrcaHostLbPolicyData.
+  xds::data::orca::v3::OrcaLoadReport report;
+  report.set_rps_fractional(1000);
+  report.set_application_utilization(0.5);
+  respondReport(attempt, report);
+
+  // Counter incremented exactly once via the production on_report_cb.
+  EXPECT_EQ(1U, manager->oobStatsForTest().reports_received_.value());
+  EXPECT_EQ(0U, manager->oobStatsForTest().report_errors_.value());
+
+  // Side effect: report_handler_->updateClientSideDataFromOrcaLoadReport
+  // wrote the new weight into the host's OrcaHostLbPolicyData. We observe
+  // that side effect rather than mocking the handler, because the manager
+  // owns its handler internally.
+  auto data_opt = host->typedLbPolicyData<OrcaHostLbPolicyData>();
+  ASSERT_TRUE(data_opt.has_value());
+  EXPECT_EQ(2000U, data_opt->weight_.load());
+  EXPECT_EQ(MonotonicTime(std::chrono::seconds(60)), data_opt->last_update_time_.load());
+
+  // Tear down via host removal so the manager defers-deletes cleanly.
+  EXPECT_CALL(dispatcher_, deferredDelete_(testing::_)).Times(testing::AtLeast(1));
+  auto* host_set = priority_set_.getMockHostSet(0);
+  host_set->hosts_.clear();
+  host_set->runCallbacks({}, {host});
+}
+
+// Test 2: when the session terminates (UNIMPLEMENTED here, but the
+// manager's on_terminated_cb is status-agnostic — it always tears down),
+// stream_terminated is incremented, the session is erased from
+// oob_sessions_, and the active_sessions gauge is decremented to zero.
+//
+// NOTE: OrcaOobSession only fires its terminal callback for UNIMPLEMENTED
+// (see OrcaOobSession::onRpcComplete). Other gRPC statuses go through
+// handleTransientFailure and do not invoke on_terminated_cb. We therefore
+// drive UNIMPLEMENTED here; the manager's cleanup logic does not branch
+// on status, so this fully exercises the terminal cleanup path that
+// would also run for any other status the session might one day deliver.
+TEST_F(OrcaWeightManagerOobWireTest, TerminalCallback_ErasesSessionAndDecrementsGauge) {
+  // Session goaway drain + retry timers.
+  new NiceMock<Event::MockTimer>(&dispatcher_);
+  new NiceMock<Event::MockTimer>(&dispatcher_);
+  // Stagger timer.
+  auto* stagger_timer = new NiceMock<Event::MockTimer>(&dispatcher_);
+  // Weight calc timer (consumed first).
+  new NiceMock<Event::MockTimer>(&dispatcher_);
+
+  auto manager = makeWireManager();
+  auto status = manager->initialize();
+  ASSERT_TRUE(status.ok());
+
+  auto host = makeWeightTrackingMockHost();
+  auto& attempt = startSessionForHost(host, stagger_timer);
+
+  respondHeadersOk(attempt);
+  EXPECT_EQ(1, manager->oobStatsForTest().active_sessions_.value());
+  EXPECT_EQ(0U, manager->oobStatsForTest().stream_terminated_.value());
+
+  // Expect the terminal callback to deferred-delete the session.
+  EXPECT_CALL(dispatcher_, deferredDelete_(testing::_)).Times(testing::AtLeast(1));
+
+  // Drive UNIMPLEMENTED trailers — the only status that crosses the
+  // session's terminal boundary into the manager's on_terminated_cb.
+  respondTrailers(attempt, Grpc::Status::WellKnownGrpcStatus::Unimplemented,
+                  "no service");
+
+  // Production on_terminated_cb ran:
+  //  - bumped stream_terminated counter
+  //  - erased the session from oob_sessions_ (observed via gauge)
+  //  - decremented active_sessions gauge
+  EXPECT_EQ(1U, manager->oobStatsForTest().stream_terminated_.value());
+  EXPECT_EQ(0, manager->oobStatsForTest().active_sessions_.value());
+}
+
+// Test 3: UNIMPLEMENTED stops the session permanently. After the terminal
+// fires and the manager evicts the session, no subsequent activity (no
+// new factory invocation, no fresh active session) occurs for that host.
+TEST_F(OrcaWeightManagerOobWireTest, UnimplementedStopsRetries_NoFurtherSession) {
+  // Session goaway drain + retry timers.
+  new NiceMock<Event::MockTimer>(&dispatcher_);
+  new NiceMock<Event::MockTimer>(&dispatcher_);
+  // Stagger timer.
+  auto* stagger_timer = new NiceMock<Event::MockTimer>(&dispatcher_);
+  // Weight calc timer.
+  new NiceMock<Event::MockTimer>(&dispatcher_);
+
+  auto manager = makeWireManager();
+  auto status = manager->initialize();
+  ASSERT_TRUE(status.ok());
+
+  auto host = makeWeightTrackingMockHost();
+  auto& attempt = startSessionForHost(host, stagger_timer);
+  ASSERT_EQ(1U, factory_->attempts_.size());
+
+  respondHeadersOk(attempt);
+
+  EXPECT_CALL(dispatcher_, deferredDelete_(testing::_)).Times(testing::AtLeast(1));
+  respondTrailers(attempt, Grpc::Status::WellKnownGrpcStatus::Unimplemented);
+
+  // Same teardown invariants as Test 2.
+  EXPECT_EQ(1U, manager->oobStatsForTest().stream_terminated_.value());
+  EXPECT_EQ(0, manager->oobStatsForTest().active_sessions_.value());
+
+  // The dispatcher is idle (no test-driven retry timer fire, no host
+  // removal/re-add). The manager must not have spun up a replacement
+  // session: factory.create() count is unchanged from the single
+  // initial attempt.
+  EXPECT_EQ(1U, factory_->attempts_.size());
+  EXPECT_EQ(0, manager->oobStatsForTest().active_sessions_.value());
 }
 
 // Manager destruction with active sessions cleans them up via deferredDelete.
