@@ -71,6 +71,11 @@ using OrcaOobLifecycleCb = std::function<void(OrcaOobLifecycleEvent)>;
  * Http::CodecClient, the session is itself deferred-deletable so the
  * manager can hand it to dispatcher.deferredDelete() during shutdown.
  *
+ * Ownership/destruction contract: callers must release the session via
+ * dispatcher.deferredDelete(). Direct destruction is only safe outside any
+ * session-originated callback frame because the dtor synchronously closes
+ * and destroys the underlying CodecClient.
+ *
  * Retry/backoff semantics:
  *  - On a first successful report, the supplied BackOffStrategy is reset.
  *  - If a transient failure occurs after at least one report has been
@@ -99,6 +104,9 @@ public:
                  OrcaOobReportCb on_report, OrcaOobTerminatedCb on_terminated,
                  OrcaOobLifecycleCb on_lifecycle_event,
                  BackOffStrategyPtr backoff);
+  // IMPORTANT: callers must release the session via dispatcher.deferredDelete().
+  // Direct destruction is only safe outside any session-originated callback frame
+  // because the dtor synchronously closes and destroys the underlying CodecClient.
   ~OrcaOobSession() override;
 
   /**
@@ -154,10 +162,10 @@ private:
 
   // Open a new codec client and stream.
   void connectAndStream();
-  // Schedule a retry using the backoff strategy. If override_immediate is
-  // true, schedule the retry with zero delay (used for the one-shot
-  // immediate retry after first successful report).
-  void scheduleRetry(bool override_immediate);
+  // Schedule a retry using the backoff strategy. If immediate is true,
+  // schedule the retry with zero delay (used for the one-shot immediate
+  // retry after first successful report).
+  void scheduleRetry(bool immediate);
   // Tear down the active stream/connection and notify the owner of a
   // transient failure. If terminal is true, instead invoke on_terminated_;
   // the session must NOT be touched by the caller after that.
@@ -199,10 +207,11 @@ private:
   // True if at least one report has been received over the lifetime of the
   // session. Drives the "next failure gets one immediate retry" rule.
   bool received_any_report_{false};
-  // True if a report has been received within the current connection
-  // attempt. When true at the time of failure, the immediate-retry rule
-  // applies (provided we have not already used it).
-  bool received_report_in_attempt_{false};
+  // True once we have observed a report within the current connection
+  // attempt and used it to re-arm the backoff strategy. This guards the
+  // backoff_->reset() call so that successive reports in a single attempt
+  // do not redundantly reset the backoff.
+  bool backoff_reset_armed_in_attempt_{false};
   // True if the immediate-retry budget is currently available (i.e. a
   // successful report has been observed and we have not yet consumed the
   // immediate retry).

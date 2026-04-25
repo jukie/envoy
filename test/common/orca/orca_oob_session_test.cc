@@ -56,6 +56,13 @@ struct AttemptMocks {
   CodecClientForTest* codec_client{nullptr};
   bool encode_headers_called{false};
   bool encode_data_called{false};
+  // The OrcaLoadReportRequest parsed off the wire when the session sent
+  // its first (and only) data frame on this attempt.
+  xds::service::orca::v3::OrcaLoadReportRequest parsed_request;
+  // Captured :scheme pseudo-header value, or empty if the session did not
+  // set one. The reference gRPC health checker leaves this to the codec,
+  // and the OrcaOobSession should follow that pattern.
+  std::string captured_scheme;
 };
 
 // Drives stream reset through the mock encoder's stream so that the
@@ -115,6 +122,7 @@ public:
           EXPECT_EQ("/xds.service.orca.v3.OpenRcaService/StreamCoreMetrics",
                     headers.getPathValue());
           EXPECT_EQ("orca-oob", headers.getHostValue());
+          attempt_ptr->captured_scheme = std::string(headers.getSchemeValue());
           attempt_ptr->encode_headers_called = true;
           return Http::okStatus();
         }));
@@ -124,9 +132,8 @@ public:
           Grpc::Decoder decoder;
           ASSERT_TRUE(decoder.decode(data, frames).ok());
           ASSERT_EQ(1u, frames.size());
-          xds::service::orca::v3::OrcaLoadReportRequest req;
           Buffer::ZeroCopyInputStreamImpl stream(std::move(frames[0].data_));
-          ASSERT_TRUE(req.ParseFromZeroCopyStream(&stream));
+          ASSERT_TRUE(attempt_ptr->parsed_request.ParseFromZeroCopyStream(&stream));
           attempt_ptr->encode_data_called = true;
         }));
 
@@ -190,13 +197,27 @@ public:
 
 // Open stream, server replies with headers + a single OrcaLoadReport
 // frame; lifecycle StreamOpen fires and the report callback observes the
-// payload.
+// payload. Also asserts that the session encoded the report interval and
+// requested cost names into the OrcaLoadReportRequest body, and that it
+// did not pin the :scheme pseudo-header (the codec defaults it).
 TEST_F(OrcaOobSessionTest, HappyPathReceivesReport) {
-  createSession();
+  createSession(std::chrono::milliseconds(1000), {"cpu_utilization"});
   session_->start();
   ASSERT_EQ(1u, attempts_.size());
   EXPECT_TRUE(attempts_[0]->encode_headers_called);
   EXPECT_TRUE(attempts_[0]->encode_data_called);
+
+  // Body content: report interval round-trips and cost names made it into
+  // the request.
+  const auto& req = attempts_[0]->parsed_request;
+  ASSERT_TRUE(req.has_report_interval());
+  EXPECT_EQ(1, req.report_interval().seconds());
+  EXPECT_EQ(0, req.report_interval().nanos());
+  ASSERT_EQ(1, req.request_cost_names_size());
+  EXPECT_EQ("cpu_utilization", req.request_cost_names(0));
+
+  // The session must NOT pin :scheme; the codec is responsible for that.
+  EXPECT_TRUE(attempts_[0]->captured_scheme.empty());
 
   respondHeadersOk(*attempts_[0]);
   ASSERT_EQ(1u, lifecycle_events_.size());
@@ -209,6 +230,39 @@ TEST_F(OrcaOobSessionTest, HappyPathReceivesReport) {
   ASSERT_EQ(1u, reports_.size());
   EXPECT_DOUBLE_EQ(0.42, reports_[0].cpu_utilization());
   EXPECT_FALSE(terminated_);
+
+  session_->close();
+}
+
+// Sub-second report intervals must split correctly into seconds + nanos
+// rather than dropping the fractional portion. 1500ms => 1s + 500_000_000ns.
+TEST_F(OrcaOobSessionTest, SubSecondReportIntervalSplitsSecondsAndNanos) {
+  createSession(std::chrono::milliseconds(1500), {"cpu_utilization"});
+  session_->start();
+  ASSERT_EQ(1u, attempts_.size());
+  ASSERT_TRUE(attempts_[0]->encode_data_called);
+
+  const auto& req = attempts_[0]->parsed_request;
+  ASSERT_TRUE(req.has_report_interval());
+  EXPECT_EQ(1, req.report_interval().seconds());
+  EXPECT_EQ(500'000'000, req.report_interval().nanos());
+
+  session_->close();
+}
+
+// Non-default cost names propagate into the request, in order. This guards
+// against accidentally dropping or reordering entries.
+TEST_F(OrcaOobSessionTest, RequestCostNamesAreEncoded) {
+  createSession(std::chrono::milliseconds(1000),
+                {"named_metrics.foo", "named_metrics.bar"});
+  session_->start();
+  ASSERT_EQ(1u, attempts_.size());
+  ASSERT_TRUE(attempts_[0]->encode_data_called);
+
+  const auto& req = attempts_[0]->parsed_request;
+  ASSERT_EQ(2, req.request_cost_names_size());
+  EXPECT_EQ("named_metrics.foo", req.request_cost_names(0));
+  EXPECT_EQ("named_metrics.bar", req.request_cost_names(1));
 
   session_->close();
 }
@@ -240,6 +294,30 @@ TEST_F(OrcaOobSessionTest, UnimplementedIsTerminal) {
   EXPECT_TRUE(terminated_);
   EXPECT_EQ(Grpc::Status::WellKnownGrpcStatus::Unimplemented, terminated_status_);
   EXPECT_EQ(1u, attempts_.size());
+}
+
+// Non-200 response with end_stream=false and no trailers must route
+// through Grpc::Utility::httpToGrpcStatus and the transient-failure path
+// (i.e. schedule a retry, NOT terminate). HTTP 500 maps to gRPC Unknown.
+TEST_F(OrcaOobSessionTest, Non200NoTrailersIsTransientFailure) {
+  createSession();
+  EXPECT_CALL(*backoff_, nextBackOffMs()).WillOnce(Return(75));
+  EXPECT_CALL(*retry_timer_, enableTimer(std::chrono::milliseconds(75), _));
+
+  session_->start();
+  // 500 response with end_stream=false: no grpc-status header, server
+  // hasn't ended the stream cleanly. The session should reset the stream
+  // itself and queue a retry rather than fire on_terminated_.
+  auto headers = std::make_unique<Http::TestResponseHeaderMapImpl>(
+      Http::TestResponseHeaderMapImpl({{":status", "500"}}));
+  attempts_[0]->response_decoder->decodeHeaders(std::move(headers), false);
+
+  EXPECT_FALSE(terminated_);
+  ASSERT_EQ(1u, lifecycle_events_.size());
+  EXPECT_EQ(OrcaOobLifecycleEvent::StreamFailure, lifecycle_events_[0]);
+
+  retry_timer_->invokeCallback();
+  ASSERT_EQ(2u, attempts_.size());
 }
 
 // Trailers-only UNIMPLEMENTED also terminates.

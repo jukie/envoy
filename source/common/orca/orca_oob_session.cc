@@ -17,7 +17,6 @@
 #include "source/common/grpc/status.h"
 #include "source/common/http/codes.h"
 #include "source/common/http/header_map_impl.h"
-#include "source/common/http/headers.h"
 #include "source/common/http/message_impl.h"
 #include "source/common/http/utility.h"
 
@@ -32,6 +31,8 @@ namespace {
 constexpr absl::string_view kOrcaOobServiceFullName = "xds.service.orca.v3.OpenRcaService";
 constexpr absl::string_view kStreamCoreMetricsMethod = "StreamCoreMetrics";
 // Authority used for the gRPC :authority header. This is host-agnostic.
+// TODO: plumb the host's hostname / SNI through the factory so the manager
+// can pass it here for name-based vhost upstream routing.
 constexpr absl::string_view kDefaultAuthority = "orca-oob";
 
 } // namespace
@@ -129,7 +130,9 @@ void OrcaOobSession::connectAndStream() {
 
   auto headers_message = Grpc::Common::prepareHeaders(kDefaultAuthority, kOrcaOobServiceFullName,
                                                       kStreamCoreMetricsMethod, absl::nullopt);
-  headers_message->headers().setReferenceScheme(Http::Headers::get().SchemeValues.Http);
+  // Intentionally do not set :scheme here: the reference gRPC health
+  // checker leaves it to the codec, and tying the leaf to either http or
+  // https would prevent the owner from supplying a TLS-aware codec client.
   // The stream is server-streaming with no per-call timeout; the report
   // interval governs frequency.
   auto status = request_encoder_->encodeHeaders(headers_message->headers(), false);
@@ -151,13 +154,12 @@ void OrcaOobSession::connectAndStream() {
   request_encoder_->encodeData(*Grpc::Common::serializeToGrpcFrame(request), true);
 }
 
-void OrcaOobSession::scheduleRetry(bool override_immediate) {
+void OrcaOobSession::scheduleRetry(bool immediate) {
   if (stopped_) {
     return;
   }
-  uint64_t delay_ms = override_immediate ? 0 : backoff_->nextBackOffMs();
-  ENVOY_LOG(debug, "OrcaOobSession: scheduling retry in {} ms (immediate={})", delay_ms,
-            override_immediate);
+  const uint64_t delay_ms = immediate ? 0 : backoff_->nextBackOffMs();
+  ENVOY_LOG(debug, "OrcaOobSession: scheduling retry in {} ms (immediate={})", delay_ms, immediate);
   retry_timer_->enableTimer(std::chrono::milliseconds(delay_ms));
 }
 
@@ -182,7 +184,7 @@ void OrcaOobSession::resetStreamState() {
   decoder_ = Grpc::Decoder();
   expect_reset_ = false;
   draining_no_error_goaway_ = false;
-  received_report_in_attempt_ = false;
+  backoff_reset_armed_in_attempt_ = false;
 }
 
 void OrcaOobSession::handleTransientFailure(absl::string_view reason) {
@@ -244,8 +246,8 @@ void OrcaOobSession::onReport(const xds::data::orca::v3::OrcaLoadReport& report)
     backoff_->reset();
     immediate_retry_available_ = true;
   }
-  if (!received_report_in_attempt_) {
-    received_report_in_attempt_ = true;
+  if (!backoff_reset_armed_in_attempt_) {
+    backoff_reset_armed_in_attempt_ = true;
     // Reset backoff on every successful attempt, not just the first one,
     // so that a string of healthy connections keeps the retry budget
     // ready even if there is an earlier transient blip.
