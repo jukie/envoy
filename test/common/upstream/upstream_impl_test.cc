@@ -49,6 +49,7 @@
 #include "test/mocks/upstream/health_checker.h"
 #include "test/mocks/upstream/priority_set.h"
 #include "test/mocks/upstream/thread_aware_load_balancer.h"
+#include "test/mocks/upstream/transport_socket_match.h"
 #include "test/mocks/upstream/typed_load_balancer_factory.h"
 #include "test/test_common/environment.h"
 #include "test/test_common/registry.h"
@@ -2236,6 +2237,59 @@ TEST_F(HostImplTest, CreateOrcaReportingConnectionHappyEyeballs) {
   // The created connection will be wrapped in a HappyEyeballsConnectionImpl.
   EXPECT_NE(connection, connection_data.connection_.get());
   EXPECT_EQ(host, connection->stream_info_.upstreamInfo()->upstreamHost());
+}
+
+// Verifies that when non-null metadata is supplied to createOrcaReportingConnection, the
+// HostImplBase implementation routes the resolution through
+// cluster.transportSocketMatcher().resolve(), forwarding the supplied metadata pointer and
+// transport socket options. This exercises the (metadata != nullptr) branch in
+// HostImplBase::createOrcaReportingConnection that picks the resolved factory rather than the
+// host's default transport socket factory.
+TEST_F(HostImplTest, CreateOrcaReportingConnectionWithMetadataResolvesTransportSocket) {
+  MockClusterMockPrioritySet cluster;
+  envoy::config::core::v3::Locality locality;
+  Network::Address::InstanceConstSharedPtr address =
+      *Network::Utility::resolveUrl("tcp://10.0.0.1:1234");
+  auto host = std::shared_ptr<Upstream::HostImpl>(*HostImpl::create(
+      cluster.info_, "lyft.com", address, nullptr, nullptr, 1,
+      std::make_shared<const envoy::config::core::v3::Locality>(locality),
+      envoy::config::endpoint::v3::Endpoint::HealthCheckConfig::default_instance(), 1,
+      envoy::config::core::v3::UNKNOWN));
+
+  // Build a minimal but non-empty metadata to pass through.
+  envoy::config::core::v3::Metadata orca_metadata;
+  Config::Metadata::mutableMetadataValue(orca_metadata, "envoy.test.orca", "key")
+      .set_string_value("value");
+
+  // Build distinct transport socket options so we can assert they were forwarded.
+  Network::TransportSocketOptionsConstSharedPtr transport_socket_options =
+      std::make_shared<Network::TransportSocketOptionsImpl>(
+          "test-server-name", std::vector<std::string>{}, std::vector<std::string>{},
+          std::vector<std::string>{});
+
+  // The MockClusterInfo owns a NiceMock<MockTransportSocketMatcher>; intercept resolve() to
+  // verify that the metadata pointer and transport socket options provided to
+  // createOrcaReportingConnection are forwarded through resolveTransportSocketFactory ->
+  // matcher.resolve(). Returning a MatchData built from the matcher's default factory keeps the
+  // downstream connection-creation path working.
+  auto* matcher = dynamic_cast<NiceMock<MockTransportSocketMatcher>*>(
+      cluster.info_->transport_socket_matcher_.get());
+  ASSERT_NE(matcher, nullptr);
+  EXPECT_CALL(*matcher, resolve(&orca_metadata, _, transport_socket_options))
+      .WillOnce(Return(TransportSocketMatcher::MatchData(*matcher->socket_factory_,
+                                                         matcher->stats_, "orca-test")));
+
+  testing::StrictMock<Event::MockDispatcher> dispatcher;
+  auto connection = new testing::StrictMock<Network::MockClientConnection>();
+  EXPECT_CALL(*connection, setBufferLimits(0));
+  EXPECT_CALL(dispatcher, createClientConnection_(address, _, _, _)).WillOnce(Return(connection));
+  EXPECT_CALL(*connection, connectionInfoSetter());
+  EXPECT_CALL(*connection, streamInfo());
+
+  Envoy::Upstream::Host::CreateConnectionData connection_data =
+      host->createOrcaReportingConnection(dispatcher, transport_socket_options, &orca_metadata);
+  EXPECT_EQ(connection, connection_data.connection_.get());
+  EXPECT_EQ(host, connection_data.host_description_);
 }
 
 TEST_F(HostImplTest, HealthFlags) {
