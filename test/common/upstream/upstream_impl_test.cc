@@ -1837,6 +1837,17 @@ TEST_P(StrictDnsClusterImplParamTest, Http2UserDefinedSettingsParametersValidati
 class HostImplTest : public Event::TestUsingSimulatedTime, public testing::Test {
 protected:
   using AddressVector = HostDescription::AddressVector;
+
+  std::shared_ptr<HostImpl> makeHostWithOrca(
+      const std::shared_ptr<MockClusterInfo>& info,
+      const Network::Address::InstanceConstSharedPtr& address,
+      const envoy::config::endpoint::v3::Endpoint::OrcaReportingConfig& orca_config = {}) {
+    return std::shared_ptr<HostImpl>(*HostImpl::create(
+        info, "", address, nullptr, nullptr, 1,
+        std::make_shared<const envoy::config::core::v3::Locality>(),
+        envoy::config::endpoint::v3::Endpoint::HealthCheckConfig::default_instance(), 0,
+        envoy::config::core::v3::UNKNOWN, {}, orca_config));
+  }
 };
 
 TEST_F(HostImplTest, HostCluster) {
@@ -1970,14 +1981,67 @@ TEST_F(HostImplTest, CreateConnection) {
 
 TEST_F(HostImplTest, OrcaReportingAddressDefaultsToDataAddress) {
   MockClusterMockPrioritySet cluster;
-  Network::Address::InstanceConstSharedPtr address =
-      *Network::Utility::resolveUrl("tcp://10.0.0.1:1234");
-  auto host = std::shared_ptr<Upstream::HostImpl>(*HostImpl::create(
-      cluster.info_, "", address, nullptr, nullptr, 1,
-      std::make_shared<const envoy::config::core::v3::Locality>(),
-      envoy::config::endpoint::v3::Endpoint::HealthCheckConfig::default_instance(), 0,
-      envoy::config::core::v3::UNKNOWN));
+  auto address = *Network::Utility::resolveUrl("tcp://10.0.0.1:1234");
+  auto host = makeHostWithOrca(cluster.info_, address);
   EXPECT_EQ(host->orcaReportingAddress(), host->address());
+}
+
+TEST_F(HostImplTest, OrcaReportingPortValueOverlaysDataAddress) {
+  MockClusterMockPrioritySet cluster;
+  auto address = *Network::Utility::resolveUrl("tcp://10.0.0.1:1234");
+  envoy::config::endpoint::v3::Endpoint::OrcaReportingConfig orca_config;
+  orca_config.set_port_value(9091);
+  auto host = makeHostWithOrca(cluster.info_, address, orca_config);
+  EXPECT_EQ(host->orcaReportingAddress()->asString(), "10.0.0.1:9091");
+}
+
+TEST_F(HostImplTest, OrcaReportingAddressOverridesDataAddress) {
+  MockClusterMockPrioritySet cluster;
+  auto address = *Network::Utility::resolveUrl("tcp://10.0.0.1:1234");
+  envoy::config::endpoint::v3::Endpoint::OrcaReportingConfig orca_config;
+  auto* addr = orca_config.mutable_address()->mutable_socket_address();
+  addr->set_address("127.0.0.1");
+  addr->set_port_value(8080);
+  auto host = makeHostWithOrca(cluster.info_, address, orca_config);
+  EXPECT_EQ(host->orcaReportingAddress()->asString(), "127.0.0.1:8080");
+}
+
+// port_value overlays the port of an explicit address, matching HealthCheckConfig.
+TEST_F(HostImplTest, OrcaReportingPortOverlaysExplicitAddress) {
+  MockClusterMockPrioritySet cluster;
+  auto address = *Network::Utility::resolveUrl("tcp://10.0.0.1:1234");
+  envoy::config::endpoint::v3::Endpoint::OrcaReportingConfig orca_config;
+  auto* addr = orca_config.mutable_address()->mutable_socket_address();
+  addr->set_address("127.0.0.1");
+  addr->set_port_value(8080);
+  orca_config.set_port_value(9091);
+  auto host = makeHostWithOrca(cluster.info_, address, orca_config);
+  EXPECT_EQ(host->orcaReportingAddress()->asString(), "127.0.0.1:9091");
+}
+
+TEST_F(HostImplTest, OrcaReportingHostnameDrivesAuthorityAndSni) {
+  MockClusterMockPrioritySet cluster;
+  auto address = *Network::Utility::resolveUrl("tcp://10.0.0.1:1234");
+  envoy::config::endpoint::v3::Endpoint::OrcaReportingConfig orca_config;
+  orca_config.set_hostname("orca.backend.local");
+  auto host = makeHostWithOrca(cluster.info_, address, orca_config);
+  EXPECT_EQ(host->orcaReportingAuthority(), "orca.backend.local");
+  ASSERT_NE(host->orcaReportingTransportSocketOptions(), nullptr);
+  EXPECT_EQ(host->orcaReportingTransportSocketOptions()->serverNameOverride(),
+            "orca.backend.local");
+}
+
+// When disable_oob_load_report is set, no TLS options object is materialized even if a
+// hostname override was supplied.
+TEST_F(HostImplTest, OrcaReportingDisableSuppressesTransportSocketOptions) {
+  MockClusterMockPrioritySet cluster;
+  auto address = *Network::Utility::resolveUrl("tcp://10.0.0.1:1234");
+  envoy::config::endpoint::v3::Endpoint::OrcaReportingConfig orca_config;
+  orca_config.set_hostname("orca.backend.local");
+  orca_config.set_disable_oob_load_report(true);
+  auto host = makeHostWithOrca(cluster.info_, address, orca_config);
+  EXPECT_TRUE(host->disableOrcaReporting());
+  EXPECT_EQ(host->orcaReportingTransportSocketOptions(), nullptr);
 }
 
 TEST_F(HostImplTest, CreateOrcaReportingConnectionDialsDataAddress) {
@@ -1996,9 +2060,8 @@ TEST_F(HostImplTest, CreateOrcaReportingConnectionDialsDataAddress) {
   EXPECT_CALL(*connection, setBufferLimits(0));
   EXPECT_CALL(*connection, connectionInfoSetter()).Times(testing::AnyNumber());
   EXPECT_CALL(*connection, streamInfo()).Times(testing::AnyNumber());
-  Host::CreateConnectionData data =
-      host->createOrcaReportingConnection(dispatcher, /*transport_socket_options=*/nullptr,
-                                          /*metadata=*/nullptr);
+  Host::CreateConnectionData data = host->createOrcaReportingConnection(
+      dispatcher, /*transport_socket_options=*/nullptr, /*metadata=*/nullptr);
   EXPECT_EQ(data.host_description_.get(), host.get());
 }
 

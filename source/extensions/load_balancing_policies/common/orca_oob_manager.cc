@@ -8,6 +8,7 @@
 #include "source/common/http/codec_client.h"
 #include "source/common/http/headers.h"
 #include "source/common/http/utility.h"
+#include "source/common/network/transport_socket_options_impl.h"
 #include "source/common/protobuf/protobuf.h"
 
 #include "xds/service/orca/v3/orca.pb.h"
@@ -72,6 +73,9 @@ OrcaOobStats OrcaOobManager::generateOrcaOobStats(Stats::Scope& scope) {
 void OrcaOobManager::onHostsAdded(const Upstream::HostVector& hosts) {
   const size_t prior_size = oob_sessions_.size();
   for (const Upstream::HostSharedPtr& host : hosts) {
+    if (host->disableOrcaReporting()) {
+      continue;
+    }
     auto [it, inserted] = oob_sessions_.try_emplace(host, nullptr);
     if (!inserted) {
       continue;
@@ -226,8 +230,19 @@ void OrcaOobManager::OobSession::connectAndStream() {
   ASSERT(codec_client_ == nullptr);
   resetState();
 
+  // Synthesize SNI transport socket options from the effective authority so that TLS cert SAN
+  // validation succeeds on the ORCA stream. Skip non-IP hosts (UDS/Pipe): their :authority
+  // falls back to cluster().name(), which is an internal ID and not a valid TLS SNI.
+  const std::string authority = computeAuthority();
+  Network::TransportSocketOptionsConstSharedPtr transport_socket_options =
+      host_->orcaReportingTransportSocketOptions();
+  const auto& host_addr = host_->address();
+  if (transport_socket_options == nullptr && !authority.empty() && host_addr != nullptr &&
+      host_addr->ip() != nullptr && authority != host_addr->asString()) {
+    transport_socket_options = std::make_shared<Network::TransportSocketOptionsImpl>(authority);
+  }
   Upstream::Host::CreateConnectionData connection_data = host_->createOrcaReportingConnection(
-      parent_.dispatcher_, /*transport_socket_options=*/nullptr, /*metadata=*/nullptr);
+      parent_.dispatcher_, transport_socket_options, /*metadata=*/nullptr);
   codec_client_ = parent_.createCodecClient(connection_data);
   if (codec_client_ == nullptr) {
     parent_.oob_stats_.stream_failures_.inc();
@@ -242,7 +257,7 @@ void OrcaOobManager::OobSession::connectAndStream() {
   request_encoder_->getStream().addCallbacks(*this);
 
   auto headers_message =
-      Grpc::Common::prepareHeaders(authority(), std::string(kOrcaOobServiceFullName),
+      Grpc::Common::prepareHeaders(authority, std::string(kOrcaOobServiceFullName),
                                    std::string(kStreamCoreMetricsMethod), absl::nullopt);
   headers_message->headers().setReferenceScheme(
       host_->transportSocketFactory().implementsSecureTransport()
@@ -345,16 +360,19 @@ void OrcaOobManager::OobSession::resetState() {
   received_no_error_goaway_ = false;
 }
 
-std::string OrcaOobManager::OobSession::authority() const {
+std::string OrcaOobManager::OobSession::computeAuthority() const {
+  const std::string& orca_auth = host_->orcaReportingAuthority();
+  if (!orca_auth.empty()) {
+    return orca_auth;
+  }
   if (!host_->hostname().empty()) {
     return std::string(host_->hostname());
   }
-  // For IP addresses, use the full address string which includes brackets for IPv6 and the port.
-  if (host_->address()->ip() != nullptr) {
-    return host_->address()->asString();
+  const auto& addr = host_->address();
+  if (addr != nullptr && addr->ip() != nullptr) {
+    return addr->asString();
   }
-  // Terminal fallback for non-IP addresses (e.g., UDS, Pipe) avoids using a
-  // socket path as :authority.
+  // UDS/Pipe addresses can't be :authority values; use the cluster name as a last resort.
   return host_->cluster().name();
 }
 

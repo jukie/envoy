@@ -41,6 +41,21 @@ LogicalHost::LogicalHost(
       address_list_or_null_(makeAddressListOrNull(address, address_list)) {
   health_check_address_ =
       resolveHealthCheckAddress(lb_endpoint.endpoint().health_check_config(), address);
+  const auto& orca_cfg = lb_endpoint.endpoint().orca_reporting_config();
+  orca_full_address_override_ =
+      orca_cfg.has_address() ? resolveOrcaReportingAddress(orca_cfg, address) : nullptr;
+  orca_port_override_ = orca_cfg.port_value();
+  orca_reporting_authority_ = orca_cfg.hostname();
+  orca_reporting_transport_socket_options_ = makeOrcaReportingTransportSocketOptions(orca_cfg);
+  disable_orca_reporting_ = orca_cfg.disable_oob_load_report();
+  orca_port_address_ = computeOrcaPortAddress(address);
+}
+
+Network::Address::InstanceConstSharedPtr
+LogicalHost::computeOrcaPortAddress(const Network::Address::InstanceConstSharedPtr& address) const {
+  return (orca_port_override_ != 0 && address->ip())
+             ? Network::Utility::getAddressWithPort(*address, orca_port_override_)
+             : Network::Address::InstanceConstSharedPtr{};
 }
 
 Network::Address::InstanceConstSharedPtr LogicalHost::healthCheckAddress() const {
@@ -54,6 +69,7 @@ void LogicalHost::setNewAddresses(const Network::Address::InstanceConstSharedPtr
   const auto& health_check_config = lb_endpoint.endpoint().health_check_config();
   // TODO(jmarantz): change setNewAddresses interface to specify the address_list as a shared_ptr.
   auto health_check_address = resolveHealthCheckAddress(health_check_config, address);
+  auto orca_port_address = computeOrcaPortAddress(address);
   SharedConstAddressVector shared_address_list;
   if (!address_list.empty()) {
     shared_address_list = std::make_shared<AddressVector>(address_list);
@@ -64,6 +80,7 @@ void LogicalHost::setNewAddresses(const Network::Address::InstanceConstSharedPtr
     address_ = address;
     address_list_or_null_ = std::move(shared_address_list);
     health_check_address_ = std::move(health_check_address);
+    orca_port_address_ = std::move(orca_port_address);
   }
 }
 
@@ -79,8 +96,23 @@ Network::Address::InstanceConstSharedPtr LogicalHost::address() const {
 
 Network::Address::InstanceConstSharedPtr LogicalHost::orcaReportingAddress() const {
   absl::MutexLock lock(address_lock_);
+  if (orca_full_address_override_) {
+    return orca_full_address_override_;
+  }
+  if (orca_port_override_ != 0) {
+    return orca_port_address_;
+  }
   return address_;
 }
+
+const std::string& LogicalHost::orcaReportingAuthority() const { return orca_reporting_authority_; }
+
+Network::TransportSocketOptionsConstSharedPtr
+LogicalHost::orcaReportingTransportSocketOptions() const {
+  return orca_reporting_transport_socket_options_;
+}
+
+bool LogicalHost::disableOrcaReporting() const { return disable_orca_reporting_; }
 
 Upstream::Host::CreateConnectionData LogicalHost::createConnection(
     Event::Dispatcher& dispatcher, const Network::ConnectionSocket::OptionsSharedPtr& options,

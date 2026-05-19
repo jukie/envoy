@@ -50,6 +50,7 @@
 #include "source/common/network/resolver_impl.h"
 #include "source/common/network/socket_option_factory.h"
 #include "source/common/network/socket_option_impl.h"
+#include "source/common/network/transport_socket_options_impl.h"
 #include "source/common/protobuf/protobuf.h"
 #include "source/common/protobuf/utility.h"
 #include "source/common/router/config_impl.h"
@@ -474,11 +475,12 @@ absl::StatusOr<std::unique_ptr<HostDescriptionImpl>> HostDescriptionImpl::create
     MetadataConstSharedPtr locality_metadata,
     std::shared_ptr<const envoy::config::core::v3::Locality> locality,
     const envoy::config::endpoint::v3::Endpoint::HealthCheckConfig& health_check_config,
-    uint32_t priority, const AddressVector& address_list) {
+    uint32_t priority, const AddressVector& address_list,
+    const envoy::config::endpoint::v3::Endpoint::OrcaReportingConfig& orca_reporting_config) {
   absl::Status creation_status = absl::OkStatus();
   auto ret = std::unique_ptr<HostDescriptionImpl>(new HostDescriptionImpl(
       creation_status, cluster, hostname, dest_address, endpoint_metadata, locality_metadata,
-      locality, health_check_config, priority, address_list));
+      locality, health_check_config, priority, address_list, orca_reporting_config));
   RETURN_IF_NOT_OK(creation_status);
   return ret;
 }
@@ -489,12 +491,18 @@ HostDescriptionImpl::HostDescriptionImpl(
     MetadataConstSharedPtr locality_metadata,
     std::shared_ptr<const envoy::config::core::v3::Locality> locality,
     const envoy::config::endpoint::v3::Endpoint::HealthCheckConfig& health_check_config,
-    uint32_t priority, const AddressVector& address_list)
+    uint32_t priority, const AddressVector& address_list,
+    const envoy::config::endpoint::v3::Endpoint::OrcaReportingConfig& orca_reporting_config)
     : HostDescriptionImplBase(cluster, hostname, dest_address, endpoint_metadata, locality_metadata,
                               locality, health_check_config, priority, creation_status),
       address_(dest_address),
       address_list_or_null_(makeAddressListOrNull(dest_address, address_list)),
-      health_check_address_(resolveHealthCheckAddress(health_check_config, dest_address)) {}
+      health_check_address_(resolveHealthCheckAddress(health_check_config, dest_address)),
+      orca_reporting_address_(resolveOrcaReportingAddress(orca_reporting_config, dest_address)),
+      orca_reporting_authority_(orca_reporting_config.hostname()),
+      orca_reporting_transport_socket_options_(
+          makeOrcaReportingTransportSocketOptions(orca_reporting_config)),
+      disable_orca_reporting_(orca_reporting_config.disable_oob_load_report()) {}
 
 HostDescriptionImplBase::HostDescriptionImplBase(
     ClusterInfoConstSharedPtr cluster, const std::string& hostname,
@@ -737,11 +745,13 @@ absl::StatusOr<std::unique_ptr<HostImpl>> HostImpl::create(
     std::shared_ptr<const envoy::config::core::v3::Locality> locality,
     const envoy::config::endpoint::v3::Endpoint::HealthCheckConfig& health_check_config,
     uint32_t priority, const envoy::config::core::v3::HealthStatus health_status,
-    const AddressVector& address_list) {
+    const AddressVector& address_list,
+    const envoy::config::endpoint::v3::Endpoint::OrcaReportingConfig& orca_reporting_config) {
   absl::Status creation_status = absl::OkStatus();
-  auto ret = std::unique_ptr<HostImpl>(new HostImpl(
-      creation_status, cluster, hostname, address, endpoint_metadata, locality_metadata,
-      initial_weight, locality, health_check_config, priority, health_status, address_list));
+  auto ret = std::unique_ptr<HostImpl>(
+      new HostImpl(creation_status, cluster, hostname, address, endpoint_metadata,
+                   locality_metadata, initial_weight, locality, health_check_config, priority,
+                   health_status, address_list, orca_reporting_config));
   RETURN_IF_NOT_OK(creation_status);
   return ret;
 }
@@ -2220,7 +2230,8 @@ void PriorityStateManager::registerHostForPriority(
           lb_endpoint.load_balancing_weight().value(),
           parent_.constLocalitySharedPool()->getObject(locality_lb_endpoint.locality()),
           lb_endpoint.endpoint().health_check_config(), locality_lb_endpoint.priority(),
-          lb_endpoint.health_status(), address_list),
+          lb_endpoint.health_status(), address_list,
+          lb_endpoint.endpoint().orca_reporting_config()),
       std::unique_ptr<HostImpl>));
   registerHostForPriority(host, locality_lb_endpoint);
 }
@@ -2599,6 +2610,33 @@ void reportUpstreamCxDestroyActiveRequest(const Upstream::HostDescriptionConstSh
   } else {
     stats.upstream_cx_destroy_local_with_active_rq_.inc();
   }
+}
+
+Network::TransportSocketOptionsConstSharedPtr makeOrcaReportingTransportSocketOptions(
+    const envoy::config::endpoint::v3::Endpoint::OrcaReportingConfig& orca_reporting_config) {
+  if (orca_reporting_config.hostname().empty() || orca_reporting_config.disable_oob_load_report()) {
+    return nullptr;
+  }
+  return std::make_shared<Network::TransportSocketOptionsImpl>(orca_reporting_config.hostname());
+}
+
+Network::Address::InstanceConstSharedPtr resolveOrcaReportingAddress(
+    const envoy::config::endpoint::v3::Endpoint::OrcaReportingConfig& orca_reporting_config,
+    Network::Address::InstanceConstSharedPtr host_address) {
+  Network::Address::InstanceConstSharedPtr orca_address;
+  const uint32_t port_value = orca_reporting_config.port_value();
+  if (orca_reporting_config.has_address()) {
+    auto address_or_error = Network::Address::resolveProtoAddress(orca_reporting_config.address());
+    THROW_IF_NOT_OK_REF(address_or_error.status());
+    auto address = address_or_error.value();
+    orca_address =
+        port_value == 0 ? address : Network::Utility::getAddressWithPort(*address, port_value);
+  } else {
+    orca_address = (port_value == 0 || !host_address->ip())
+                       ? host_address
+                       : Network::Utility::getAddressWithPort(*host_address, port_value);
+  }
+  return orca_address;
 }
 
 Network::Address::InstanceConstSharedPtr resolveHealthCheckAddress(

@@ -39,7 +39,7 @@ public:
   std::chrono::milliseconds weight_expiration_period;
   std::chrono::milliseconds weight_update_period;
 
-  bool enable_oob_load_report;
+  bool enable_oob_load_report{false};
   std::chrono::milliseconds oob_reporting_period;
 
   // Round robin proto overrides that we want to propagate to the worker RR LB (e.g., slow start).

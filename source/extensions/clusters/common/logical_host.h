@@ -4,6 +4,7 @@
 #include "envoy/config/core/v3/base.pb.h"
 #include "envoy/config/endpoint/v3/endpoint_components.pb.h"
 
+#include "source/common/common/empty_string.h"
 #include "source/common/upstream/upstream_impl.h"
 
 namespace Envoy {
@@ -56,6 +57,10 @@ public:
   Network::Address::InstanceConstSharedPtr address() const override;
   Network::Address::InstanceConstSharedPtr healthCheckAddress() const override;
   Network::Address::InstanceConstSharedPtr orcaReportingAddress() const override;
+  const std::string& orcaReportingAuthority() const override;
+  Network::TransportSocketOptionsConstSharedPtr
+  orcaReportingTransportSocketOptions() const override;
+  bool disableOrcaReporting() const override;
 
 protected:
   LogicalHost(
@@ -67,12 +72,22 @@ protected:
       absl::Status& creation_status);
 
 private:
+  Network::Address::InstanceConstSharedPtr
+  computeOrcaPortAddress(const Network::Address::InstanceConstSharedPtr& address) const;
+
   const Network::TransportSocketOptionsConstSharedPtr override_transport_socket_options_;
+
+  Network::Address::InstanceConstSharedPtr orca_full_address_override_;
+  uint32_t orca_port_override_{0};
+  std::string orca_reporting_authority_;
+  Network::TransportSocketOptionsConstSharedPtr orca_reporting_transport_socket_options_;
+  bool disable_orca_reporting_{false};
 
   // The first entry in the address_list_ should match the value in address_.
   Network::Address::InstanceConstSharedPtr address_ ABSL_GUARDED_BY(address_lock_);
   SharedConstAddressVector address_list_or_null_ ABSL_GUARDED_BY(address_lock_);
   Network::Address::InstanceConstSharedPtr health_check_address_ ABSL_GUARDED_BY(address_lock_);
+  Network::Address::InstanceConstSharedPtr orca_port_address_ ABSL_GUARDED_BY(address_lock_);
   mutable absl::Mutex address_lock_;
 };
 
@@ -130,6 +145,15 @@ public:
     // Should never be called since real hosts are used only for forwarding.
     return nullptr;
   }
+  // Should never be called since real hosts are used only for forwarding.
+  const std::string& orcaReportingAuthority() const override { return EMPTY_STRING; }
+  // Should never be called since real hosts are used only for forwarding.
+  Network::TransportSocketOptionsConstSharedPtr
+  orcaReportingTransportSocketOptions() const override {
+    return nullptr;
+  }
+  // Should never be called since real hosts are used only for forwarding.
+  bool disableOrcaReporting() const override { return false; }
   absl::optional<MonotonicTime> lastHcPassTime() const override {
     return logical_host_->lastHcPassTime();
   }

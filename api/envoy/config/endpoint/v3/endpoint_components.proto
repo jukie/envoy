@@ -65,6 +65,46 @@ message Endpoint {
     core.v3.Address address = 1;
   }
 
+  // Per-endpoint overrides for ORCA out-of-band load reporting.
+  // Takes effect only for clusters whose LB policy enables OOB reporting (e.g.,
+  // :ref:`client_side_weighted_round_robin.enable_oob_load_report
+  // <envoy_v3_api_field_extensions.load_balancing_policies.client_side_weighted_round_robin.v3.ClientSideWeightedRoundRobin.enable_oob_load_report>`).
+  message OrcaReportingConfig {
+    // Alternate port for the ORCA out-of-band stream dial. Default is the
+    // host's serving port. When ``address`` is also set, this port overlays
+    // the address's port (matching the behavior of
+    // :ref:`HealthCheckConfig.port_value
+    // <envoy_v3_api_field_config.endpoint.v3.Endpoint.HealthCheckConfig.port_value>`).
+    uint32 port_value = 1 [(validate.rules).uint32 = {lte: 65535}];
+
+    // Alternate ``:authority`` header and TLS SNI for the ORCA stream.
+    // When unset, the effective authority falls back to the host's DNS name
+    // (for STRICT_DNS / LOGICAL_DNS clusters), then to the host address
+    // string, then to the cluster name. The upstream's TLS certificate
+    // SANs must validate against the effective authority when TLS is in use.
+    string hostname = 2;
+
+    // When true, no ORCA out-of-band stream is opened for this endpoint.
+    // Other fields in this message are ignored.
+    bool disable_oob_load_report = 3;
+
+    // Alternate dial target for the ORCA stream. Expected to be a direct
+    // IP address (same form rule as
+    // :ref:`HealthCheckConfig.address
+    // <envoy_v3_api_field_config.endpoint.v3.Endpoint.HealthCheckConfig.address>`).
+    // When ``port_value`` is also set, it overlays the port of this address.
+    // Intended for split-network deployments where the ORCA collector
+    // lives behind a side-car or on a separate management network.
+    //
+    // .. attention::
+    //
+    //   This field allows the EDS control plane to redirect the ORCA
+    //   stream to an arbitrary destination. If EDS is treated as less
+    //   trusted than CDS in your deployment, restrict who can populate
+    //   this field accordingly.
+    core.v3.Address address = 4;
+  }
+
   // The upstream host address.
   //
   // .. attention::
@@ -84,6 +124,12 @@ message Endpoint {
   //   This takes into effect only for upstream clusters with
   //   :ref:`active health checking <arch_overview_health_checking>` enabled.
   HealthCheckConfig health_check_config = 2;
+
+  // Per-endpoint ORCA out-of-band reporting overrides. Has no effect unless
+  // the cluster's LB policy enables OOB reporting (e.g.,
+  // :ref:`client_side_weighted_round_robin.enable_oob_load_report
+  // <envoy_v3_api_field_extensions.load_balancing_policies.client_side_weighted_round_robin.v3.ClientSideWeightedRoundRobin.enable_oob_load_report>`).
+  OrcaReportingConfig orca_reporting_config = 5;
 
   // The hostname associated with this endpoint. This hostname is not used for routing or address
   // resolution. If provided, it will be associated with the endpoint, and can be used for features

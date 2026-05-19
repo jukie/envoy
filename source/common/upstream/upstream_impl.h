@@ -311,13 +311,14 @@ private:
  */
 class HostDescriptionImpl : public HostDescriptionImplBase {
 public:
-  static absl::StatusOr<std::unique_ptr<HostDescriptionImpl>>
-  create(ClusterInfoConstSharedPtr cluster, const std::string& hostname,
-         Network::Address::InstanceConstSharedPtr dest_address,
-         MetadataConstSharedPtr endpoint_metadata, MetadataConstSharedPtr locality_metadata,
-         std::shared_ptr<const envoy::config::core::v3::Locality> locality,
-         const envoy::config::endpoint::v3::Endpoint::HealthCheckConfig& health_check_config,
-         uint32_t priority, const AddressVector& address_list = {});
+  static absl::StatusOr<std::unique_ptr<HostDescriptionImpl>> create(
+      ClusterInfoConstSharedPtr cluster, const std::string& hostname,
+      Network::Address::InstanceConstSharedPtr dest_address,
+      MetadataConstSharedPtr endpoint_metadata, MetadataConstSharedPtr locality_metadata,
+      std::shared_ptr<const envoy::config::core::v3::Locality> locality,
+      const envoy::config::endpoint::v3::Endpoint::HealthCheckConfig& health_check_config,
+      uint32_t priority, const AddressVector& address_list = {},
+      const envoy::config::endpoint::v3::Endpoint::OrcaReportingConfig& orca_reporting_config = {});
 
   // HostDescription
   Network::Address::InstanceConstSharedPtr address() const override { return address_; }
@@ -325,8 +326,14 @@ public:
     return health_check_address_;
   }
   Network::Address::InstanceConstSharedPtr orcaReportingAddress() const override {
-    return address_;
+    return orca_reporting_address_;
   }
+  const std::string& orcaReportingAuthority() const override { return orca_reporting_authority_; }
+  Network::TransportSocketOptionsConstSharedPtr
+  orcaReportingTransportSocketOptions() const override {
+    return orca_reporting_transport_socket_options_;
+  }
+  bool disableOrcaReporting() const override { return disable_orca_reporting_; }
   SharedConstAddressVector addressListOrNull() const override { return address_list_or_null_; }
 
 protected:
@@ -336,7 +343,8 @@ protected:
       MetadataConstSharedPtr endpoint_metadata, MetadataConstSharedPtr locality_metadata,
       std::shared_ptr<const envoy::config::core::v3::Locality> locality,
       const envoy::config::endpoint::v3::Endpoint::HealthCheckConfig& health_check_config,
-      uint32_t priority, const AddressVector& address_list = {});
+      uint32_t priority, const AddressVector& address_list = {},
+      const envoy::config::endpoint::v3::Endpoint::OrcaReportingConfig& orca_reporting_config = {});
 
 private:
   // No locks are required in this implementation: all address-related member
@@ -346,6 +354,12 @@ private:
   const Network::Address::InstanceConstSharedPtr address_;
   const SharedConstAddressVector address_list_or_null_;
   const Network::Address::InstanceConstSharedPtr health_check_address_;
+  const Network::Address::InstanceConstSharedPtr orca_reporting_address_;
+  const std::string orca_reporting_authority_;
+  // Non-null when orca_reporting_authority_ is set; carries the SNI for TLS validation
+  // of the ORCA stream.
+  const Network::TransportSocketOptionsConstSharedPtr orca_reporting_transport_socket_options_;
+  const bool disable_orca_reporting_;
 };
 
 /**
@@ -514,28 +528,30 @@ private:
 
 class HostImpl : public HostImplBase, public HostDescriptionImpl {
 public:
-  static absl::StatusOr<std::unique_ptr<HostImpl>>
-  create(ClusterInfoConstSharedPtr cluster, const std::string& hostname,
-         Network::Address::InstanceConstSharedPtr address, MetadataConstSharedPtr endpoint_metadata,
-         MetadataConstSharedPtr locality_metadata, uint32_t initial_weight,
-         std::shared_ptr<const envoy::config::core::v3::Locality> locality,
-         const envoy::config::endpoint::v3::Endpoint::HealthCheckConfig& health_check_config,
-         uint32_t priority, const envoy::config::core::v3::HealthStatus health_status,
-         const AddressVector& address_list = {});
+  static absl::StatusOr<std::unique_ptr<HostImpl>> create(
+      ClusterInfoConstSharedPtr cluster, const std::string& hostname,
+      Network::Address::InstanceConstSharedPtr address, MetadataConstSharedPtr endpoint_metadata,
+      MetadataConstSharedPtr locality_metadata, uint32_t initial_weight,
+      std::shared_ptr<const envoy::config::core::v3::Locality> locality,
+      const envoy::config::endpoint::v3::Endpoint::HealthCheckConfig& health_check_config,
+      uint32_t priority, const envoy::config::core::v3::HealthStatus health_status,
+      const AddressVector& address_list = {},
+      const envoy::config::endpoint::v3::Endpoint::OrcaReportingConfig& orca_reporting_config = {});
 
 protected:
-  HostImpl(absl::Status& creation_status, ClusterInfoConstSharedPtr cluster,
-           const std::string& hostname, Network::Address::InstanceConstSharedPtr address,
-           MetadataConstSharedPtr endpoint_metadata, MetadataConstSharedPtr locality_metadata,
-           uint32_t initial_weight,
-           std::shared_ptr<const envoy::config::core::v3::Locality> locality,
-           const envoy::config::endpoint::v3::Endpoint::HealthCheckConfig& health_check_config,
-           uint32_t priority, const envoy::config::core::v3::HealthStatus health_status,
-           const AddressVector& address_list = {})
+  HostImpl(
+      absl::Status& creation_status, ClusterInfoConstSharedPtr cluster, const std::string& hostname,
+      Network::Address::InstanceConstSharedPtr address, MetadataConstSharedPtr endpoint_metadata,
+      MetadataConstSharedPtr locality_metadata, uint32_t initial_weight,
+      std::shared_ptr<const envoy::config::core::v3::Locality> locality,
+      const envoy::config::endpoint::v3::Endpoint::HealthCheckConfig& health_check_config,
+      uint32_t priority, const envoy::config::core::v3::HealthStatus health_status,
+      const AddressVector& address_list = {},
+      const envoy::config::endpoint::v3::Endpoint::OrcaReportingConfig& orca_reporting_config = {})
       : HostImplBase(initial_weight, health_check_config, health_status),
         HostDescriptionImpl(creation_status, cluster, hostname, address, endpoint_metadata,
                             locality_metadata, locality, health_check_config, priority,
-                            address_list) {}
+                            address_list, orca_reporting_config) {}
 };
 
 class HostsPerLocalityImpl : public HostsPerLocality {
@@ -1391,6 +1407,13 @@ void reportUpstreamCxDestroyActiveRequest(const Upstream::HostDescriptionConstSh
 Network::Address::InstanceConstSharedPtr resolveHealthCheckAddress(
     const envoy::config::endpoint::v3::Endpoint::HealthCheckConfig& health_check_config,
     Network::Address::InstanceConstSharedPtr host_address);
+
+Network::Address::InstanceConstSharedPtr resolveOrcaReportingAddress(
+    const envoy::config::endpoint::v3::Endpoint::OrcaReportingConfig& orca_reporting_config,
+    Network::Address::InstanceConstSharedPtr host_address);
+
+Network::TransportSocketOptionsConstSharedPtr makeOrcaReportingTransportSocketOptions(
+    const envoy::config::endpoint::v3::Endpoint::OrcaReportingConfig& orca_reporting_config);
 
 } // namespace Upstream
 } // namespace Envoy

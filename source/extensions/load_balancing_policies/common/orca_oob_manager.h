@@ -125,7 +125,7 @@ private:
     void onRpcComplete(Grpc::Status::GrpcStatus status, absl::string_view message, bool end_stream);
     void onReport(const xds::data::orca::v3::OrcaLoadReport& report);
     void resetState();
-    std::string authority() const;
+    std::string computeAuthority() const;
 
     OrcaOobManager& parent_;
     const Upstream::HostConstSharedPtr host_;
