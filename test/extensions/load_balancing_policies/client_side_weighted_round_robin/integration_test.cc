@@ -320,6 +320,77 @@ TEST_P(ClientSideWeightedRoundRobinOobIntegrationTest, OobReportsApplyWeights) {
   test_server_->waitForGauge("cluster.cluster_0.lb_orca_oob.active_sessions", Eq(2));
 }
 
+// Verifies that an endpoint with disable_oob_load_report=true in its
+// Endpoint.OrcaReportingConfig is skipped by OrcaOobManager: only one OOB stream
+// is opened for the enabled host; the disabled host never receives a stream.
+TEST_P(ClientSideWeightedRoundRobinOobIntegrationTest, PerEndpointDisableSkipsSession) {
+  config_helper_.addConfigModifier([](envoy::config::bootstrap::v3::Bootstrap& bootstrap) {
+    auto* cluster_0 = bootstrap.mutable_static_resources()->mutable_clusters()->Mutable(0);
+    ASSERT(cluster_0->name() == "cluster_0");
+    auto* endpoint_group =
+        cluster_0->mutable_load_assignment()->mutable_endpoints()->Mutable(0);
+
+    const std::string local_address = Network::Test::getLoopbackAddressString(GetParam());
+    const std::string endpoints_yaml = fmt::format(R"EOF(
+        lb_endpoints:
+        - endpoint:
+            address:
+              socket_address:
+                address: {}
+                port_value: 0
+        - endpoint:
+            address:
+              socket_address:
+                address: {}
+                port_value: 0
+            orca_reporting_config:
+              disable_oob_load_report: true
+        )EOF",
+                                                   local_address, local_address);
+    TestUtility::loadFromYaml(endpoints_yaml, *endpoint_group);
+
+    // Use the new orca_reporting field instead of legacy enable_oob_load_report.
+    auto* policy = cluster_0->mutable_load_balancing_policy();
+    const std::string policy_yaml = R"EOF(
+        policies:
+        - typed_extension_config:
+            name: envoy.load_balancing_policies.client_side_weighted_round_robin
+            typed_config:
+                "@type": type.googleapis.com/envoy.extensions.load_balancing_policies.client_side_weighted_round_robin.v3.ClientSideWeightedRoundRobin
+                orca_reporting:
+                  oob_reporting_period:
+                    seconds: 1
+                blackout_period:
+                  seconds: 1
+                weight_expiration_period:
+                  seconds: 180
+                weight_update_period:
+                  seconds: 1
+        )EOF";
+    TestUtility::loadFromYaml(policy_yaml, *policy);
+  });
+  HttpIntegrationTest::initialize();
+
+  // Only the first (enabled) upstream should receive an OOB stream.
+  FakeHttpConnectionPtr conn;
+  ASSERT_TRUE(fake_upstreams_[0]->waitForHttpConnection(*dispatcher_, conn));
+  FakeStreamPtr stream;
+  ASSERT_TRUE(conn->waitForNewStream(*dispatcher_, stream));
+  ASSERT_TRUE(stream->waitForEndStream(*dispatcher_));
+  Http::TestResponseHeaderMapImpl resp_headers{{":status", "200"},
+                                               {"content-type", "application/grpc"}};
+  stream->encodeHeaders(resp_headers, false);
+  xds::data::orca::v3::OrcaLoadReport report;
+  report.set_rps_fractional(100.0);
+  auto frame = Grpc::Common::serializeToGrpcFrame(report);
+  stream->encodeData(*frame, false);
+  stream_holder_.push_back(std::move(stream));
+  conn_holder_.push_back(std::move(conn));
+
+  // Only one active session: the second endpoint is disabled.
+  test_server_->waitForGauge("cluster.cluster_0.lb_orca_oob.active_sessions", Eq(1));
+}
+
 // Tests to verify the behavior of load balancing policy when cluster is added,
 // removed, and added again.
 class ClientSideWeightedRoundRobinXdsIntegrationTest

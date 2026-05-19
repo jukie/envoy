@@ -39,8 +39,13 @@ public:
   std::chrono::milliseconds weight_expiration_period;
   std::chrono::milliseconds weight_update_period;
 
-  bool enable_oob_load_report;
+  // OOB reporting resolved from orca_reporting (preferred) or legacy enable_oob_load_report
+  // / oob_reporting_period fields.
+  bool oob_enabled{false};
   std::chrono::milliseconds oob_reporting_period;
+  uint32_t cluster_port_override{0}; // 0 = unset; cluster-default alt port for ORCA streams
+  std::string cluster_authority;     // "" = unset; applied as :authority fallback
+  Protobuf::Struct cluster_transport_socket_match_criteria; // empty = unset
 
   // Round robin proto overrides that we want to propagate to the worker RR LB (e.g., slow start).
   RoundRobinConfig round_robin_overrides_;

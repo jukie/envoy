@@ -3,6 +3,8 @@
 #include <memory>
 #include <string>
 
+#include "source/common/config/well_known_names.h"
+
 #include "envoy/common/exception.h"
 
 #include "source/common/protobuf/utility.h"
@@ -43,9 +45,26 @@ ClientSideWeightedRoundRobinLbConfig::ClientSideWeightedRoundRobinLbConfig(
   weight_update_period =
       std::chrono::milliseconds(PROTOBUF_GET_MS_OR_DEFAULT(lb_proto, weight_update_period, 1000));
 
-  enable_oob_load_report = lb_proto.enable_oob_load_report().value();
-  oob_reporting_period =
-      std::chrono::milliseconds(PROTOBUF_GET_MS_OR_DEFAULT(lb_proto, oob_reporting_period, 10000));
+  if (lb_proto.has_orca_reporting()) {
+    const auto& orca = lb_proto.orca_reporting();
+    oob_enabled = true;
+    oob_reporting_period = orca.has_oob_reporting_period()
+        ? std::chrono::milliseconds(
+              DurationUtil::durationToMilliseconds(orca.oob_reporting_period()))
+        : std::chrono::milliseconds(10000);
+    cluster_port_override = orca.has_port_value() ? orca.port_value().value() : 0;
+    cluster_authority = orca.authority();
+    cluster_transport_socket_match_criteria = orca.transport_socket_match_criteria();
+  } else if (lb_proto.has_enable_oob_load_report() || lb_proto.has_oob_reporting_period()) {
+    oob_enabled = lb_proto.enable_oob_load_report().value();
+    oob_reporting_period = std::chrono::milliseconds(
+        PROTOBUF_GET_MS_OR_DEFAULT(lb_proto, oob_reporting_period, 10000));
+    ENVOY_LOG_MISC(warn, "client_side_weighted_round_robin: enable_oob_load_report and "
+                         "oob_reporting_period are deprecated; use the orca_reporting field");
+  } else {
+    oob_enabled = false;
+    oob_reporting_period = std::chrono::milliseconds(10000);
+  }
 
   if (lb_proto.has_slow_start_config()) {
     *round_robin_overrides_.mutable_slow_start_config() = lb_proto.slow_start_config();
@@ -123,12 +142,25 @@ ClientSideWeightedRoundRobinLoadBalancer::ClientSideWeightedRoundRobinLoadBalanc
   // Init order relies on PrioritySetImpl::updateHosts() firing priority callbacks
   // (OrcaWeightManager attaches OrcaHostLbPolicyData) before member callbacks (OrcaOobManager
   // opens the session), so the data is in place before the first OOB report.
-  if (typed_lb_config->enable_oob_load_report) {
+  if (typed_lb_config->oob_enabled) {
+    // Falls back to the cluster default transport socket when no match criteria are configured.
+    const Protobuf::Struct& criteria =
+        typed_lb_config->cluster_transport_socket_match_criteria;
+    envoy::config::core::v3::Metadata metadata;
+    const envoy::config::core::v3::Metadata* metadata_ptr = nullptr;
+    if (!criteria.fields().empty()) {
+      (*metadata.mutable_filter_metadata())
+          [Config::MetadataFilters::get().ENVOY_TRANSPORT_SOCKET_MATCH] = criteria;
+      metadata_ptr = &metadata;
+    }
+    Network::UpstreamTransportSocketFactory& orca_factory =
+        cluster_info.transportSocketMatcher().resolve(metadata_ptr, nullptr).factory_;
     orca_oob_manager_ =
         std::make_unique<Extensions::LoadBalancingPolicies::Common::ProdOrcaOobManager>(
-            typed_lb_config->oob_reporting_period, priority_set,
-            typed_lb_config->main_thread_dispatcher_, random, cluster_info.statsScope(),
-            orca_weight_manager_->reportHandler());
+            typed_lb_config->oob_reporting_period, typed_lb_config->cluster_port_override,
+            typed_lb_config->cluster_authority, orca_factory,
+            priority_set, typed_lb_config->main_thread_dispatcher_, random,
+            cluster_info.statsScope(), orca_weight_manager_->reportHandler());
   }
 }
 

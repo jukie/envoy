@@ -7,6 +7,7 @@ import "envoy/config/route/v3/route_components.proto";
 import "envoy/type/v3/percent.proto";
 
 import "google/protobuf/duration.proto";
+import "google/protobuf/struct.proto";
 import "google/protobuf/wrappers.proto";
 
 import "envoy/annotations/deprecation.proto";
@@ -158,4 +159,37 @@ message ConsistentHashingLbConfig {
   // :ref:`route level hash policy <envoy_v3_api_field_config.route.v3.RouteAction.hash_policy>`
   // will be ignored.
   repeated config.route.v3.RouteAction.HashPolicy hash_policy = 3;
+}
+
+// Configuration shared by LB policies that consume ORCA out-of-band
+// load reports (gRFC A51). Embed this message in a policy-specific
+// configuration to enable OOB reporting for that policy and to express
+// cluster-level overrides for the reporting stream.
+//
+// Per-endpoint overrides live on
+// :ref:`Endpoint.orca_reporting_config <envoy_v3_api_field_config.endpoint.v3.Endpoint.orca_reporting_config>`
+// and take precedence over the cluster-level values defined here.
+message OrcaReportingCommonConfig {
+  // Cadence at which upstream hosts are expected to push ORCA reports.
+  // Defaults to 10 seconds when unset. Minimum granularity is 1ms.
+  google.protobuf.Duration oob_reporting_period = 1
+      [(validate.rules).duration = {gte {nanos: 1000000}}];
+
+  // Cluster-default override for the destination port of the ORCA stream.
+  // If unset, each host uses its own serving port. Per-endpoint
+  // ``OrcaReportingConfig.port_value`` overrides this value.
+  google.protobuf.UInt32Value port_value = 2
+      [(validate.rules).uint32 = {lte: 65535}];
+
+  // Cluster-default :authority header for the ORCA gRPC request.
+  // If unset, each host's address string is used. Per-endpoint
+  // ``OrcaReportingConfig.hostname`` overrides this value.
+  string authority = 3;
+
+  // Optional transport-socket match. When set, resolved against the cluster's
+  // ``transport_socket_matches`` list to select a non-default transport
+  // for the ORCA stream. Mirrors
+  // :ref:`HealthCheck.transport_socket_match_criteria
+  // <envoy_v3_api_field_config.core.v3.HealthCheck.transport_socket_match_criteria>`.
+  google.protobuf.Struct transport_socket_match_criteria = 4;
 }

@@ -48,14 +48,20 @@ public:
       Network::TransportSocketOptionsConstSharedPtr transport_socket_options) const override;
   Upstream::Host::CreateConnectionData createOrcaReportingConnection(
       Event::Dispatcher& dispatcher,
+      Network::UpstreamTransportSocketFactory& transport_socket_factory,
       Network::TransportSocketOptionsConstSharedPtr transport_socket_options,
-      const envoy::config::core::v3::Metadata* metadata) const override;
+      const envoy::config::core::v3::Metadata* metadata,
+      Network::Address::InstanceConstSharedPtr dial_address_override = nullptr) const override;
 
   // Upstream::HostDescription
   SharedConstAddressVector addressListOrNull() const override;
   Network::Address::InstanceConstSharedPtr address() const override;
   Network::Address::InstanceConstSharedPtr healthCheckAddress() const override;
   Network::Address::InstanceConstSharedPtr orcaReportingAddress() const override;
+  absl::string_view orcaReportingAuthority() const override;
+  Network::TransportSocketOptionsConstSharedPtr
+  orcaReportingTransportSocketOptions() const override;
+  bool disableOrcaReporting() const override;
 
 protected:
   LogicalHost(
@@ -69,10 +75,20 @@ protected:
 private:
   const Network::TransportSocketOptionsConstSharedPtr override_transport_socket_options_;
 
+  // Immutable after construction; only address_ (and its derived orca_port_address_) vary.
+  Network::Address::InstanceConstSharedPtr orca_full_address_override_;
+  uint32_t orca_port_override_{0};
+  std::string orca_reporting_authority_;
+  // Non-null when orca_reporting_authority_ is set; carries SNI for TLS validation.
+  Network::TransportSocketOptionsConstSharedPtr orca_reporting_transport_socket_options_;
+  bool disable_orca_reporting_{false};
+
   // The first entry in the address_list_ should match the value in address_.
   Network::Address::InstanceConstSharedPtr address_ ABSL_GUARDED_BY(address_lock_);
   SharedConstAddressVector address_list_or_null_ ABSL_GUARDED_BY(address_lock_);
   Network::Address::InstanceConstSharedPtr health_check_address_ ABSL_GUARDED_BY(address_lock_);
+  // Pre-computed ORCA address with cluster port override applied; updated in setNewAddresses.
+  Network::Address::InstanceConstSharedPtr orca_port_address_ ABSL_GUARDED_BY(address_lock_);
   mutable absl::Mutex address_lock_;
 };
 
@@ -130,6 +146,12 @@ public:
     // Should never be called since real hosts are used only for forwarding.
     return nullptr;
   }
+  absl::string_view orcaReportingAuthority() const override { return {}; }
+  Network::TransportSocketOptionsConstSharedPtr
+  orcaReportingTransportSocketOptions() const override {
+    return nullptr;
+  }
+  bool disableOrcaReporting() const override { return false; }
   absl::optional<MonotonicTime> lastHcPassTime() const override {
     return logical_host_->lastHcPassTime();
   }

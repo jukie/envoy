@@ -1,5 +1,7 @@
 #include "source/extensions/clusters/common/logical_host.h"
 
+#include "source/common/network/transport_socket_options_impl.h"
+
 namespace Envoy {
 namespace Upstream {
 
@@ -41,6 +43,19 @@ LogicalHost::LogicalHost(
       address_list_or_null_(makeAddressListOrNull(address, address_list)) {
   health_check_address_ =
       resolveHealthCheckAddress(lb_endpoint.endpoint().health_check_config(), address);
+  const auto& orca_cfg = lb_endpoint.endpoint().orca_reporting_config();
+  orca_full_address_override_ =
+      orca_cfg.has_address() ? resolveOrcaReportingAddress(orca_cfg, address) : nullptr;
+  orca_port_override_ = orca_cfg.port_value();
+  orca_reporting_authority_ = orca_cfg.hostname();
+  if (!orca_reporting_authority_.empty() && !orca_cfg.disable_oob_load_report()) {
+    orca_reporting_transport_socket_options_ =
+        std::make_shared<Network::TransportSocketOptionsImpl>(orca_reporting_authority_);
+  }
+  disable_orca_reporting_ = orca_cfg.disable_oob_load_report();
+  if (orca_port_override_ != 0 && address->ip()) {
+    orca_port_address_ = Network::Utility::getAddressWithPort(*address, orca_port_override_);
+  }
 }
 
 Network::Address::InstanceConstSharedPtr LogicalHost::healthCheckAddress() const {
@@ -54,6 +69,9 @@ void LogicalHost::setNewAddresses(const Network::Address::InstanceConstSharedPtr
   const auto& health_check_config = lb_endpoint.endpoint().health_check_config();
   // TODO(jmarantz): change setNewAddresses interface to specify the address_list as a shared_ptr.
   auto health_check_address = resolveHealthCheckAddress(health_check_config, address);
+  auto orca_port_address = (orca_port_override_ != 0 && address->ip())
+      ? Network::Utility::getAddressWithPort(*address, orca_port_override_)
+      : Network::Address::InstanceConstSharedPtr{};
   SharedConstAddressVector shared_address_list;
   if (!address_list.empty()) {
     shared_address_list = std::make_shared<AddressVector>(address_list);
@@ -64,6 +82,7 @@ void LogicalHost::setNewAddresses(const Network::Address::InstanceConstSharedPtr
     address_ = address;
     address_list_or_null_ = std::move(shared_address_list);
     health_check_address_ = std::move(health_check_address);
+    orca_port_address_ = std::move(orca_port_address);
   }
 }
 
@@ -79,8 +98,23 @@ Network::Address::InstanceConstSharedPtr LogicalHost::address() const {
 
 Network::Address::InstanceConstSharedPtr LogicalHost::orcaReportingAddress() const {
   absl::MutexLock lock(address_lock_);
+  if (orca_full_address_override_) {
+    return orca_full_address_override_;
+  }
+  if (orca_port_override_ != 0) {
+    return orca_port_address_;
+  }
   return address_;
 }
+
+absl::string_view LogicalHost::orcaReportingAuthority() const { return orca_reporting_authority_; }
+
+Network::TransportSocketOptionsConstSharedPtr
+LogicalHost::orcaReportingTransportSocketOptions() const {
+  return orca_reporting_transport_socket_options_;
+}
+
+bool LogicalHost::disableOrcaReporting() const { return disable_orca_reporting_; }
 
 Upstream::Host::CreateConnectionData LogicalHost::createConnection(
     Event::Dispatcher& dispatcher, const Network::ConnectionSocket::OptionsSharedPtr& options,
@@ -115,17 +149,21 @@ Upstream::Host::CreateConnectionData LogicalHost::createConnection(
 
 Upstream::Host::CreateConnectionData LogicalHost::createOrcaReportingConnection(
     Event::Dispatcher& dispatcher,
+    Network::UpstreamTransportSocketFactory& transport_socket_factory,
     Network::TransportSocketOptionsConstSharedPtr transport_socket_options,
-    const envoy::config::core::v3::Metadata* metadata) const {
-  const Network::Address::InstanceConstSharedPtr address = orcaReportingAddress();
+    const envoy::config::core::v3::Metadata* metadata,
+    Network::Address::InstanceConstSharedPtr dial_address_override) const {
+  const Network::Address::InstanceConstSharedPtr address =
+      dial_address_override != nullptr ? dial_address_override : orcaReportingAddress();
   const SharedConstAddressVector address_list_or_null = addressListOrNull();
   // Use override_transport_socket_options if set, otherwise use the passed options.
   const auto& effective_options = override_transport_socket_options_ != nullptr
                                       ? override_transport_socket_options_
                                       : transport_socket_options;
   Network::UpstreamTransportSocketFactory& factory =
-      (metadata != nullptr) ? resolveTransportSocketFactory(address, metadata, effective_options)
-                            : transportSocketFactory();
+      (metadata != nullptr)
+          ? resolveTransportSocketFactory(address, metadata, effective_options)
+          : transport_socket_factory;
   return HostImplBase::createConnection(
       dispatcher, cluster(), address, address_list_or_null, factory,
       /*options=*/nullptr, effective_options,

@@ -59,8 +59,11 @@ protected:
     report_handler_ = std::make_shared<OrcaLoadReportHandler>(weight_config, simTime());
   }
 
-  std::unique_ptr<TestOrcaOobManager> makeManager() {
-    return std::make_unique<TestOrcaOobManager>(std::chrono::seconds(10), priority_set_,
+  std::unique_ptr<TestOrcaOobManager> makeManager(uint32_t cluster_port_override = 0,
+                                                   std::string cluster_authority = "") {
+    return std::make_unique<TestOrcaOobManager>(std::chrono::seconds(10), cluster_port_override,
+                                                std::move(cluster_authority),
+                                                transport_socket_factory_, priority_set_,
                                                 dispatcher_, random_, *stats_store_.rootScope(),
                                                 report_handler_);
   }
@@ -74,7 +77,13 @@ protected:
     return stats_store_.counter(absl::StrCat("lb_orca_oob.", name)).value();
   }
 
-  Upstream::HostSharedPtr makeHost() { return std::make_shared<NiceMock<Upstream::MockHost>>(); }
+  std::shared_ptr<NiceMock<Upstream::MockHost>> makeHost() {
+    auto host = std::make_shared<NiceMock<Upstream::MockHost>>();
+    ON_CALL(*host, hostname()).WillByDefault(testing::ReturnRef(empty_hostname_));
+    return host;
+  }
+
+  std::string empty_hostname_;
 
   // OobSession ctor calls createTimer twice (attempt, then inactivity); MockTimer EXPECT_CALLs
   // match LIFO, so we push the inactivity mock first and return the attempt mock.
@@ -86,6 +95,7 @@ protected:
   NiceMock<Upstream::MockPrioritySet> priority_set_;
   NiceMock<Event::MockDispatcher> dispatcher_;
   NiceMock<Random::MockRandomGenerator> random_;
+  NiceMock<Network::MockTransportSocketFactory> transport_socket_factory_;
   Stats::TestUtil::TestStore stats_store_;
   OrcaLoadReportHandlerSharedPtr report_handler_;
 };
@@ -153,6 +163,7 @@ protected:
     std::unique_ptr<NiceMock<Http::MockRequestEncoder>> request_encoder;
     Http::ResponseDecoder* response_decoder{nullptr};
     CodecClientForTest* codec_client{nullptr};
+    std::string captured_authority;
   };
 
   // Build the per-attempt mocks. OobSession takes ownership of network_connection (via
@@ -169,7 +180,11 @@ protected:
         .WillOnce(testing::DoAll(SaveArgAddress(&attempt->response_decoder),
                                  testing::ReturnRef(*attempt->request_encoder)));
     EXPECT_CALL(*attempt->request_encoder, encodeHeaders(_, false))
-        .WillOnce(testing::Return(absl::OkStatus()));
+        .WillOnce(testing::Invoke([ap = attempt.get()](const Http::RequestHeaderMap& h,
+                                                       bool) -> absl::Status {
+          ap->captured_authority = std::string(h.getHostValue());
+          return absl::OkStatus();
+        }));
     EXPECT_CALL(*attempt->request_encoder, encodeData(_, true));
     ON_CALL(*attempt->network_connection, close(_, _)).WillByDefault(testing::Return());
     ON_CALL(*attempt->network_connection, close(_)).WillByDefault(testing::Return());
@@ -227,7 +242,7 @@ protected:
 
   // Returns a MockHost with address+hostname+canCreateConnection wired up enough for
   // OobSession::connectAndStream to traverse without segfault.
-  Upstream::HostSharedPtr makeWiredHost() {
+  std::shared_ptr<NiceMock<Upstream::MockHost>> makeWiredHost() {
     auto host = std::make_shared<NiceMock<Upstream::MockHost>>();
     auto address = *Network::Utility::resolveUrl("tcp://10.0.0.1:80");
     addresses_.push_back(address);
@@ -236,7 +251,6 @@ protected:
     return host;
   }
 
-  std::string empty_hostname_;
   std::vector<Network::Address::InstanceConstSharedPtr> addresses_;
   Upstream::HostDescriptionConstSharedPtr host_description_for_codec_;
 };
@@ -729,6 +743,72 @@ TEST_F(OrcaOobManagerWireTest, SyncLocalCloseDuringTearDownDoesNotDoubleCount) {
   // codec_client_ and returns; stream_failures stays at 1.
   attempt->codec_client->raiseGoAway(Http::GoAwayErrorCode::Other);
   EXPECT_EQ(oobCounter("stream_failures"), 1);
+}
+
+// Cluster-level authority is used when the host has no per-endpoint override.
+TEST_F(OrcaOobManagerWireTest, ClusterAuthoritySetsAuthorityHeader) {
+  auto manager = makeManager(/*cluster_port_override=*/0, "orca.backend.local");
+  ASSERT_OK(manager->initialize());
+
+  auto* attempt_timer = installAttemptTimer();
+  auto host = makeWiredHost();
+  priority_set_.runUpdateCallbacks(0, {host}, {});
+
+  auto attempt = makeAttempt();
+  wireConnectionFor(host, *attempt);
+  expectCreateCodecClient(*manager, *attempt);
+  attempt_timer->invokeCallback();
+  EXPECT_EQ(attempt->captured_authority, "orca.backend.local");
+
+  EXPECT_CALL(dispatcher_, deferredDelete_(_)).Times(AtLeast(1));
+  manager.reset();
+}
+
+// Per-endpoint orcaReportingAuthority() takes precedence over cluster-level authority.
+TEST_F(OrcaOobManagerWireTest, PerEndpointOrcaAuthorityWinsOverClusterAuthority) {
+  auto manager = makeManager(/*cluster_port_override=*/0, "cluster.backend.local");
+  ASSERT_OK(manager->initialize());
+
+  auto* attempt_timer = installAttemptTimer();
+  auto host = makeWiredHost();
+  std::string per_endpoint_auth = "pod-6.backend.local";
+  ON_CALL(*host, orcaReportingAuthority()).WillByDefault(testing::Return(per_endpoint_auth));
+  priority_set_.runUpdateCallbacks(0, {host}, {});
+
+  auto attempt = makeAttempt();
+  wireConnectionFor(host, *attempt);
+  expectCreateCodecClient(*manager, *attempt);
+  attempt_timer->invokeCallback();
+  EXPECT_EQ(attempt->captured_authority, "pod-6.backend.local");
+
+  EXPECT_CALL(dispatcher_, deferredDelete_(_)).Times(AtLeast(1));
+  manager.reset();
+}
+
+// An endpoint with disable_oob_load_report=true should not get a session.
+TEST_F(OrcaOobManagerLifecycleTest, DisabledEndpointGetsNoSession) {
+  auto manager = makeManager();
+  ASSERT_OK(manager->initialize());
+
+  auto host = makeHost();
+  ON_CALL(*host, disableOrcaReporting()).WillByDefault(testing::Return(true));
+  priority_set_.runUpdateCallbacks(0, {host}, {});
+
+  EXPECT_EQ(activeOobSessions(), 0);
+}
+
+// When a disabled and an enabled host are added together only the enabled one gets a session.
+TEST_F(OrcaOobManagerLifecycleTest, DisabledEndpointMixedUpdateGetsNoSession) {
+  auto manager = makeManager();
+  ASSERT_OK(manager->initialize());
+
+  installAttemptTimer();
+  auto enabled_host = makeHost();
+  auto disabled_host = makeHost();
+  ON_CALL(*disabled_host, disableOrcaReporting()).WillByDefault(testing::Return(true));
+
+  priority_set_.runUpdateCallbacks(0, {enabled_host, disabled_host}, {});
+  EXPECT_EQ(activeOobSessions(), 1);
 }
 
 } // namespace

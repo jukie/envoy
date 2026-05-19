@@ -52,6 +52,8 @@ struct OrcaOobStats {
 class OrcaOobManager : protected Logger::Loggable<Logger::Id::upstream> {
 public:
   OrcaOobManager(std::chrono::milliseconds reporting_period,
+                 uint32_t cluster_port_override, std::string cluster_authority,
+                 Network::UpstreamTransportSocketFactory& transport_socket_factory,
                  const Upstream::PrioritySet& priority_set, Event::Dispatcher& dispatcher,
                  Random::RandomGenerator& random, Stats::Scope& stats_scope,
                  OrcaLoadReportHandlerSharedPtr report_handler);
@@ -125,7 +127,7 @@ private:
     void onRpcComplete(Grpc::Status::GrpcStatus status, absl::string_view message, bool end_stream);
     void onReport(const xds::data::orca::v3::OrcaLoadReport& report);
     void resetState();
-    std::string authority() const;
+    std::string computeAuthority() const;
 
     OrcaOobManager& parent_;
     const Upstream::HostConstSharedPtr host_;
@@ -153,6 +155,9 @@ private:
   static OrcaOobStats generateOrcaOobStats(Stats::Scope& scope);
 
   const std::chrono::milliseconds reporting_period_;
+  const uint32_t cluster_port_override_;
+  const std::string cluster_authority_;
+  Network::UpstreamTransportSocketFactory& transport_socket_factory_;
   const Upstream::PrioritySet& priority_set_;
   OrcaLoadReportHandlerSharedPtr report_handler_;
   Envoy::Common::CallbackHandlePtr member_update_cb_;

@@ -85,6 +85,8 @@ envoy_cc_library(
         "//source/common/grpc:common_lib",
         "//source/common/grpc:status_lib",
         "//source/common/http:codec_client_lib",
+        "//source/common/network:transport_socket_options_lib",
+        "//source/common/network:utility_lib",
         "//source/common/http:headers_lib",
         "//source/common/http:utility_lib",
         "@abseil-cpp//absl/container:node_hash_map",

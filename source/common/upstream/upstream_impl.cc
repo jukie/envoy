@@ -45,6 +45,7 @@
 #include "source/common/http/http2/codec_stats.h"
 #include "source/common/http/utility.h"
 #include "source/common/network/address_impl.h"
+#include "source/common/network/transport_socket_options_impl.h"
 #include "source/common/network/filter_state_proxy_info.h"
 #include "source/common/network/happy_eyeballs_connection_impl.h"
 #include "source/common/network/resolver_impl.h"
@@ -474,11 +475,12 @@ absl::StatusOr<std::unique_ptr<HostDescriptionImpl>> HostDescriptionImpl::create
     MetadataConstSharedPtr locality_metadata,
     std::shared_ptr<const envoy::config::core::v3::Locality> locality,
     const envoy::config::endpoint::v3::Endpoint::HealthCheckConfig& health_check_config,
-    uint32_t priority, const AddressVector& address_list) {
+    uint32_t priority, const AddressVector& address_list,
+    const envoy::config::endpoint::v3::Endpoint::OrcaReportingConfig& orca_reporting_config) {
   absl::Status creation_status = absl::OkStatus();
   auto ret = std::unique_ptr<HostDescriptionImpl>(new HostDescriptionImpl(
       creation_status, cluster, hostname, dest_address, endpoint_metadata, locality_metadata,
-      locality, health_check_config, priority, address_list));
+      locality, health_check_config, priority, address_list, orca_reporting_config));
   RETURN_IF_NOT_OK(creation_status);
   return ret;
 }
@@ -489,12 +491,22 @@ HostDescriptionImpl::HostDescriptionImpl(
     MetadataConstSharedPtr locality_metadata,
     std::shared_ptr<const envoy::config::core::v3::Locality> locality,
     const envoy::config::endpoint::v3::Endpoint::HealthCheckConfig& health_check_config,
-    uint32_t priority, const AddressVector& address_list)
+    uint32_t priority, const AddressVector& address_list,
+    const envoy::config::endpoint::v3::Endpoint::OrcaReportingConfig& orca_reporting_config)
     : HostDescriptionImplBase(cluster, hostname, dest_address, endpoint_metadata, locality_metadata,
                               locality, health_check_config, priority, creation_status),
       address_(dest_address),
       address_list_or_null_(makeAddressListOrNull(dest_address, address_list)),
-      health_check_address_(resolveHealthCheckAddress(health_check_config, dest_address)) {}
+      health_check_address_(resolveHealthCheckAddress(health_check_config, dest_address)),
+      orca_reporting_address_(resolveOrcaReportingAddress(orca_reporting_config, dest_address)),
+      orca_reporting_authority_(orca_reporting_config.hostname()),
+      orca_reporting_transport_socket_options_(
+          orca_reporting_config.hostname().empty() ||
+                  orca_reporting_config.disable_oob_load_report()
+              ? nullptr
+              : std::make_shared<Network::TransportSocketOptionsImpl>(
+                    orca_reporting_config.hostname())),
+      disable_orca_reporting_(orca_reporting_config.disable_oob_load_report()) {}
 
 HostDescriptionImplBase::HostDescriptionImplBase(
     ClusterInfoConstSharedPtr cluster, const std::string& hostname,
@@ -605,13 +617,16 @@ Host::CreateConnectionData HostImplBase::createHealthCheckConnection(
 
 Host::CreateConnectionData HostImplBase::createOrcaReportingConnection(
     Event::Dispatcher& dispatcher,
+    Network::UpstreamTransportSocketFactory& transport_socket_factory,
     Network::TransportSocketOptionsConstSharedPtr transport_socket_options,
-    const envoy::config::core::v3::Metadata* metadata) const {
-  const auto orca_address = orcaReportingAddress();
+    const envoy::config::core::v3::Metadata* metadata,
+    Network::Address::InstanceConstSharedPtr dial_address_override) const {
+  const auto orca_address =
+      dial_address_override != nullptr ? dial_address_override : orcaReportingAddress();
   Network::UpstreamTransportSocketFactory& factory =
       (metadata != nullptr)
           ? resolveTransportSocketFactory(orca_address, metadata, transport_socket_options)
-          : transportSocketFactory();
+          : transport_socket_factory;
   return createConnection(dispatcher, cluster(), orca_address, addressListOrNull(), factory,
                           /*options=*/nullptr, transport_socket_options, shared_from_this());
 }
@@ -737,11 +752,13 @@ absl::StatusOr<std::unique_ptr<HostImpl>> HostImpl::create(
     std::shared_ptr<const envoy::config::core::v3::Locality> locality,
     const envoy::config::endpoint::v3::Endpoint::HealthCheckConfig& health_check_config,
     uint32_t priority, const envoy::config::core::v3::HealthStatus health_status,
-    const AddressVector& address_list) {
+    const AddressVector& address_list,
+    const envoy::config::endpoint::v3::Endpoint::OrcaReportingConfig& orca_reporting_config) {
   absl::Status creation_status = absl::OkStatus();
   auto ret = std::unique_ptr<HostImpl>(new HostImpl(
       creation_status, cluster, hostname, address, endpoint_metadata, locality_metadata,
-      initial_weight, locality, health_check_config, priority, health_status, address_list));
+      initial_weight, locality, health_check_config, priority, health_status, address_list,
+      orca_reporting_config));
   RETURN_IF_NOT_OK(creation_status);
   return ret;
 }
@@ -1426,6 +1443,7 @@ ClusterInfoImpl::ClusterInfoImpl(
                                creation_status);
     }
   }
+
 }
 
 // Configures the load balancer based on config.load_balancing_policy
@@ -2220,7 +2238,8 @@ void PriorityStateManager::registerHostForPriority(
           lb_endpoint.load_balancing_weight().value(),
           parent_.constLocalitySharedPool()->getObject(locality_lb_endpoint.locality()),
           lb_endpoint.endpoint().health_check_config(), locality_lb_endpoint.priority(),
-          lb_endpoint.health_status(), address_list),
+          lb_endpoint.health_status(), address_list,
+          lb_endpoint.endpoint().orca_reporting_config()),
       std::unique_ptr<HostImpl>));
   registerHostForPriority(host, locality_lb_endpoint);
 }
@@ -2599,6 +2618,22 @@ void reportUpstreamCxDestroyActiveRequest(const Upstream::HostDescriptionConstSh
   } else {
     stats.upstream_cx_destroy_local_with_active_rq_.inc();
   }
+}
+
+Network::Address::InstanceConstSharedPtr resolveOrcaReportingAddress(
+    const envoy::config::endpoint::v3::Endpoint::OrcaReportingConfig& orca_reporting_config,
+    const Network::Address::InstanceConstSharedPtr& host_address) {
+  if (orca_reporting_config.has_address()) {
+    auto address_or_error =
+        Network::Address::resolveProtoAddress(orca_reporting_config.address());
+    THROW_IF_NOT_OK_REF(address_or_error.status());
+    return address_or_error.value();
+  }
+  const uint32_t port_value = orca_reporting_config.port_value();
+  if (port_value != 0 && host_address->ip()) {
+    return Network::Utility::getAddressWithPort(*host_address, port_value);
+  }
+  return host_address;
 }
 
 Network::Address::InstanceConstSharedPtr resolveHealthCheckAddress(

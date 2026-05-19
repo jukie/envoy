@@ -7,6 +7,7 @@ import "envoy/extensions/load_balancing_policies/common/v3/common.proto";
 import "google/protobuf/duration.proto";
 import "google/protobuf/wrappers.proto";
 
+import "envoy/annotations/deprecation.proto";
 import "udpa/annotations/status.proto";
 import "validate/validate.proto";
 
@@ -44,16 +45,32 @@ option (udpa.annotations.file_status).package_version_status = ACTIVE;
 // See the :ref:`load balancing architecture
 // overview<arch_overview_load_balancing_types>` for more information.
 //
-// [#next-free-field: 9]
+// [#next-free-field: 10]
 message ClientSideWeightedRoundRobin {
   // Whether to enable out-of-band utilization reporting collection from
   // the endpoints. By default, per-request utilization reporting is used.
-  google.protobuf.BoolValue enable_oob_load_report = 1;
+  //
+  // .. attention::
+  //
+  //   Deprecated. Set
+  //   :ref:`orca_reporting
+  //   <envoy_v3_api_field_extensions.load_balancing_policies.client_side_weighted_round_robin.v3.ClientSideWeightedRoundRobin.orca_reporting>`
+  //   to enable OOB reporting. This field is honored only when ``orca_reporting`` is unset.
+  google.protobuf.BoolValue enable_oob_load_report = 1
+      [deprecated = true, (envoy.annotations.deprecated_at_minor_version) = "3.0"];
 
   // Load reporting interval to request from the server. Note that the
   // server may not provide reports as frequently as the client requests.
   // Used only when enable_oob_load_report is true. Default is 10 seconds.
-  google.protobuf.Duration oob_reporting_period = 2;
+  //
+  // .. attention::
+  //
+  //   Deprecated. Use
+  //   :ref:`OrcaReportingCommonConfig.oob_reporting_period
+  //   <envoy_v3_api_field_extensions.load_balancing_policies.common.v3.OrcaReportingCommonConfig.oob_reporting_period>`
+  //   via the ``orca_reporting`` field.
+  google.protobuf.Duration oob_reporting_period = 2
+      [deprecated = true, (envoy.annotations.deprecated_at_minor_version) = "3.0"];
 
   // A given endpoint must report load metrics continuously for at least
   // this long before the endpoint weight will be used. This avoids
@@ -88,4 +105,14 @@ message ClientSideWeightedRoundRobin {
   // Configuration for slow start mode.
   // If this configuration is not set, slow start will not be not enabled.
   common.v3.SlowStartConfig slow_start_config = 8;
+
+  // ORCA out-of-band reporting configuration. Setting this enables OOB
+  // reporting and allows cluster-level overrides for the reporting stream.
+  // Per-endpoint overrides live on
+  // :ref:`Endpoint.orca_reporting_config
+  // <envoy_v3_api_field_config.endpoint.v3.Endpoint.orca_reporting_config>`.
+  //
+  // Mutually exclusive with the deprecated ``enable_oob_load_report`` /
+  // ``oob_reporting_period`` fields.
+  common.v3.OrcaReportingCommonConfig orca_reporting = 9;
 }

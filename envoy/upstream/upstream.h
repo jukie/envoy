@@ -219,17 +219,24 @@ public:
   /**
    * Create a dedicated connection for ORCA out-of-band load reporting per gRFC A51
    * (xds.service.orca.v3.OpenRcaService), separate from request and health-check pools.
-   * Dials the address returned by orcaReportingAddress().
    * @param dispatcher supplies the owning dispatcher.
+   * @param transport_socket_factory the factory to use for this ORCA stream (resolved by the
+   *        calling LB policy from ClusterInfo::transportSocketMatcher()).
    * @param transport_socket_options supplies the transport options that will be set on the new
-   * connection.
-   * @param metadata when non-null drives transport socket factory resolution.
+   *        connection.
+   * @param metadata when non-null drives per-connection factory resolution for legacy callers;
+   *        new callers should pass nullptr.
+   * @param dial_address_override when non-null, dials this address instead of
+   *        orcaReportingAddress(). Used by OrcaOobManager to apply cluster-level port overrides
+   *        that are not captured at host construction time.
    * @return the connection data.
    */
   virtual CreateConnectionData createOrcaReportingConnection(
       Event::Dispatcher& dispatcher,
+      Network::UpstreamTransportSocketFactory& transport_socket_factory,
       Network::TransportSocketOptionsConstSharedPtr transport_socket_options,
-      const envoy::config::core::v3::Metadata* metadata) const PURE;
+      const envoy::config::core::v3::Metadata* metadata,
+      Network::Address::InstanceConstSharedPtr dial_address_override = nullptr) const PURE;
 
   /**
    * @return host specific gauges.
@@ -1188,6 +1195,7 @@ public:
    * factory.
    */
   virtual TransportSocketMatcher& transportSocketMatcher() const PURE;
+
 
   /**
    * @return ClusterConfigUpdateStats& config update stats for this cluster.

@@ -1996,9 +1996,9 @@ TEST_F(HostImplTest, CreateOrcaReportingConnectionDialsDataAddress) {
   EXPECT_CALL(*connection, setBufferLimits(0));
   EXPECT_CALL(*connection, connectionInfoSetter()).Times(testing::AnyNumber());
   EXPECT_CALL(*connection, streamInfo()).Times(testing::AnyNumber());
-  Host::CreateConnectionData data =
-      host->createOrcaReportingConnection(dispatcher, /*transport_socket_options=*/nullptr,
-                                          /*metadata=*/nullptr);
+  Host::CreateConnectionData data = host->createOrcaReportingConnection(
+      dispatcher, host->transportSocketFactory(), /*transport_socket_options=*/nullptr,
+      /*metadata=*/nullptr);
   EXPECT_EQ(data.host_description_.get(), host.get());
 }
 
@@ -2023,8 +2023,8 @@ TEST_F(HostImplTest, CreateOrcaReportingConnectionWithMetadataResolvesTransportS
   EXPECT_CALL(*connection, setBufferLimits(0));
   EXPECT_CALL(*connection, connectionInfoSetter()).Times(testing::AnyNumber());
   EXPECT_CALL(*connection, streamInfo()).Times(testing::AnyNumber());
-  host->createOrcaReportingConnection(dispatcher, /*transport_socket_options=*/nullptr,
-                                      &orca_metadata);
+  host->createOrcaReportingConnection(dispatcher, host->transportSocketFactory(),
+                                      /*transport_socket_options=*/nullptr, &orca_metadata);
 }
 
 TEST_F(HostImplTest, CreateConnectionHappyEyeballs) {
