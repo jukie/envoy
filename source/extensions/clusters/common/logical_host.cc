@@ -116,8 +116,10 @@ Upstream::Host::CreateConnectionData LogicalHost::createConnection(
 Upstream::Host::CreateConnectionData LogicalHost::createOrcaReportingConnection(
     Event::Dispatcher& dispatcher,
     Network::TransportSocketOptionsConstSharedPtr transport_socket_options,
-    const envoy::config::core::v3::Metadata* metadata) const {
-  const Network::Address::InstanceConstSharedPtr address = orcaReportingAddress();
+    const envoy::config::core::v3::Metadata* metadata,
+    Network::Address::InstanceConstSharedPtr address_override) const {
+  const Network::Address::InstanceConstSharedPtr address =
+      address_override != nullptr ? address_override : orcaReportingAddress();
   const SharedConstAddressVector address_list_or_null = addressListOrNull();
   // Use override_transport_socket_options if set, otherwise use the passed options.
   const auto& effective_options = override_transport_socket_options_ != nullptr
