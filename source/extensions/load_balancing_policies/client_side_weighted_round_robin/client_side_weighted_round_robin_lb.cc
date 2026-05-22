@@ -43,9 +43,17 @@ ClientSideWeightedRoundRobinLbConfig::ClientSideWeightedRoundRobinLbConfig(
   weight_update_period =
       std::chrono::milliseconds(PROTOBUF_GET_MS_OR_DEFAULT(lb_proto, weight_update_period, 1000));
 
-  enable_oob_load_report = lb_proto.enable_oob_load_report().value();
-  oob_reporting_period =
-      std::chrono::milliseconds(PROTOBUF_GET_MS_OR_DEFAULT(lb_proto, oob_reporting_period, 10000));
+  // oob_reporting_config supersedes the deprecated enable_oob_load_report /
+  // oob_reporting_period fields, which are honored only when it is unset.
+  if (lb_proto.has_oob_reporting_config()) {
+    enable_oob_load_report = !lb_proto.oob_reporting_config().disabled();
+    oob_manager_config = Extensions::LoadBalancingPolicies::Common::parseOrcaOobManagerConfig(
+        lb_proto.oob_reporting_config());
+  } else {
+    enable_oob_load_report = lb_proto.enable_oob_load_report().value();
+    oob_manager_config.reporting_period = std::chrono::milliseconds(
+        PROTOBUF_GET_MS_OR_DEFAULT(lb_proto, oob_reporting_period, 10000));
+  }
 
   if (lb_proto.has_slow_start_config()) {
     *round_robin_overrides_.mutable_slow_start_config() = lb_proto.slow_start_config();
@@ -124,12 +132,11 @@ ClientSideWeightedRoundRobinLoadBalancer::ClientSideWeightedRoundRobinLoadBalanc
   // (OrcaWeightManager attaches OrcaHostLbPolicyData) before member callbacks (OrcaOobManager
   // opens the session), so the data is in place before the first OOB report.
   if (typed_lb_config->enable_oob_load_report) {
-    Extensions::LoadBalancingPolicies::Common::OrcaOobManagerConfig oob_config;
-    oob_config.reporting_period = typed_lb_config->oob_reporting_period;
     orca_oob_manager_ =
         std::make_unique<Extensions::LoadBalancingPolicies::Common::ProdOrcaOobManager>(
-            std::move(oob_config), priority_set, typed_lb_config->main_thread_dispatcher_, random,
-            cluster_info.statsScope(), orca_weight_manager_->reportHandler());
+            typed_lb_config->oob_manager_config, priority_set,
+            typed_lb_config->main_thread_dispatcher_, random, cluster_info.statsScope(),
+            orca_weight_manager_->reportHandler());
   }
 }
 

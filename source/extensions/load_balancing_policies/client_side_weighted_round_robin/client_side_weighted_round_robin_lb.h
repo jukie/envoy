@@ -39,8 +39,11 @@ public:
   std::chrono::milliseconds weight_expiration_period;
   std::chrono::milliseconds weight_update_period;
 
+  // Resolved enablement: from oob_reporting_config presence/disabled, or the
+  // deprecated enable_oob_load_report when oob_reporting_config is unset.
   bool enable_oob_load_report;
-  std::chrono::milliseconds oob_reporting_period;
+  // Resolved OOB connection configuration passed to OrcaOobManager.
+  Extensions::LoadBalancingPolicies::Common::OrcaOobManagerConfig oob_manager_config;
 
   // Round robin proto overrides that we want to propagate to the worker RR LB (e.g., slow start).
   RoundRobinConfig round_robin_overrides_;
