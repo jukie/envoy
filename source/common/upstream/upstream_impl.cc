@@ -613,7 +613,9 @@ Host::CreateConnectionData HostImplBase::createOrcaReportingConnection(
       (metadata != nullptr)
           ? resolveTransportSocketFactory(orca_address, metadata, transport_socket_options)
           : transportSocketFactory();
-  return createConnection(dispatcher, cluster(), orca_address, addressListOrNull(), factory,
+  // The OOB stream dials a single address; the happy-eyeballs address list is
+  // intentionally not used.
+  return createConnection(dispatcher, cluster(), orca_address, /*address_list_or_null=*/{}, factory,
                           /*options=*/nullptr, transport_socket_options, shared_from_this());
 }
 

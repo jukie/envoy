@@ -107,7 +107,12 @@ protected:
     return stats_store_.counter(absl::StrCat("lb_orca_oob.", name)).value();
   }
 
-  Upstream::HostSharedPtr makeHost() { return std::make_shared<NiceMock<Upstream::MockHost>>(); }
+  Upstream::HostSharedPtr makeHost() {
+    auto host = std::make_shared<NiceMock<Upstream::MockHost>>();
+    ON_CALL(*host, address())
+        .WillByDefault(Return(*Network::Utility::resolveUrl("tcp://10.0.0.1:80")));
+    return host;
+  }
 
   // OobSession ctor calls createTimer twice (attempt, then inactivity); MockTimer EXPECT_CALLs
   // match LIFO, so we push the inactivity mock first and return the attempt mock.
@@ -837,8 +842,9 @@ TEST_F(OrcaOobManagerWireTest, AlpnForcedToH2OnEveryOobConnection) {
   manager.reset();
 }
 
-// Test that port_value overrides the port in the address passed to createOrcaReportingConnection.
-TEST_F(OrcaOobManagerWireTest, PortOverrideRedialsOnOverridePort) {
+// port_value overrides the port, and the override is applied to the host's
+// orcaReportingAddress() (not its data address()).
+TEST_F(OrcaOobManagerWireTest, PortOverrideAppliedToOrcaReportingAddress) {
   OrcaOobManagerConfig config;
   config.reporting_period = std::chrono::seconds(10);
   config.port_value = 9001;
@@ -847,14 +853,18 @@ TEST_F(OrcaOobManagerWireTest, PortOverrideRedialsOnOverridePort) {
 
   auto* attempt_timer = installAttemptTimer();
   auto attempt = makeAttempt();
-  auto host = makeWiredCapturingHost("tcp://1.2.3.4:80", *manager, *attempt);
+  auto host = makeWiredCapturingHost("tcp://1.1.1.1:80", *manager, *attempt);
+  // orcaReportingAddress() deliberately differs from address(): the override
+  // must apply to the OOB reporting address.
+  auto orca_address = *Network::Utility::resolveUrl("tcp://2.2.2.2:80");
+  addresses_.push_back(orca_address);
+  ON_CALL(*host, orcaReportingAddress()).WillByDefault(Return(orca_address));
   priority_set_.runUpdateCallbacks(0, {host}, {});
 
   attempt_timer->invokeCallback();
 
-  // The address override must have port 9001 with the host IP 1.2.3.4.
   ASSERT_NE(host->last_address_override_, nullptr);
-  EXPECT_EQ(host->last_address_override_->asString(), "1.2.3.4:9001");
+  EXPECT_EQ(host->last_address_override_->asString(), "2.2.2.2:9001");
 
   EXPECT_CALL(dispatcher_, deferredDelete_(_)).Times(AtLeast(1));
   manager.reset();

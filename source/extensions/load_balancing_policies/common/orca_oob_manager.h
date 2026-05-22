@@ -43,10 +43,13 @@ struct OrcaOobStats {
   ALL_ORCA_OOB_STATS(GENERATE_COUNTER_STRUCT, GENERATE_GAUGE_STRUCT)
 };
 
+// Default ORCA OOB load reporting interval, applied when reporting_period is unset.
+constexpr uint64_t kDefaultOobReportingPeriodMs = 10000;
+
 // Parsed, validated form of OrcaOobReportingConfig consumed by OrcaOobManager.
 // Reusable by any load balancing policy that drives ORCA OOB reporting.
 struct OrcaOobManagerConfig {
-  std::chrono::milliseconds reporting_period{10000};
+  std::chrono::milliseconds reporting_period{kDefaultOobReportingPeriodMs};
   uint32_t port_value{0};
   std::string authority;
   // Synthetic endpoint metadata carrying transport_socket_match_criteria under

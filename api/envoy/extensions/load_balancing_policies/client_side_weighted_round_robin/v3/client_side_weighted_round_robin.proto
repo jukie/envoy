@@ -58,6 +58,9 @@ message ClientSideWeightedRoundRobin {
   // Load reporting interval to request from the server. Note that the
   // server may not provide reports as frequently as the client requests.
   // Used only when enable_oob_load_report is true. Default is 10 seconds.
+  // This field is deprecated; use :ref:`oob_reporting_config
+  // <envoy_v3_api_field_extensions.load_balancing_policies.client_side_weighted_round_robin.v3.ClientSideWeightedRoundRobin.oob_reporting_config>`
+  // instead.
   google.protobuf.Duration oob_reporting_period = 2
       [deprecated = true, (envoy.annotations.deprecated_at_minor_version) = "3.0"];
 
@@ -98,7 +101,7 @@ message ClientSideWeightedRoundRobin {
   // Out-of-band ORCA load reporting configuration. Setting this field enables
   // out-of-band reporting (unless :ref:`disabled
   // <envoy_v3_api_field_extensions.load_balancing_policies.common.v3.OrcaOobReportingConfig.disabled>`
-  // is true) and supersedes the deprecated ``enable_oob_load_report`` and
-  // ``oob_reporting_period`` fields, which are ignored when this field is set.
+  // is true) and replaces the deprecated ``enable_oob_load_report`` and
+  // ``oob_reporting_period`` fields. Cannot be set alongside either.
   common.v3.OrcaOobReportingConfig oob_reporting_config = 9;
 }

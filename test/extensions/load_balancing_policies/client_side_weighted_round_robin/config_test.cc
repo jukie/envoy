@@ -9,6 +9,8 @@
 #include "test/mocks/upstream/cluster_info.h"
 #include "test/mocks/upstream/priority_set.h"
 
+#include "absl/status/status.h"
+
 namespace Envoy {
 namespace Extensions {
 namespace LoadBalancingPolicies {
@@ -60,7 +62,7 @@ TEST(CswrrOobConfigResolution, NewFieldEnablesAndIsParsed) {
   NiceMock<ThreadLocal::MockInstance> tls;
   Upstream::ClientSideWeightedRoundRobinLbConfig config(proto, dispatcher, tls);
 
-  EXPECT_TRUE(config.enable_oob_load_report);
+  EXPECT_TRUE(config.oob_enabled);
   EXPECT_EQ(config.oob_manager_config.reporting_period, std::chrono::milliseconds(5000));
   EXPECT_EQ(config.oob_manager_config.port_value, 9001u);
   EXPECT_EQ(config.oob_manager_config.authority, "orca.example.com");
@@ -75,7 +77,7 @@ TEST(CswrrOobConfigResolution, DisabledTurnsOffEvenWhenPresent) {
   NiceMock<ThreadLocal::MockInstance> tls;
   Upstream::ClientSideWeightedRoundRobinLbConfig config(proto, dispatcher, tls);
 
-  EXPECT_FALSE(config.enable_oob_load_report);
+  EXPECT_FALSE(config.oob_enabled);
 }
 
 TEST(CswrrOobConfigResolution, DeprecatedFieldsUsedWhenNewFieldAbsent) {
@@ -88,25 +90,23 @@ TEST(CswrrOobConfigResolution, DeprecatedFieldsUsedWhenNewFieldAbsent) {
   NiceMock<ThreadLocal::MockInstance> tls;
   Upstream::ClientSideWeightedRoundRobinLbConfig config(proto, dispatcher, tls);
 
-  EXPECT_TRUE(config.enable_oob_load_report);
+  EXPECT_TRUE(config.oob_enabled);
   EXPECT_EQ(config.oob_manager_config.reporting_period, std::chrono::milliseconds(42000));
 }
 
-TEST(CswrrOobConfigResolution, NewFieldWinsOverDeprecatedFields) {
+// Setting oob_reporting_config alongside either deprecated field is rejected at
+// config load to avoid ambiguous precedence.
+TEST(CswrrOobConfigResolution, BothNewAndDeprecatedFieldsRejected) {
   envoy::extensions::load_balancing_policies::client_side_weighted_round_robin::v3::
       ClientSideWeightedRoundRobin proto;
-  // Deprecated fields set...
-  proto.mutable_enable_oob_load_report()->set_value(true);
-  proto.mutable_oob_reporting_period()->set_seconds(99);
-  // ...but the new field is also set and must win.
   proto.mutable_oob_reporting_config()->mutable_reporting_period()->set_seconds(5);
+  proto.mutable_enable_oob_load_report()->set_value(true);
 
-  NiceMock<Event::MockDispatcher> dispatcher;
-  NiceMock<ThreadLocal::MockInstance> tls;
-  Upstream::ClientSideWeightedRoundRobinLbConfig config(proto, dispatcher, tls);
-
-  EXPECT_TRUE(config.enable_oob_load_report);
-  EXPECT_EQ(config.oob_manager_config.reporting_period, std::chrono::milliseconds(5000));
+  NiceMock<Server::Configuration::MockServerFactoryContext> context;
+  Factory factory;
+  auto result = factory.loadConfig(context, proto);
+  ASSERT_FALSE(result.ok());
+  EXPECT_EQ(result.status().code(), absl::StatusCode::kInvalidArgument);
 }
 
 TEST(CswrrOobConfigResolution, EmptyConfigEnablesWithDefaults) {
@@ -118,7 +118,7 @@ TEST(CswrrOobConfigResolution, EmptyConfigEnablesWithDefaults) {
   NiceMock<ThreadLocal::MockInstance> tls;
   Upstream::ClientSideWeightedRoundRobinLbConfig config(proto, dispatcher, tls);
 
-  EXPECT_TRUE(config.enable_oob_load_report);
+  EXPECT_TRUE(config.oob_enabled);
   EXPECT_EQ(config.oob_manager_config.reporting_period, std::chrono::milliseconds(10000));
   EXPECT_EQ(config.oob_manager_config.port_value, 0u);
 }

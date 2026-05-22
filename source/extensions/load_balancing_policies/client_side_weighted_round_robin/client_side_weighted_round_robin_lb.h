@@ -41,7 +41,7 @@ public:
 
   // Resolved enablement: from oob_reporting_config presence/disabled, or the
   // deprecated enable_oob_load_report when oob_reporting_config is unset.
-  bool enable_oob_load_report;
+  bool oob_enabled;
   // Resolved OOB connection configuration passed to OrcaOobManager.
   Extensions::LoadBalancingPolicies::Common::OrcaOobManagerConfig oob_manager_config;
 
@@ -134,7 +134,7 @@ private:
   std::unique_ptr<Extensions::LoadBalancingPolicies::Common::OrcaWeightManager>
       orca_weight_manager_;
 
-  // ORCA out-of-band manager. Constructed only when enable_oob_load_report is true; null
+  // ORCA out-of-band manager. Constructed only when oob_enabled is true; null
   // otherwise. Shares the OrcaWeightManager's report handler so OOB reports feed the same
   // per-host atomics as in-band reports.
   std::unique_ptr<Extensions::LoadBalancingPolicies::Common::OrcaOobManager> orca_oob_manager_;

@@ -178,13 +178,14 @@ message OrcaOobReportingConfig {
   bool disabled = 1;
 
   // Load reporting interval to request from the server. The server may report
-  // less frequently than requested. Defaults to 10 seconds.
-  google.protobuf.Duration reporting_period = 2 [(validate.rules).duration = {gt {}}];
+  // less frequently than requested. Defaults to 10 seconds. If set, must be
+  // greater than 1 millisecond.
+  google.protobuf.Duration reporting_period = 2 [(validate.rules).duration = {gt {nanos: 1000000}}];
 
   // Optional alternative port for the OOB reporting connection, for example an
   // ORCA reporting sidecar listening on a dedicated port. If 0 or unset, the
-  // host's serving address port is used. Ignored for non-IP (pipe/UDS) host
-  // addresses.
+  // port of the host's ORCA reporting address is used. Ignored for non-IP
+  // (pipe/UDS) host addresses.
   uint32 port_value = 3 [(validate.rules).uint32 = {lte: 65535}];
 
   // Value of the ``:authority`` header on the OOB gRPC stream. If empty, the
