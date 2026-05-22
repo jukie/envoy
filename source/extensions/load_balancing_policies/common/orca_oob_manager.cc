@@ -264,6 +264,10 @@ void OrcaOobManager::OobSession::connectAndStream() {
   Upstream::Host::CreateConnectionData connection_data = host_->createOrcaReportingConnection(
       parent_.dispatcher_, parent_.alpn_options_,
       parent_.config_.transport_socket_match_metadata.get(), address_override);
+  // Derive :scheme from the actual OOB connection's transport, which (via
+  // transport_socket_match_criteria) may differ from the cluster default.
+  const bool secure_transport =
+      connection_data.connection_ != nullptr && connection_data.connection_->ssl() != nullptr;
   codec_client_ = parent_.createCodecClient(connection_data);
   if (codec_client_ == nullptr) {
     parent_.oob_stats_.stream_failures_.inc();
@@ -280,10 +284,9 @@ void OrcaOobManager::OobSession::connectAndStream() {
   auto headers_message =
       Grpc::Common::prepareHeaders(authority(), std::string(kOrcaOobServiceFullName),
                                    std::string(kStreamCoreMetricsMethod), absl::nullopt);
-  headers_message->headers().setReferenceScheme(
-      host_->transportSocketFactory().implementsSecureTransport()
-          ? Http::Headers::get().SchemeValues.Https
-          : Http::Headers::get().SchemeValues.Http);
+  headers_message->headers().setReferenceScheme(secure_transport
+                                                    ? Http::Headers::get().SchemeValues.Https
+                                                    : Http::Headers::get().SchemeValues.Http);
 
   const auto status =
       request_encoder_->encodeHeaders(headers_message->headers(), /*end_stream=*/false);

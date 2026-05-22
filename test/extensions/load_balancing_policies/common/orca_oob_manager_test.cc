@@ -17,6 +17,7 @@
 #include "test/mocks/event/mocks.h"
 #include "test/mocks/http/mocks.h"
 #include "test/mocks/network/mocks.h"
+#include "test/mocks/ssl/mocks.h"
 #include "test/mocks/upstream/host.h"
 #include "test/mocks/upstream/priority_set.h"
 #include "test/test_common/simulated_time_system.h"
@@ -222,6 +223,27 @@ protected:
         .WillOnce(testing::Invoke(
             [&captured_authority](const Http::RequestHeaderMap& h, bool) -> absl::Status {
               captured_authority = std::string(h.getHostValue());
+              return absl::OkStatus();
+            }));
+    EXPECT_CALL(*attempt->request_encoder, encodeData(_, true));
+    ON_CALL(*attempt->network_connection, close(_, _)).WillByDefault(testing::Return());
+    ON_CALL(*attempt->network_connection, close(_)).WillByDefault(testing::Return());
+    return attempt;
+  }
+
+  // Like makeAttemptCapturingAuthority but captures the :scheme pseudo-header instead.
+  std::unique_ptr<OobAttempt> makeAttemptCapturingScheme(std::string& captured_scheme) {
+    auto attempt = std::make_unique<OobAttempt>();
+    attempt->network_connection = new NiceMock<Network::MockClientConnection>();
+    attempt->codec = new NiceMock<Http::MockClientConnection>();
+    attempt->request_encoder = std::make_unique<NiceMock<Http::MockRequestEncoder>>();
+    EXPECT_CALL(*attempt->codec, newStream(_))
+        .WillOnce(testing::DoAll(SaveArgAddress(&attempt->response_decoder),
+                                 testing::ReturnRef(*attempt->request_encoder)));
+    EXPECT_CALL(*attempt->request_encoder, encodeHeaders(_, false))
+        .WillOnce(testing::Invoke(
+            [&captured_scheme](const Http::RequestHeaderMap& h, bool) -> absl::Status {
+              captured_scheme = std::string(h.getSchemeValue());
               return absl::OkStatus();
             }));
     EXPECT_CALL(*attempt->request_encoder, encodeData(_, true));
@@ -898,6 +920,55 @@ TEST_F(OrcaOobManagerWireTest, AuthorityOverrideUsedInRequestHeaders) {
   expectCreateCodecClient(*manager, *attempt);
   attempt_timer->invokeCallback();
   EXPECT_EQ(captured_authority, "orca.example.com");
+
+  EXPECT_CALL(dispatcher_, deferredDelete_(_)).Times(AtLeast(1));
+  manager.reset();
+}
+
+// Verify that the gRPC request's :scheme is "http" when the OOB connection's transport
+// socket is plaintext (ssl() returns nullptr).
+TEST_F(OrcaOobManagerWireTest, SchemeIsHttpForPlaintextConnection) {
+  auto manager = makeManager();
+  ASSERT_OK(manager->initialize());
+
+  auto* attempt_timer = installAttemptTimer();
+  auto host = makeWiredHost();
+  priority_set_.runUpdateCallbacks(0, {host}, {});
+
+  std::string captured_scheme;
+  auto attempt = makeAttemptCapturingScheme(captured_scheme);
+  // Plaintext: ssl() returns nullptr (default for NiceMock<MockClientConnection>).
+  ON_CALL(*attempt->network_connection, ssl()).WillByDefault(Return(nullptr));
+  wireConnectionFor(host, *attempt);
+  expectCreateCodecClient(*manager, *attempt);
+  attempt_timer->invokeCallback();
+  EXPECT_EQ(captured_scheme, "http");
+
+  EXPECT_CALL(dispatcher_, deferredDelete_(_)).Times(AtLeast(1));
+  manager.reset();
+}
+
+// Verify that the gRPC request's :scheme is "https" when the OOB connection's transport
+// socket is TLS (ssl() returns a non-null ConnectionInfo). This covers the case where
+// transport_socket_match_criteria selects a TLS socket even if the cluster default differs.
+TEST_F(OrcaOobManagerWireTest, SchemeIsHttpsForTlsConnection) {
+  auto manager = makeManager();
+  ASSERT_OK(manager->initialize());
+
+  auto* attempt_timer = installAttemptTimer();
+  auto host = makeWiredHost();
+  priority_set_.runUpdateCallbacks(0, {host}, {});
+
+  std::string captured_scheme;
+  auto attempt = makeAttemptCapturingScheme(captured_scheme);
+  // TLS: ssl() returns a non-null MockConnectionInfo, simulating an SslSocket whose
+  // ConnectionInfo is created in the constructor (before handshake completes).
+  auto ssl_info = std::make_shared<NiceMock<Ssl::MockConnectionInfo>>();
+  ON_CALL(*attempt->network_connection, ssl()).WillByDefault(Return(ssl_info));
+  wireConnectionFor(host, *attempt);
+  expectCreateCodecClient(*manager, *attempt);
+  attempt_timer->invokeCallback();
+  EXPECT_EQ(captured_scheme, "https");
 
   EXPECT_CALL(dispatcher_, deferredDelete_(_)).Times(AtLeast(1));
   manager.reset();
