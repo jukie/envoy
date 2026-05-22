@@ -209,9 +209,10 @@ protected:
     return attempt;
   }
 
-  // Like makeAttempt() but captures the :authority value passed to encodeHeaders into
-  // *captured_authority instead of hard-stubbing the return value.
-  std::unique_ptr<OobAttempt> makeAttemptCapturingAuthority(std::string& captured_authority) {
+  // Like makeAttempt() but captures both the :authority and :scheme pseudo-headers passed
+  // to encodeHeaders into the provided out-params instead of hard-stubbing the return value.
+  std::unique_ptr<OobAttempt> makeAttemptCapturingHeaders(std::string& captured_authority,
+                                                          std::string& captured_scheme) {
     auto attempt = std::make_unique<OobAttempt>();
     attempt->network_connection = new NiceMock<Network::MockClientConnection>();
     attempt->codec = new NiceMock<Http::MockClientConnection>();
@@ -220,32 +221,12 @@ protected:
         .WillOnce(testing::DoAll(SaveArgAddress(&attempt->response_decoder),
                                  testing::ReturnRef(*attempt->request_encoder)));
     EXPECT_CALL(*attempt->request_encoder, encodeHeaders(_, false))
-        .WillOnce(testing::Invoke(
-            [&captured_authority](const Http::RequestHeaderMap& h, bool) -> absl::Status {
-              captured_authority = std::string(h.getHostValue());
-              return absl::OkStatus();
-            }));
-    EXPECT_CALL(*attempt->request_encoder, encodeData(_, true));
-    ON_CALL(*attempt->network_connection, close(_, _)).WillByDefault(testing::Return());
-    ON_CALL(*attempt->network_connection, close(_)).WillByDefault(testing::Return());
-    return attempt;
-  }
-
-  // Like makeAttemptCapturingAuthority but captures the :scheme pseudo-header instead.
-  std::unique_ptr<OobAttempt> makeAttemptCapturingScheme(std::string& captured_scheme) {
-    auto attempt = std::make_unique<OobAttempt>();
-    attempt->network_connection = new NiceMock<Network::MockClientConnection>();
-    attempt->codec = new NiceMock<Http::MockClientConnection>();
-    attempt->request_encoder = std::make_unique<NiceMock<Http::MockRequestEncoder>>();
-    EXPECT_CALL(*attempt->codec, newStream(_))
-        .WillOnce(testing::DoAll(SaveArgAddress(&attempt->response_decoder),
-                                 testing::ReturnRef(*attempt->request_encoder)));
-    EXPECT_CALL(*attempt->request_encoder, encodeHeaders(_, false))
-        .WillOnce(testing::Invoke(
-            [&captured_scheme](const Http::RequestHeaderMap& h, bool) -> absl::Status {
-              captured_scheme = std::string(h.getSchemeValue());
-              return absl::OkStatus();
-            }));
+        .WillOnce(testing::Invoke([&captured_authority, &captured_scheme](
+                                      const Http::RequestHeaderMap& h, bool) -> absl::Status {
+          captured_authority = std::string(h.getHostValue());
+          captured_scheme = std::string(h.getSchemeValue());
+          return absl::OkStatus();
+        }));
     EXPECT_CALL(*attempt->request_encoder, encodeData(_, true));
     ON_CALL(*attempt->network_connection, close(_, _)).WillByDefault(testing::Return());
     ON_CALL(*attempt->network_connection, close(_)).WillByDefault(testing::Return());
@@ -915,7 +896,8 @@ TEST_F(OrcaOobManagerWireTest, AuthorityOverrideUsedInRequestHeaders) {
   priority_set_.runUpdateCallbacks(0, {host}, {});
 
   std::string captured_authority;
-  auto attempt = makeAttemptCapturingAuthority(captured_authority);
+  std::string captured_scheme;
+  auto attempt = makeAttemptCapturingHeaders(captured_authority, captured_scheme);
   wireConnectionFor(host, *attempt);
   expectCreateCodecClient(*manager, *attempt);
   attempt_timer->invokeCallback();
@@ -935,8 +917,9 @@ TEST_F(OrcaOobManagerWireTest, SchemeIsHttpForPlaintextConnection) {
   auto host = makeWiredHost();
   priority_set_.runUpdateCallbacks(0, {host}, {});
 
+  std::string captured_authority;
   std::string captured_scheme;
-  auto attempt = makeAttemptCapturingScheme(captured_scheme);
+  auto attempt = makeAttemptCapturingHeaders(captured_authority, captured_scheme);
   // Plaintext: ssl() returns nullptr (default for NiceMock<MockClientConnection>).
   ON_CALL(*attempt->network_connection, ssl()).WillByDefault(Return(nullptr));
   wireConnectionFor(host, *attempt);
@@ -959,8 +942,9 @@ TEST_F(OrcaOobManagerWireTest, SchemeIsHttpsForTlsConnection) {
   auto host = makeWiredHost();
   priority_set_.runUpdateCallbacks(0, {host}, {});
 
+  std::string captured_authority;
   std::string captured_scheme;
-  auto attempt = makeAttemptCapturingScheme(captured_scheme);
+  auto attempt = makeAttemptCapturingHeaders(captured_authority, captured_scheme);
   // TLS: ssl() returns a non-null MockConnectionInfo, simulating an SslSocket whose
   // ConnectionInfo is created in the constructor (before handshake completes).
   auto ssl_info = std::make_shared<NiceMock<Ssl::MockConnectionInfo>>();
