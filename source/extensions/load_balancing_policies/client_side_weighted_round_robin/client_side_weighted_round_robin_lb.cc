@@ -124,11 +124,12 @@ ClientSideWeightedRoundRobinLoadBalancer::ClientSideWeightedRoundRobinLoadBalanc
   // (OrcaWeightManager attaches OrcaHostLbPolicyData) before member callbacks (OrcaOobManager
   // opens the session), so the data is in place before the first OOB report.
   if (typed_lb_config->enable_oob_load_report) {
+    Extensions::LoadBalancingPolicies::Common::OrcaOobManagerConfig oob_config;
+    oob_config.reporting_period = typed_lb_config->oob_reporting_period;
     orca_oob_manager_ =
         std::make_unique<Extensions::LoadBalancingPolicies::Common::ProdOrcaOobManager>(
-            typed_lb_config->oob_reporting_period, priority_set,
-            typed_lb_config->main_thread_dispatcher_, random, cluster_info.statsScope(),
-            orca_weight_manager_->reportHandler());
+            std::move(oob_config), priority_set, typed_lb_config->main_thread_dispatcher_, random,
+            cluster_info.statsScope(), orca_weight_manager_->reportHandler());
   }
 }
 

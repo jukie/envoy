@@ -50,6 +50,24 @@ public:
               (Upstream::Host::CreateConnectionData & data));
 };
 
+// MockHost subclass that captures the transport_socket_options argument passed to
+// createOrcaReportingConnection before delegating to the base class mock machinery.
+// Needed because MockHostLight::createOrcaReportingConnection discards the options arg.
+class CapturingMockHost : public NiceMock<Upstream::MockHost> {
+public:
+  Upstream::Host::CreateConnectionData createOrcaReportingConnection(
+      Event::Dispatcher& dispatcher,
+      Network::TransportSocketOptionsConstSharedPtr transport_socket_options,
+      const envoy::config::core::v3::Metadata* metadata,
+      Network::Address::InstanceConstSharedPtr address_override = nullptr) const override {
+    last_transport_socket_options_ = transport_socket_options;
+    return Upstream::MockHostLight::createOrcaReportingConnection(
+        dispatcher, transport_socket_options, metadata, address_override);
+  }
+
+  mutable Network::TransportSocketOptionsConstSharedPtr last_transport_socket_options_;
+};
+
 class OrcaOobManagerLifecycleTest : public testing::Test, public Event::TestUsingSimulatedTime {
 protected:
   void SetUp() override {
@@ -61,9 +79,14 @@ protected:
   }
 
   std::unique_ptr<TestOrcaOobManager> makeManager() {
-    return std::make_unique<TestOrcaOobManager>(std::chrono::seconds(10), priority_set_,
-                                                dispatcher_, random_, *stats_store_.rootScope(),
-                                                report_handler_);
+    OrcaOobManagerConfig config;
+    config.reporting_period = std::chrono::seconds(10);
+    return makeManager(config);
+  }
+
+  std::unique_ptr<TestOrcaOobManager> makeManager(const OrcaOobManagerConfig& config) {
+    return std::make_unique<TestOrcaOobManager>(config, priority_set_, dispatcher_, random_,
+                                                *stats_store_.rootScope(), report_handler_);
   }
 
   uint64_t activeOobSessions() {
@@ -730,6 +753,47 @@ TEST_F(OrcaOobManagerWireTest, SyncLocalCloseDuringTearDownDoesNotDoubleCount) {
   // codec_client_ and returns; stream_failures stays at 1.
   attempt->codec_client->raiseGoAway(Http::GoAwayErrorCode::Other);
   EXPECT_EQ(oobCounter("stream_failures"), 1);
+}
+
+// Verifies that every OOB connection attempt is made with ALPN forced to "h2".
+// OOB reporting is always gRPC-over-HTTP/2, regardless of the main host's
+// negotiated protocol. CapturingMockHost intercepts the transport_socket_options
+// arg that MockHostLight::createOrcaReportingConnection normally discards.
+TEST_F(OrcaOobManagerWireTest, AlpnForcedToH2OnEveryOobConnection) {
+  auto manager = makeManager();
+  ASSERT_OK(manager->initialize());
+
+  auto* attempt_timer = installAttemptTimer();
+
+  // Use a CapturingMockHost so we can inspect transport_socket_options.
+  auto host = std::make_shared<CapturingMockHost>();
+  auto address = *Network::Utility::resolveUrl("tcp://10.0.0.2:80");
+  addresses_.push_back(address);
+  ON_CALL(*host, address()).WillByDefault(testing::Return(address));
+  ON_CALL(*host, hostname()).WillByDefault(testing::ReturnRef(empty_hostname_));
+  priority_set_.runUpdateCallbacks(0, {host}, {});
+
+  auto attempt = makeAttempt();
+  // Wire via the host's createConnection_ mock (createOrcaReportingConnection delegates to it).
+  host_description_for_codec_ = std::make_shared<NiceMock<Upstream::MockHostDescription>>();
+  EXPECT_CALL(*host, createConnection_(_, _))
+      .WillOnce(testing::InvokeWithoutArgs([this, &attempt]() {
+        Upstream::MockHostLight::MockCreateConnectionData data;
+        data.connection_ = attempt->network_connection;
+        data.host_description_ = host_description_for_codec_;
+        return data;
+      }));
+  expectCreateCodecClient(*manager, *attempt);
+  attempt_timer->invokeCallback();
+
+  // The CapturingMockHost must have captured a non-null transport_socket_options
+  // with ALPN override exactly {"h2"}.
+  ASSERT_NE(host->last_transport_socket_options_, nullptr);
+  EXPECT_THAT(host->last_transport_socket_options_->applicationProtocolListOverride(),
+              testing::ElementsAre("h2"));
+
+  EXPECT_CALL(dispatcher_, deferredDelete_(_)).Times(AtLeast(1));
+  manager.reset();
 }
 
 TEST(ParseOrcaOobManagerConfigTest, EmptyProtoYieldsDefaults) {
