@@ -10,6 +10,7 @@
 #include "source/common/http/headers.h"
 #include "source/common/http/utility.h"
 #include "source/common/network/transport_socket_options_impl.h"
+#include "source/common/network/utility.h"
 #include "source/common/protobuf/protobuf.h"
 #include "source/common/protobuf/utility.h"
 
@@ -142,6 +143,10 @@ OrcaOobManager::OobSession::OobSession(OrcaOobManager& parent, Upstream::HostCon
   attempt_timer_->enableTimer(initial_delay);
   inactivity_timer_ =
       parent_.dispatcher_.createTimer([this]() { handleTransientFailure("inactivity timeout"); });
+  if (parent_.config_.port_value != 0 && host_->address()->ip() == nullptr) {
+    ENVOY_LOG(warn, "ORCA OOB port_value override ({}) ignored for host {} with non-IP address",
+              parent_.config_.port_value, host_->address()->asString());
+  }
 }
 
 OrcaOobManager::OobSession::~OobSession() { ASSERT(codec_client_ == nullptr); }
@@ -249,8 +254,16 @@ void OrcaOobManager::OobSession::connectAndStream() {
   ASSERT(codec_client_ == nullptr);
   resetState();
 
+  // Apply the policy-level port override. Skipped for non-IP (pipe/UDS) hosts.
+  Network::Address::InstanceConstSharedPtr address_override;
+  if (parent_.config_.port_value != 0 && host_->address()->ip() != nullptr) {
+    address_override =
+        Network::Utility::getAddressWithPort(*host_->address(), parent_.config_.port_value);
+  }
+
   Upstream::Host::CreateConnectionData connection_data = host_->createOrcaReportingConnection(
-      parent_.dispatcher_, parent_.alpn_options_, /*metadata=*/nullptr);
+      parent_.dispatcher_, parent_.alpn_options_,
+      parent_.config_.transport_socket_match_metadata.get(), address_override);
   codec_client_ = parent_.createCodecClient(connection_data);
   if (codec_client_ == nullptr) {
     parent_.oob_stats_.stream_failures_.inc();
@@ -371,6 +384,10 @@ void OrcaOobManager::OobSession::resetState() {
 }
 
 std::string OrcaOobManager::OobSession::authority() const {
+  // Explicit policy-level authority wins over everything.
+  if (!parent_.config_.authority.empty()) {
+    return parent_.config_.authority;
+  }
   if (!host_->hostname().empty()) {
     return std::string(host_->hostname());
   }

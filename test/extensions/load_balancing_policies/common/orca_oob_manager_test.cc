@@ -50,9 +50,9 @@ public:
               (Upstream::Host::CreateConnectionData & data));
 };
 
-// MockHost subclass that captures the transport_socket_options argument passed to
-// createOrcaReportingConnection before delegating to the base class mock machinery.
-// Needed because MockHostLight::createOrcaReportingConnection discards the options arg.
+// MockHost subclass that captures all args passed to createOrcaReportingConnection before
+// delegating to the base class mock machinery.
+// Needed because MockHostLight::createOrcaReportingConnection discards its args.
 class CapturingMockHost : public NiceMock<Upstream::MockHost> {
 public:
   Upstream::Host::CreateConnectionData createOrcaReportingConnection(
@@ -61,11 +61,19 @@ public:
       const envoy::config::core::v3::Metadata* metadata,
       Network::Address::InstanceConstSharedPtr address_override = nullptr) const override {
     last_transport_socket_options_ = transport_socket_options;
+    last_address_override_ = address_override;
+    if (metadata != nullptr) {
+      last_metadata_ = std::make_unique<envoy::config::core::v3::Metadata>(*metadata);
+    } else {
+      last_metadata_.reset();
+    }
     return Upstream::MockHostLight::createOrcaReportingConnection(
         dispatcher, transport_socket_options, metadata, address_override);
   }
 
   mutable Network::TransportSocketOptionsConstSharedPtr last_transport_socket_options_;
+  mutable Network::Address::InstanceConstSharedPtr last_address_override_;
+  mutable std::unique_ptr<envoy::config::core::v3::Metadata> last_metadata_;
 };
 
 class OrcaOobManagerLifecycleTest : public testing::Test, public Event::TestUsingSimulatedTime {
@@ -200,6 +208,28 @@ protected:
     return attempt;
   }
 
+  // Like makeAttempt() but captures the :authority value passed to encodeHeaders into
+  // *captured_authority instead of hard-stubbing the return value.
+  std::unique_ptr<OobAttempt> makeAttemptCapturingAuthority(std::string& captured_authority) {
+    auto attempt = std::make_unique<OobAttempt>();
+    attempt->network_connection = new NiceMock<Network::MockClientConnection>();
+    attempt->codec = new NiceMock<Http::MockClientConnection>();
+    attempt->request_encoder = std::make_unique<NiceMock<Http::MockRequestEncoder>>();
+    EXPECT_CALL(*attempt->codec, newStream(_))
+        .WillOnce(testing::DoAll(SaveArgAddress(&attempt->response_decoder),
+                                 testing::ReturnRef(*attempt->request_encoder)));
+    EXPECT_CALL(*attempt->request_encoder, encodeHeaders(_, false))
+        .WillOnce(testing::Invoke(
+            [&captured_authority](const Http::RequestHeaderMap& h, bool) -> absl::Status {
+              captured_authority = std::string(h.getHostValue());
+              return absl::OkStatus();
+            }));
+    EXPECT_CALL(*attempt->request_encoder, encodeData(_, true));
+    ON_CALL(*attempt->network_connection, close(_, _)).WillByDefault(testing::Return());
+    ON_CALL(*attempt->network_connection, close(_)).WillByDefault(testing::Return());
+    return attempt;
+  }
+
   // Wire host->createOrcaReportingConnection (which delegates to MockHostLight::
   // createConnection_) to hand back the network_connection raw ptr we control.
   void wireConnectionFor(Upstream::HostSharedPtr host, OobAttempt& attempt) {
@@ -257,6 +287,30 @@ protected:
     addresses_.push_back(address);
     ON_CALL(*host, address()).WillByDefault(testing::Return(address));
     ON_CALL(*host, hostname()).WillByDefault(testing::ReturnRef(empty_hostname_));
+    return host;
+  }
+
+  // Returns a CapturingMockHost with the given address string and empty hostname, and wires
+  // createConnection_ to hand back the network_connection from *attempt. Also sets up
+  // host_description_for_codec_ and calls expectCreateCodecClient. Callers invoke
+  // attempt_timer->invokeCallback() to trigger connectAndStream.
+  std::shared_ptr<CapturingMockHost> makeWiredCapturingHost(absl::string_view address_url,
+                                                            TestOrcaOobManager& manager,
+                                                            OobAttempt& attempt) {
+    auto host = std::make_shared<CapturingMockHost>();
+    auto address = *Network::Utility::resolveUrl(std::string(address_url));
+    addresses_.push_back(address);
+    ON_CALL(*host, address()).WillByDefault(testing::Return(address));
+    ON_CALL(*host, hostname()).WillByDefault(testing::ReturnRef(empty_hostname_));
+    host_description_for_codec_ = std::make_shared<NiceMock<Upstream::MockHostDescription>>();
+    EXPECT_CALL(*host, createConnection_(_, _))
+        .WillOnce(testing::InvokeWithoutArgs([this, &attempt]() {
+          Upstream::MockHostLight::MockCreateConnectionData data;
+          data.connection_ = attempt.network_connection;
+          data.host_description_ = host_description_for_codec_;
+          return data;
+        }));
+    expectCreateCodecClient(manager, attempt);
     return host;
   }
 
@@ -764,26 +818,10 @@ TEST_F(OrcaOobManagerWireTest, AlpnForcedToH2OnEveryOobConnection) {
   ASSERT_OK(manager->initialize());
 
   auto* attempt_timer = installAttemptTimer();
-
-  // Use a CapturingMockHost so we can inspect transport_socket_options.
-  auto host = std::make_shared<CapturingMockHost>();
-  auto address = *Network::Utility::resolveUrl("tcp://10.0.0.2:80");
-  addresses_.push_back(address);
-  ON_CALL(*host, address()).WillByDefault(testing::Return(address));
-  ON_CALL(*host, hostname()).WillByDefault(testing::ReturnRef(empty_hostname_));
+  auto attempt = makeAttempt();
+  auto host = makeWiredCapturingHost("tcp://10.0.0.2:80", *manager, *attempt);
   priority_set_.runUpdateCallbacks(0, {host}, {});
 
-  auto attempt = makeAttempt();
-  // Wire via the host's createConnection_ mock (createOrcaReportingConnection delegates to it).
-  host_description_for_codec_ = std::make_shared<NiceMock<Upstream::MockHostDescription>>();
-  EXPECT_CALL(*host, createConnection_(_, _))
-      .WillOnce(testing::InvokeWithoutArgs([this, &attempt]() {
-        Upstream::MockHostLight::MockCreateConnectionData data;
-        data.connection_ = attempt->network_connection;
-        data.host_description_ = host_description_for_codec_;
-        return data;
-      }));
-  expectCreateCodecClient(*manager, *attempt);
   attempt_timer->invokeCallback();
 
   // The CapturingMockHost must have captured a non-null transport_socket_options
@@ -791,6 +829,75 @@ TEST_F(OrcaOobManagerWireTest, AlpnForcedToH2OnEveryOobConnection) {
   ASSERT_NE(host->last_transport_socket_options_, nullptr);
   EXPECT_THAT(host->last_transport_socket_options_->applicationProtocolListOverride(),
               testing::ElementsAre("h2"));
+
+  EXPECT_CALL(dispatcher_, deferredDelete_(_)).Times(AtLeast(1));
+  manager.reset();
+}
+
+// Test that port_value overrides the port in the address passed to createOrcaReportingConnection.
+TEST_F(OrcaOobManagerWireTest, PortOverrideRedialsOnOverridePort) {
+  OrcaOobManagerConfig config;
+  config.reporting_period = std::chrono::seconds(10);
+  config.port_value = 9001;
+  auto manager = makeManager(config);
+  ASSERT_OK(manager->initialize());
+
+  auto* attempt_timer = installAttemptTimer();
+  auto attempt = makeAttempt();
+  auto host = makeWiredCapturingHost("tcp://1.2.3.4:80", *manager, *attempt);
+  priority_set_.runUpdateCallbacks(0, {host}, {});
+
+  attempt_timer->invokeCallback();
+
+  // The address override must have port 9001 with the host IP 1.2.3.4.
+  ASSERT_NE(host->last_address_override_, nullptr);
+  EXPECT_EQ(host->last_address_override_->asString(), "1.2.3.4:9001");
+
+  EXPECT_CALL(dispatcher_, deferredDelete_(_)).Times(AtLeast(1));
+  manager.reset();
+}
+
+// Test that transport_socket_match_criteria is forwarded as metadata to
+// createOrcaReportingConnection with the "envoy.transport_socket_match" filter metadata key.
+TEST_F(OrcaOobManagerWireTest, TransportSocketMatchCriteriaPassedAsMetadata) {
+  envoy::extensions::load_balancing_policies::common::v3::OrcaOobReportingConfig proto;
+  (*proto.mutable_transport_socket_match_criteria()->mutable_fields())["useMTLS"].set_bool_value(
+      true);
+  auto manager = makeManager(parseOrcaOobManagerConfig(proto));
+  ASSERT_OK(manager->initialize());
+
+  auto* attempt_timer = installAttemptTimer();
+  auto attempt = makeAttempt();
+  auto host = makeWiredCapturingHost("tcp://10.0.0.3:80", *manager, *attempt);
+  priority_set_.runUpdateCallbacks(0, {host}, {});
+
+  attempt_timer->invokeCallback();
+
+  // Metadata must be non-null and contain the transport socket match key.
+  ASSERT_NE(host->last_metadata_, nullptr);
+  EXPECT_TRUE(host->last_metadata_->filter_metadata().contains("envoy.transport_socket_match"));
+
+  EXPECT_CALL(dispatcher_, deferredDelete_(_)).Times(AtLeast(1));
+  manager.reset();
+}
+
+// Test that config_.authority overrides the :authority header in the gRPC request.
+TEST_F(OrcaOobManagerWireTest, AuthorityOverrideUsedInRequestHeaders) {
+  envoy::extensions::load_balancing_policies::common::v3::OrcaOobReportingConfig proto;
+  proto.set_authority("orca.example.com");
+  auto manager = makeManager(parseOrcaOobManagerConfig(proto));
+  ASSERT_OK(manager->initialize());
+
+  auto* attempt_timer = installAttemptTimer();
+  auto host = makeWiredHost();
+  priority_set_.runUpdateCallbacks(0, {host}, {});
+
+  std::string captured_authority;
+  auto attempt = makeAttemptCapturingAuthority(captured_authority);
+  wireConnectionFor(host, *attempt);
+  expectCreateCodecClient(*manager, *attempt);
+  attempt_timer->invokeCallback();
+  EXPECT_EQ(captured_authority, "orca.example.com");
 
   EXPECT_CALL(dispatcher_, deferredDelete_(_)).Times(AtLeast(1));
   manager.reset();
