@@ -4,8 +4,10 @@
 #include <memory>
 
 #include "envoy/common/random_generator.h"
+#include "envoy/config/core/v3/base.pb.h"
 #include "envoy/event/dispatcher.h"
 #include "envoy/event/timer.h"
+#include "envoy/extensions/load_balancing_policies/common/v3/common.pb.h"
 #include "envoy/grpc/status.h"
 #include "envoy/http/codec.h"
 #include "envoy/network/connection.h"
@@ -40,6 +42,21 @@ namespace Common {
 struct OrcaOobStats {
   ALL_ORCA_OOB_STATS(GENERATE_COUNTER_STRUCT, GENERATE_GAUGE_STRUCT)
 };
+
+// Parsed, validated form of OrcaOobReportingConfig consumed by OrcaOobManager.
+// Reusable by any load balancing policy that drives ORCA OOB reporting.
+struct OrcaOobManagerConfig {
+  std::chrono::milliseconds reporting_period{10000};
+  uint32_t port_value{0};
+  std::string authority;
+  // Synthetic endpoint metadata carrying transport_socket_match_criteria under
+  // the "envoy.transport_socket_match" key; nullptr when no criteria are set.
+  std::shared_ptr<const envoy::config::core::v3::Metadata> transport_socket_match_metadata;
+};
+
+// Translates the proto config into OrcaOobManagerConfig, applying defaults.
+OrcaOobManagerConfig parseOrcaOobManagerConfig(
+    const envoy::extensions::load_balancing_policies::common::v3::OrcaOobReportingConfig& proto);
 
 /**
  * Cluster-level manager owning per-host ORCA OOB streams. Modeled on

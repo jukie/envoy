@@ -142,6 +142,7 @@ envoy_cc_test(
         "//test/test_common:simulated_time_system_lib",
         "//test/test_common:status_utility_lib",
         "//test/test_common:utility_lib",
+        "@envoy_api//envoy/extensions/load_balancing_policies/common/v3:pkg_cc_proto",
         "@xds//xds/data/orca/v3:pkg_cc_proto",
     ],
 )

@@ -4,11 +4,13 @@
 #include "envoy/upstream/upstream.h"
 
 #include "source/common/buffer/zero_copy_input_stream_impl.h"
+#include "source/common/config/well_known_names.h"
 #include "source/common/grpc/common.h"
 #include "source/common/http/codec_client.h"
 #include "source/common/http/headers.h"
 #include "source/common/http/utility.h"
 #include "source/common/protobuf/protobuf.h"
+#include "source/common/protobuf/utility.h"
 
 #include "xds/service/orca/v3/orca.pb.h"
 
@@ -31,6 +33,23 @@ constexpr uint64_t kInactivityWatchdogMultiplier = 3;
 // Max allowed size of a single gRPC frame accepted on an OOB OrcaLoadReport stream.
 constexpr uint32_t kMaxOrcaReportFrameBytes = 64 * 1024;
 } // namespace
+
+OrcaOobManagerConfig parseOrcaOobManagerConfig(
+    const envoy::extensions::load_balancing_policies::common::v3::OrcaOobReportingConfig& proto) {
+  OrcaOobManagerConfig config;
+  config.reporting_period =
+      std::chrono::milliseconds(PROTOBUF_GET_MS_OR_DEFAULT(proto, reporting_period, 10000));
+  config.port_value = proto.port_value();
+  config.authority = proto.authority();
+  if (proto.has_transport_socket_match_criteria()) {
+    auto metadata = std::make_shared<envoy::config::core::v3::Metadata>();
+    (*metadata->mutable_filter_metadata())[Envoy::Config::MetadataFilters::get()
+                                               .ENVOY_TRANSPORT_SOCKET_MATCH] =
+        proto.transport_socket_match_criteria();
+    config.transport_socket_match_metadata = std::move(metadata);
+  }
+  return config;
+}
 
 OrcaOobManager::OrcaOobManager(std::chrono::milliseconds reporting_period,
                                const Upstream::PrioritySet& priority_set,

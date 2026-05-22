@@ -2,6 +2,7 @@
 #include <memory>
 #include <sstream>
 
+#include "envoy/extensions/load_balancing_policies/common/v3/common.pb.h"
 #include "envoy/upstream/upstream.h"
 
 #include "source/common/buffer/buffer_impl.h"
@@ -729,6 +730,37 @@ TEST_F(OrcaOobManagerWireTest, SyncLocalCloseDuringTearDownDoesNotDoubleCount) {
   // codec_client_ and returns; stream_failures stays at 1.
   attempt->codec_client->raiseGoAway(Http::GoAwayErrorCode::Other);
   EXPECT_EQ(oobCounter("stream_failures"), 1);
+}
+
+TEST(ParseOrcaOobManagerConfigTest, EmptyProtoYieldsDefaults) {
+  envoy::extensions::load_balancing_policies::common::v3::OrcaOobReportingConfig proto;
+  OrcaOobManagerConfig config = parseOrcaOobManagerConfig(proto);
+  EXPECT_EQ(config.reporting_period, std::chrono::milliseconds(10000));
+  EXPECT_EQ(config.port_value, 0u);
+  EXPECT_TRUE(config.authority.empty());
+  EXPECT_EQ(config.transport_socket_match_metadata, nullptr);
+}
+
+TEST(ParseOrcaOobManagerConfigTest, PopulatedProtoIsParsed) {
+  envoy::extensions::load_balancing_policies::common::v3::OrcaOobReportingConfig proto;
+  proto.mutable_reporting_period()->set_seconds(7);
+  proto.set_port_value(9001);
+  proto.set_authority("backend.example.com");
+  (*proto.mutable_transport_socket_match_criteria()->mutable_fields())["useMTLS"].set_bool_value(
+      true);
+
+  OrcaOobManagerConfig config = parseOrcaOobManagerConfig(proto);
+  EXPECT_EQ(config.reporting_period, std::chrono::milliseconds(7000));
+  EXPECT_EQ(config.port_value, 9001u);
+  EXPECT_EQ(config.authority, "backend.example.com");
+  ASSERT_NE(config.transport_socket_match_metadata, nullptr);
+  EXPECT_TRUE(config.transport_socket_match_metadata->filter_metadata().contains(
+      "envoy.transport_socket_match"));
+  EXPECT_TRUE(config.transport_socket_match_metadata->filter_metadata()
+                  .at("envoy.transport_socket_match")
+                  .fields()
+                  .at("useMTLS")
+                  .bool_value());
 }
 
 } // namespace
