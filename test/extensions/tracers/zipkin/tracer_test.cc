@@ -37,6 +37,15 @@ private:
 
 class ZipkinTracerTest : public testing::Test {
 protected:
+  // Returns the current monotonic clock value as 32-bit epoch seconds, matching
+  // the upper-32-bits format used by Tracer::generateTraceId() when
+  // timestamp_trace_ids is enabled.
+  uint32_t getExpectedMonotonicTimestamp() const {
+    return static_cast<uint32_t>(std::chrono::duration_cast<std::chrono::seconds>(
+                                     time_system_.monotonicTime().time_since_epoch())
+                                     .count());
+  }
+
   Event::SimulatedTimeSystem time_system_;
 };
 
@@ -739,11 +748,8 @@ TEST_F(ZipkinTracerTest, TimestampTraceIds) {
   uint32_t extracted_random = static_cast<uint32_t>(trace_id & 0xFFFFFFFF);
 
   // Verify timestamp is approximately correct (within 1 second)
-  uint32_t expected_timestamp =
-      static_cast<uint32_t>(std::chrono::duration_cast<std::chrono::seconds>(
-                                time_system_.monotonicTime().time_since_epoch())
-                                .count());
-  EXPECT_LE(std::abs(static_cast<int32_t>(extracted_timestamp - expected_timestamp)), 1);
+  EXPECT_LE(std::abs(static_cast<int32_t>(extracted_timestamp - getExpectedMonotonicTimestamp())),
+            1);
 
   // Verify random part matches what we mocked
   EXPECT_EQ(0x12345678U, extracted_random);
@@ -781,17 +787,14 @@ TEST_F(ZipkinTracerTest, TimestampTraceIds128bit) {
 
   uint32_t extracted_timestamp_high = static_cast<uint32_t>(trace_id_high >> 32);
 
-  uint32_t expected_timestamp =
-      static_cast<uint32_t>(std::chrono::duration_cast<std::chrono::seconds>(
-                                time_system_.monotonicTime().time_since_epoch())
-                                .count());
-
   // High part should have the timestamp prefix
-  EXPECT_LE(std::abs(static_cast<int32_t>(extracted_timestamp_high - expected_timestamp)), 1);
+  EXPECT_LE(
+      std::abs(static_cast<int32_t>(extracted_timestamp_high - getExpectedMonotonicTimestamp())),
+      1);
 }
 
 // Back-compat: when timestamping is disabled, trace id == span id for root spans (64-bit)
-TEST_F(ZipkinTracerTest, RootSpanTraceIdEqualsSpanIdWhenTimestampDisabled) {
+
   Network::Address::InstanceConstSharedPtr addr =
       Network::Utility::parseInternetAddressAndPortNoThrow("127.0.0.1:9000");
   NiceMock<Random::MockRandomGenerator> random_generator;

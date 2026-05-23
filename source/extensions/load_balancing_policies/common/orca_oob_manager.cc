@@ -94,7 +94,6 @@ OrcaOobStats OrcaOobManager::generateOrcaOobStats(Stats::Scope& scope) {
 }
 
 void OrcaOobManager::onHostsAdded(const Upstream::HostVector& hosts) {
-  const size_t prior_size = oob_sessions_.size();
   for (const Upstream::HostSharedPtr& host : hosts) {
     auto [it, inserted] = oob_sessions_.try_emplace(host, nullptr);
     if (!inserted) {
@@ -104,13 +103,10 @@ void OrcaOobManager::onHostsAdded(const Upstream::HostVector& hosts) {
     const std::chrono::milliseconds initial_delay(random_.random() % period_ms);
     it->second = std::make_unique<OobSession>(*this, host, initial_delay);
   }
-  if (oob_sessions_.size() != prior_size) {
-    oob_stats_.active_sessions_.set(oob_sessions_.size());
-  }
+  oob_stats_.active_sessions_.set(oob_sessions_.size());
 }
 
 void OrcaOobManager::onHostsRemoved(const Upstream::HostVector& hosts) {
-  const size_t prior_size = oob_sessions_.size();
   for (const Upstream::HostSharedPtr& host : hosts) {
     auto it = oob_sessions_.find(host);
     if (it == oob_sessions_.end()) {
@@ -120,9 +116,7 @@ void OrcaOobManager::onHostsRemoved(const Upstream::HostVector& hosts) {
     dispatcher_.deferredDelete(std::move(it->second));
     oob_sessions_.erase(it);
   }
-  if (oob_sessions_.size() != prior_size) {
-    oob_stats_.active_sessions_.set(oob_sessions_.size());
-  }
+  oob_stats_.active_sessions_.set(oob_sessions_.size());
 }
 
 void OrcaOobManager::onSessionTerminated(OobSession* session) {

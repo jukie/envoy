@@ -48,32 +48,39 @@ TEST(ClientSideWeightedRoundRobinConfigTest, ValidateFail) {
   EXPECT_NE(nullptr, thread_local_lb);
 }
 
-TEST(CswrrOobConfigResolution, EnableOobLoadReportEnablesWithPeriod) {
-  envoy::extensions::load_balancing_policies::client_side_weighted_round_robin::v3::
-      ClientSideWeightedRoundRobin proto;
+using CswrrProto = envoy::extensions::load_balancing_policies::
+    client_side_weighted_round_robin::v3::ClientSideWeightedRoundRobin;
+
+class CswrrOobConfigResolution : public testing::Test {
+protected:
+  Upstream::ClientSideWeightedRoundRobinLbConfig makeConfig(const CswrrProto& proto) {
+    return Upstream::ClientSideWeightedRoundRobinLbConfig(proto, dispatcher_, tls_);
+  }
+
+  NiceMock<Event::MockDispatcher> dispatcher_;
+  NiceMock<ThreadLocal::MockInstance> tls_;
+};
+
+TEST_F(CswrrOobConfigResolution, EnableOobLoadReportEnablesWithPeriod) {
+  CswrrProto proto;
   proto.mutable_enable_oob_load_report()->set_value(true);
   proto.mutable_oob_reporting_period()->set_seconds(42);
 
-  NiceMock<Event::MockDispatcher> dispatcher;
-  NiceMock<ThreadLocal::MockInstance> tls;
-  Upstream::ClientSideWeightedRoundRobinLbConfig config(proto, dispatcher, tls);
+  auto config = makeConfig(proto);
 
   EXPECT_TRUE(config.oob_enabled);
   EXPECT_EQ(config.oob_manager_config.reporting_period, std::chrono::milliseconds(42000));
 }
 
-TEST(CswrrOobConfigResolution, OobReportingConfigOverridesParsed) {
-  envoy::extensions::load_balancing_policies::client_side_weighted_round_robin::v3::
-      ClientSideWeightedRoundRobin proto;
+TEST_F(CswrrOobConfigResolution, OobReportingConfigOverridesParsed) {
+  CswrrProto proto;
   proto.mutable_enable_oob_load_report()->set_value(true);
   proto.mutable_oob_reporting_period()->set_seconds(5);
   auto* overrides = proto.mutable_oob_reporting_config();
   overrides->set_port_value(9001);
   overrides->set_authority("orca.example.com");
 
-  NiceMock<Event::MockDispatcher> dispatcher;
-  NiceMock<ThreadLocal::MockInstance> tls;
-  Upstream::ClientSideWeightedRoundRobinLbConfig config(proto, dispatcher, tls);
+  auto config = makeConfig(proto);
 
   EXPECT_TRUE(config.oob_enabled);
   EXPECT_EQ(config.oob_manager_config.reporting_period, std::chrono::milliseconds(5000));
@@ -82,14 +89,11 @@ TEST(CswrrOobConfigResolution, OobReportingConfigOverridesParsed) {
 }
 
 // oob_reporting_config without enable_oob_load_report=true: accepted, overrides unused.
-TEST(CswrrOobConfigResolution, OobReportingConfigIgnoredWhenNotEnabled) {
-  envoy::extensions::load_balancing_policies::client_side_weighted_round_robin::v3::
-      ClientSideWeightedRoundRobin proto;
+TEST_F(CswrrOobConfigResolution, OobReportingConfigIgnoredWhenNotEnabled) {
+  CswrrProto proto;
   proto.mutable_oob_reporting_config()->set_port_value(9001);
 
-  NiceMock<Event::MockDispatcher> dispatcher;
-  NiceMock<ThreadLocal::MockInstance> tls;
-  Upstream::ClientSideWeightedRoundRobinLbConfig config(proto, dispatcher, tls);
+  auto config = makeConfig(proto);
 
   EXPECT_FALSE(config.oob_enabled);
 }
