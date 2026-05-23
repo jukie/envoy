@@ -29,6 +29,16 @@
 
 namespace Envoy {
 namespace Extensions {
+/**
+ * Populate connection-override fields of an OrcaOobManagerConfig from an ORCA reporting proto.
+ *
+ * Copies connection-related override values present in `proto` (such as port, authority, and
+ * optional transport-socket-match metadata) into `config`. Only fields set in `proto` are applied;
+ * other fields in `config` are left unchanged.
+ *
+ * @param proto ORCA OOB reporting configuration proto to read overrides from.
+ * @param config Resolved manager configuration to be updated with connection overrides.
+ */
 namespace LoadBalancingPolicies {
 namespace Common {
 

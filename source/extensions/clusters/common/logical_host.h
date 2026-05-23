@@ -6,6 +6,68 @@
 
 #include "source/common/upstream/upstream_impl.h"
 
+/**
+ * Create a LogicalHost for the given cluster, hostname, addresses, and endpoint metadata.
+ * @param cluster The cluster this host belongs to.
+ * @param hostname The host's configured hostname.
+ * @param address The primary address for the host.
+ * @param address_list Alternative addresses for the host; the first element must match `address`.
+ * @param locality_lb_endpoint Locality load-balancing endpoint metadata associated with the host.
+ * @param lb_endpoint Load-balanced endpoint protobuf for the host.
+ * @param override_transport_socket_options Optional transport socket options to override cluster defaults.
+ * @return A unique_ptr to a constructed LogicalHost on success, or an error Status on failure.
+ */
+/**
+ * Sets new addresses for the logical host and updates associated endpoint metadata.
+ * This is thread-safe and may be called at runtime.
+ * @param address The primary address, also used for health checking.
+ * @param address_list Alternative addresses; the first element must be `address`.
+ * @param lb_endpoint The load-balanced endpoint protobuf corresponding to the new addresses.
+ */
+/**
+ * Create connection data using the host's current logical state.
+ * @param dispatcher Event dispatcher used to create the connection.
+ * @param options Connection socket options (may be null).
+ * @param transport_socket_options Transport socket options to use for the connection (may be null).
+ * @return CreateConnectionData describing the established upstream connection parameters.
+ */
+/**
+ * Create connection data intended for ORCA reporting, using either the host's current
+ * logical address state or an explicit address override.
+ * @param dispatcher Event dispatcher used to create the connection.
+ * @param transport_socket_options Transport socket options to use for the connection (may be null).
+ * @param metadata Optional metadata to consider when resolving transport sockets.
+ * @param address_override Optional address to use instead of the host's logical address; if null, the host's address is used.
+ * @return CreateConnectionData describing the established upstream connection parameters for ORCA reporting.
+ */
+/**
+ * Return the host's current address list, or null if none is set.
+ * @return SharedConstAddressVector holding the current addresses, or nullptr when no list exists.
+ */
+/**
+ * Return the host's current primary address.
+ * @return The primary Network::Address::InstanceConstSharedPtr for the host.
+ */
+/**
+ * Return the address used for health checking.
+ * @return The Network::Address::InstanceConstSharedPtr used for health checks, or nullptr if not set.
+ */
+/**
+ * Return the address used for ORCA reporting.
+ * @return The Network::Address::InstanceConstSharedPtr used for ORCA reporting, or nullptr if not set.
+ */
+/**
+ * Protected constructor used by create(...) to initialize a LogicalHost with the provided
+ * cluster, hostname, addresses, endpoint metadata, and optional transport socket options.
+ * @param cluster The cluster this host belongs to.
+ * @param hostname The host's configured hostname.
+ * @param address The primary address for the host.
+ * @param address_list Alternative addresses for the host; the first element must match `address`.
+ * @param locality_lb_endpoint Locality load-balancing endpoint metadata associated with the host.
+ * @param lb_endpoint Load-balanced endpoint protobuf for the host.
+ * @param override_transport_socket_options Optional transport socket options to override cluster defaults.
+ * @param creation_status Status object to populate on construction failure.
+ */
 namespace Envoy {
 namespace Upstream {
 

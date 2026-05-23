@@ -34,7 +34,17 @@ constexpr uint64_t kInactivityWatchdogMultiplier = 3;
 
 // Max allowed size of a single gRPC frame accepted on an OOB OrcaLoadReport stream.
 constexpr uint32_t kMaxOrcaReportFrameBytes = 64 * 1024;
-} // namespace
+} /**
+ * @brief Populate an OrcaOobManagerConfig from an ORCA OOB reporting proto.
+ *
+ * Copies the proto's `port_value` and `authority` into `config`. If the proto contains
+ * `transport_socket_match_criteria`, creates a shared `envoy::config::core::v3::Metadata`
+ * instance and stores the criteria under the `ENVOY_TRANSPORT_SOCKET_MATCH` filter metadata
+ * key on `config.transport_socket_match_metadata`.
+ *
+ * @param proto Source ORCA OOB reporting configuration proto.
+ * @param config Destination manager configuration to be updated in-place.
+ */
 
 void mergeOrcaOobConnectionOverrides(
     const envoy::extensions::load_balancing_policies::common::v3::OrcaOobReportingConfig& proto,
@@ -50,6 +60,22 @@ void mergeOrcaOobConnectionOverrides(
   }
 }
 
+/**
+ * @brief Construct an OrcaOobManager which manages per-host ORCA out-of-band sessions.
+ *
+ * Initializes manager state from the provided configuration and hooks into the given
+ * priority set and report handler to create and maintain per-host OOB streaming sessions.
+ *
+ * @param config Configuration for ORCA OOB sessions; ownership is moved into the manager.
+ * @param priority_set The upstream priority set whose host membership drives session lifecycle.
+ * @param dispatcher Event dispatcher used for timers and deferred deletions.
+ * @param random Random generator used to jitter initial session delays and backoff.
+ * @param stats_scope Scope used to create ORCA OOB statistics.
+ * @param report_handler Handler invoked to apply received ORCA load reports to client-side state.
+ *
+ * @note The constructor enforces that `config.reporting_period` is greater than zero.
+ * @note ALPN transport socket options are created with ALPN forced to "h2".
+ */
 OrcaOobManager::OrcaOobManager(OrcaOobManagerConfig config,
                                const Upstream::PrioritySet& priority_set,
                                Event::Dispatcher& dispatcher, Random::RandomGenerator& random,
@@ -65,6 +91,12 @@ OrcaOobManager::OrcaOobManager(OrcaOobManagerConfig config,
   ASSERT(config_.reporting_period.count() > 0);
 }
 
+/**
+ * @brief Cleanly shuts down all per-host OOB sessions and resets manager state.
+ *
+ * Disarms each active session, schedules them for deferred deletion via the dispatcher,
+ * clears the internal session map, and sets the active-sessions gauge to zero.
+ */
 OrcaOobManager::~OrcaOobManager() {
   for (auto& [host, session] : oob_sessions_) {
     session->disarm();
@@ -93,6 +125,16 @@ OrcaOobStats OrcaOobManager::generateOrcaOobStats(Stats::Scope& scope) {
                              POOL_GAUGE_PREFIX(scope, kOrcaOobStatsPrefix))};
 }
 
+/**
+ * @brief Initialize out-of-band (OOB) reporting sessions for newly added upstream hosts.
+ *
+ * For each host in `hosts` that does not already have an active session, allocates an
+ * OobSession owned by this manager and schedules its first connection attempt using a
+ * randomized initial delay in the range [0, reporting_period). If the total active
+ * session count changes, updates the `active_sessions_` gauge in stats.
+ *
+ * @param hosts Vector of upstream hosts to create OOB sessions for.
+ */
 void OrcaOobManager::onHostsAdded(const Upstream::HostVector& hosts) {
   const size_t prior_size = oob_sessions_.size();
   for (const Upstream::HostSharedPtr& host : hosts) {
@@ -133,6 +175,21 @@ void OrcaOobManager::onSessionTerminated(OobSession* session) {
   oob_stats_.active_sessions_.set(oob_sessions_.size());
 }
 
+/**
+ * @brief Create and initialize an ORCA out-of-band reporting session for a host.
+ *
+ * Constructs an OobSession that manages an OOB gRPC stream lifecycle for the given host,
+ * initializes jittered exponential backoff, and schedules the first connection attempt after
+ * the specified initial delay.
+ *
+ * @param parent Reference to the owning OrcaOobManager.
+ * @param host Upstream host for which this session will maintain an OOB stream. The host
+ *             must provide a non-null `orcaReportingAddress()`.
+ * @param initial_delay Delay before the initial connection attempt is made.
+ *
+ * @note If `parent.config_.port_value` is set and the host's ORCA reporting address is not
+ *       an IP address, the port override is ignored and a warning is emitted.
+ */
 OrcaOobManager::OobSession::OobSession(OrcaOobManager& parent, Upstream::HostConstSharedPtr host,
                                        std::chrono::milliseconds initial_delay)
     : parent_(parent), host_(std::move(host)),
@@ -151,6 +208,13 @@ OrcaOobManager::OobSession::OobSession(OrcaOobManager& parent, Upstream::HostCon
   }
 }
 
+/**
+ * @brief Ensures the session has no active codec client on destruction.
+ *
+ * @details The destructor asserts that `codec_client_` is `nullptr`, enforcing
+ * the invariant that the session's codec client must have been torn down
+ * before destruction.
+ */
 OrcaOobManager::OobSession::~OobSession() { ASSERT(codec_client_ == nullptr); }
 
 void OrcaOobManager::OobSession::disarm() {
@@ -252,6 +316,19 @@ void OrcaOobManager::OobSession::onGoAway(Http::GoAwayErrorCode error_code) {
   handleTransientFailure(absl::StrCat("goaway error code=", static_cast<uint32_t>(error_code)));
 }
 
+/**
+ * @brief Establishes an ORCA out-of-band gRPC stream to the session's host and sends the initial request.
+ *
+ * Attempts to create a codec client for the host's ORCA reporting address (applying the configured
+ * port override only when the address is IP-based). If a codec client is created, the method
+ * initializes and sends the gRPC headers and a single `OrcaLoadReportRequest` with `report_interval`
+ * set from the manager configuration, then enables the inactivity watchdog for the configured
+ * reporting period multiplied by the inactivity multiplier. The `:scheme` header is derived from
+ * whether the underlying connection uses TLS.
+ *
+ * On codec client creation failure, increments the stream-failure stat and schedules the next
+ * connection attempt via the attempt timer/backoff.
+ */
 void OrcaOobManager::OobSession::connectAndStream() {
   ASSERT(codec_client_ == nullptr);
   resetState();
@@ -308,6 +385,15 @@ void OrcaOobManager::OobSession::connectAndStream() {
 
   inactivity_timer_->enableTimer(parent_.config_.reporting_period * kInactivityWatchdogMultiplier);
 }
+/**
+ * @brief Handle network connection events for the OOB session.
+ *
+ * If the event indicates a successful connection (including 0-RTT), the call is a no-op.
+ * For any other connection event, if a codec client is active, the session treats the
+ * event as a connection closure and triggers transient-failure handling.
+ *
+ * @param event The network connection event received.
+ */
 void OrcaOobManager::OobSession::onConnectionEvent(Network::ConnectionEvent event) {
   if (event == Network::ConnectionEvent::Connected ||
       event == Network::ConnectionEvent::ConnectedZeroRtt) {
@@ -359,6 +445,17 @@ void OrcaOobManager::OobSession::onRpcComplete(Grpc::Status::GrpcStatus status,
   }
 }
 
+/**
+ * @brief Process an incoming ORCA load report for this session and apply its data to the host.
+ *
+ * Increments the session-level report counter, resets the session backoff, and re-arms the
+ * inactivity watchdog for the configured reporting period multiplied by the inactivity multiplier.
+ * Attempts to obtain the host's typed LB policy data and invokes the configured report handler to
+ * update client-side state from the provided ORCA report. If the host lacks typed policy data or
+ * the handler returns a non-OK status, the report error counter is incremented.
+ *
+ * @param report The parsed xds::data::orca::v3::OrcaLoadReport received from the upstream.
+ */
 void OrcaOobManager::OobSession::onReport(const xds::data::orca::v3::OrcaLoadReport& report) {
   parent_.oob_stats_.reports_received_.inc();
   backoff_->reset();
@@ -375,6 +472,13 @@ void OrcaOobManager::OobSession::onReport(const xds::data::orca::v3::OrcaLoadRep
   }
 }
 
+/**
+ * @brief Reset the session's per-stream state.
+ *
+ * Clears the active request encoder, reinitializes the gRPC frame decoder
+ * (setting its maximum frame length to kMaxOrcaReportFrameBytes), and clears
+ * flags that track an expected stream reset and a received GOAWAY-without-error.
+ */
 void OrcaOobManager::OobSession::resetState() {
   expect_reset_ = false;
   request_encoder_ = nullptr;
@@ -383,6 +487,17 @@ void OrcaOobManager::OobSession::resetState() {
   received_no_error_goaway_ = false;
 }
 
+/**
+ * @brief Determine the authority to use for the gRPC `:authority` header for this session.
+ *
+ * The authority selection follows this precedence:
+ * 1. The explicit policy-level authority from the manager config, if set.
+ * 2. The host's hostname, if present.
+ * 3. The host's full IP address string (including port and IPv6 brackets) for IP endpoints.
+ * 4. The host's cluster name as a terminal fallback (used for non-IP addresses such as UDS).
+ *
+ * @return std::string The chosen authority string to use in gRPC requests.
+ */
 std::string OrcaOobManager::OobSession::authority() const {
   // Explicit policy-level authority wins over everything.
   if (!parent_.config_.authority.empty()) {

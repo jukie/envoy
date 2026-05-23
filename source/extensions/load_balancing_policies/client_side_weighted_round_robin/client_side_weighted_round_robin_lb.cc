@@ -25,7 +25,22 @@ RoundRobinConfig getRoundRobinConfig(const CommonLbConfig& common_config,
   return round_robin_config.lb_config_;
 }
 
-} // namespace
+} /**
+ * @brief Construct a ClientSideWeightedRoundRobinLbConfig from the provided proto and thread resources.
+ *
+ * Initializes configuration values from `lb_proto` and stores references to thread resources.
+ * Specifically, the constructor:
+ * - Copies metric names, error utilization penalty, blackout period, weight expiration period, and
+ *   weight update period from the proto into the corresponding members.
+ * - Sets `oob_enabled` from the proto and configures `oob_manager_config.reporting_period`, clamping
+ *   non-positive proto values to the common default. If `oob_reporting_config` is present in the
+ *   proto, merges those overrides into `oob_manager_config`.
+ * - If a `slow_start_config` is present in the proto, copies it into `round_robin_overrides_`.
+ *
+ * @param lb_proto Proto containing client-side weighted round-robin configuration values.
+ * @param main_thread_dispatcher Dispatcher on the main thread; stored for use by the config.
+ * @param tls_slot_allocator TLS slot allocator; stored for use by the config.
+ */
 
 ClientSideWeightedRoundRobinLbConfig::ClientSideWeightedRoundRobinLbConfig(
     const ClientSideWeightedRoundRobinLbProto& lb_proto, Event::Dispatcher& main_thread_dispatcher,
@@ -104,6 +119,26 @@ void ClientSideWeightedRoundRobinLoadBalancer::WorkerLocalLbFactory::applyWeight
   });
 }
 
+/**
+ * @brief Construct a ClientSideWeightedRoundRobinLoadBalancer.
+ *
+ * Initializes worker-local factory, creates an OrcaWeightManager configured from the
+ * provided typed load-balancing config, and conditionally creates an out-of-band (OOB)
+ * ORCA manager when OOB reporting is enabled. The constructor asserts that `lb_config`
+ * is a `ClientSideWeightedRoundRobinLbConfig`.
+ *
+ * Note: Initialization ordering ensures ORCA host weight data is attached to the
+ * priority set before the OOB manager opens its session so the first OOB report
+ * has the necessary data.
+ *
+ * @param lb_config Optional runtime load-balancer config; must point to a
+ *        ClientSideWeightedRoundRobinLbConfig (asserted).
+ * @param cluster_info Cluster information used to construct worker factories and stats.
+ * @param priority_set Priority set whose host updates drive ORCA weight management.
+ * @param runtime Runtime loader used by underlying components.
+ * @param random Random generator used by underlying components.
+ * @param time_source Time source used for scheduling and expiration behavior.
+ */
 ClientSideWeightedRoundRobinLoadBalancer::ClientSideWeightedRoundRobinLoadBalancer(
     OptRef<const Upstream::LoadBalancerConfig> lb_config, const Upstream::ClusterInfo& cluster_info,
     const Upstream::PrioritySet& priority_set, Runtime::Loader& runtime,

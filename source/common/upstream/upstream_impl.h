@@ -375,6 +375,28 @@ public:
   counters() const override {
     return stats().counters();
   }
+  /**
+   * Create a regular upstream connection for this host.
+   * @param dispatcher Event dispatcher used to create and drive the connection.
+   * @param options Socket-level options to apply to the new connection.
+   * @param transport_socket_options Transport socket options to apply to the new connection.
+   * @returns `CreateConnectionData` containing the created connection and any connection-specific metadata.
+   */
+  /**
+   * Create a connection intended for active health checking against this host.
+   * @param dispatcher Event dispatcher used to create and drive the health check connection.
+   * @param transport_socket_options Transport socket options to apply to the health check connection.
+   * @param metadata Optional metadata to influence health-check connection creation (may be nullptr).
+   * @returns `CreateConnectionData` containing the created health check connection and any connection-specific metadata.
+   */
+  /**
+   * Create an ORCA reporting connection for this host, optionally using an address override.
+   * @param dispatcher Event dispatcher used to create and drive the ORCA reporting connection.
+   * @param transport_socket_options Transport socket options to apply to the ORCA reporting connection.
+   * @param metadata Optional metadata to influence ORCA connection creation (may be nullptr).
+   * @param address_override If non-null, use this address instead of the host's primary address for the connection.
+   * @returns `CreateConnectionData` containing the created ORCA reporting connection and any connection-specific metadata.
+   */
   CreateConnectionData createConnection(
       Event::Dispatcher& dispatcher, const Network::ConnectionSocket::OptionsSharedPtr& options,
       Network::TransportSocketOptionsConstSharedPtr transport_socket_options) const override;

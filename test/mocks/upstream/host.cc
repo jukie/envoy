@@ -30,6 +30,15 @@ MockDetector::~MockDetector() = default;
 MockHealthCheckHostMonitor::MockHealthCheckHostMonitor() = default;
 MockHealthCheckHostMonitor::~MockHealthCheckHostMonitor() = default;
 
+/**
+ * @brief Construct a MockHostDescription with sensible defaults and gMock behaviors.
+ *
+ * Initializes the host address from "tcp://10.0.0.1:443" and a NiceMock transport socket factory, and installs
+ * default ON_CALL handlers for common accessors (hostname, address, orcaReportingAddress, outlierDetector,
+ * stats, loadMetricStats, locality, cluster, healthChecker, transportSocketFactory). Also configures default
+ * behaviors for connection allowance (delegating to the cluster resource manager) and for managing stored
+ * load-balancing policy data (addLbPolicyData, lbPolicyDataCount, lbPolicyDataAt).
+ */
 MockHostDescription::MockHostDescription()
     : address_(*Network::Utility::resolveUrl("tcp://10.0.0.1:443")),
       socket_factory_(new testing::NiceMock<Network::MockTransportSocketFactory>) {
@@ -69,6 +78,19 @@ MockHostDescription::~MockHostDescription() = default;
 MockHostLight::MockHostLight() = default;
 MockHostLight::~MockHostLight() = default;
 
+/**
+ * @brief Constructs a MockHost with default mock behaviors and a transport socket factory.
+ *
+ * Configures ON_CALL defaults for common accessors:
+ * - `cluster()`, `outlierDetector()`, `stats()`, `loadMetricStats()`, `transportSocketFactory()`
+ * - `orcaReportingAddress()` returns `address()`
+ * - `warmed()` returns `true`
+ *
+ * Provides in-memory management for load-balancing policy data:
+ * - `addLbPolicyData()` stores non-null data
+ * - `lbPolicyDataCount()` returns the stored count
+ * - `lbPolicyDataAt()` returns an empty optional when the index is out of range
+ */
 MockHost::MockHost() : socket_factory_(new testing::NiceMock<Network::MockTransportSocketFactory>) {
   ON_CALL(*this, cluster()).WillByDefault(ReturnRef(cluster_));
   ON_CALL(*this, orcaReportingAddress()).WillByDefault(Invoke([this]() { return address(); }));

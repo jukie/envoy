@@ -113,6 +113,22 @@ Upstream::Host::CreateConnectionData LogicalHost::createConnection(
       std::make_shared<RealHostDescription>(address, shared_from_this()));
 }
 
+/**
+ * @brief Create a connection for ORCA out-of-band reporting to this host.
+ *
+ * Selects the dial address (using |address_override| if non-null, otherwise the host's
+ * ORCA reporting address), resolves the transport socket factory using |metadata| when
+ * provided, and opens a single-address connection (no happy-eyeballs address list).
+ *
+ * This function asserts that `override_transport_socket_options_` is null; an assertion
+ * failure will occur if that invariant is violated.
+ *
+ * @param dispatcher Event dispatcher used to create the connection.
+ * @param transport_socket_options Optional transport socket options used for factory resolution.
+ * @param metadata Optional metadata used to resolve a per-connection transport socket factory.
+ * @param address_override Optional address to dial instead of the host's ORCA reporting address.
+ * @return Upstream::Host::CreateConnectionData CreateConnectionData for the created ORCA reporting connection.
+ */
 Upstream::Host::CreateConnectionData LogicalHost::createOrcaReportingConnection(
     Event::Dispatcher& dispatcher,
     Network::TransportSocketOptionsConstSharedPtr transport_socket_options,

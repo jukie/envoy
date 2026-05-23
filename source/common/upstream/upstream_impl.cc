@@ -603,6 +603,20 @@ Host::CreateConnectionData HostImplBase::createHealthCheckConnection(
                           transport_socket_options, shared_from_this());
 }
 
+/**
+ * @brief Create an out-of-band ORCA reporting connection to the chosen ORCA address.
+ *
+ * Uses `address_override` when present; otherwise uses the host's configured ORCA reporting address.
+ * If `metadata` is provided, resolves a transport socket factory for the chosen ORCA address using
+ * that metadata and the provided `transport_socket_options`; otherwise uses the host's cached
+ * transport socket factory. The connection dials a single address (no happy-eyeballs address list).
+ *
+ * @param dispatcher Dispatcher used to create the connection.
+ * @param transport_socket_options Optional transport socket options applied to the created connection.
+ * @param metadata Optional endpoint metadata used to select the transport socket factory.
+ * @param address_override Optional address to use instead of the host's ORCA reporting address.
+ * @return Host::CreateConnectionData A single-address connection and the host pointer used for it.
+ */
 Host::CreateConnectionData HostImplBase::createOrcaReportingConnection(
     Event::Dispatcher& dispatcher,
     Network::TransportSocketOptionsConstSharedPtr transport_socket_options,

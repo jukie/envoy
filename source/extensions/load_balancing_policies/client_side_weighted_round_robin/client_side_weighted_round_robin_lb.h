@@ -14,6 +14,28 @@
 
 #include "absl/status/status.h"
 
+/**
+ * Wraps the client-side weighted round robin protobuf into a LoadBalancerConfig and
+ * exposes parsed parameters and runtime references required by worker-local factories.
+ *
+ * The object owns configuration values used for ORCA-based weight computation, timing
+ * of weight updates, out-of-band (OOB) manager configuration, and round-robin overrides,
+ * and retains references to the main-thread dispatcher and a TLS slot allocator.
+ */
+/**
+ * @param lb_proto The client-side weighted round robin protobuf that provides configuration values.
+ * @param main_thread_dispatcher Dispatcher on the main thread used for orchestration and timer creation.
+ * @param tls_slot_allocator Allocator used to create per-dispatcher thread-local slots.
+ */
+
+/**
+ * Implements a thread-aware client-side weighted round robin load balancer.
+ *
+ * When operating with computed weights, scheduling uses an EDF-based mechanism; when not
+ * using weights, selection falls back to simple round-robin index selection. The implementation
+ * provides a worker-local factory, a thread-local shim for applying weight updates, and
+ * integrates with ORCA weight and optional out-of-band managers.
+ */
 namespace Envoy {
 namespace Upstream {
 

@@ -11,6 +11,28 @@
 
 #include "absl/status/status.h"
 
+/**
+ * Create a thread-aware client-side weighted round robin load balancer for the given cluster.
+ *
+ * @param lb_config Optional load balancer configuration to initialize the balancer with; may be
+ *        empty to use defaults.
+ * @param cluster_info Cluster metadata and settings used by the balancer.
+ * @param priority_set Priority set for the cluster used to obtain hosts.
+ * @param runtime Runtime loader used for feature flags and runtime settings.
+ * @param random Random generator used for weight selection and tie-breaking.
+ * @param time_source Time source used for timing and metrics.
+ * @returns A pointer to a newly created thread-aware ClientSideWeightedRoundRobinLoadBalancer.
+ */
+
+/**
+ * Convert the protobuf configuration into a LoadBalancerConfigPtr suitable for this factory.
+ *
+ * @param context Server factory context whose main thread dispatcher and thread-local storage
+ *        are used to construct the load balancer config.
+ * @param config Protobuf message expected to be a
+ *        ClientSideWeightedRoundRobin (envoy.extensions.load_balancing_policies.client_side_weighted_round_robin.v3).
+ * @returns An absl::StatusOr containing the constructed LoadBalancerConfigPtr on success.
+ */
 namespace Envoy {
 namespace Extensions {
 namespace LoadBalancingPolicies {
