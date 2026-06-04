@@ -86,6 +86,10 @@ public:
   MOCK_METHOD(SharedConstAddressVector, addressListOrNull, (), (const));
   MOCK_METHOD(Network::Address::InstanceConstSharedPtr, healthCheckAddress, (), (const));
   MOCK_METHOD(Network::Address::InstanceConstSharedPtr, orcaReportingAddress, (), (const));
+  MOCK_METHOD(const std::string&, orcaReportingAuthority, (), (const));
+  MOCK_METHOD(Network::TransportSocketOptionsConstSharedPtr, orcaReportingTransportSocketOptions,
+              (), (const));
+  MOCK_METHOD(bool, disableOrcaReporting, (), (const));
   MOCK_METHOD(bool, canary, (), (const));
   MOCK_METHOD(void, canary, (bool new_canary));
   MOCK_METHOD(MetadataConstSharedPtr, metadata, (), (const));
@@ -181,6 +185,10 @@ public:
   MOCK_METHOD(SharedConstAddressVector, addressListOrNull, (), (const));
   MOCK_METHOD(Network::Address::InstanceConstSharedPtr, healthCheckAddress, (), (const));
   MOCK_METHOD(Network::Address::InstanceConstSharedPtr, orcaReportingAddress, (), (const));
+  MOCK_METHOD(const std::string&, orcaReportingAuthority, (), (const));
+  MOCK_METHOD(Network::TransportSocketOptionsConstSharedPtr, orcaReportingTransportSocketOptions,
+              (), (const));
+  MOCK_METHOD(bool, disableOrcaReporting, (), (const));
   MOCK_METHOD(bool, canary, (), (const));
   MOCK_METHOD(void, canary, (bool new_canary));
   MOCK_METHOD(MetadataConstSharedPtr, metadata, (), (const));

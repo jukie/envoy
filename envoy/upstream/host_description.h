@@ -270,6 +270,25 @@ public:
   virtual Network::Address::InstanceConstSharedPtr orcaReportingAddress() const PURE;
 
   /**
+   * @return the :authority header override for ORCA OOB reporting requests, or
+   *         empty if no per-endpoint hostname is configured; callers should
+   *         then fall back to host->hostname() and the host address string.
+   */
+  virtual const std::string& orcaReportingAuthority() const PURE;
+
+  /**
+   * @return transport socket options carrying the TLS SNI for the ORCA stream, or null
+   *         when no per-endpoint hostname override is configured.
+   */
+  virtual Network::TransportSocketOptionsConstSharedPtr
+  orcaReportingTransportSocketOptions() const PURE;
+
+  /**
+   * @return true when Endpoint.OrcaReportingConfig.disable_oob_load_report is set.
+   */
+  virtual bool disableOrcaReporting() const PURE;
+
+  /**
    * @return the priority of the host.
    */
   virtual uint32_t priority() const PURE;

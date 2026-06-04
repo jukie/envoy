@@ -323,7 +323,8 @@ DnsClusterImpl::ResolveTarget::createStrictDnsHosts(
         lb_endpoint_.load_balancing_weight().value(),
         parent_.constLocalitySharedPool()->getObject(locality_lb_endpoints_.locality()),
         lb_endpoint_.endpoint().health_check_config(), locality_lb_endpoints_.priority(),
-        lb_endpoint_.health_status());
+        lb_endpoint_.health_status(), /*address_list=*/{},
+        lb_endpoint_.endpoint().orca_reporting_config());
 
     RETURN_IF_NOT_OK(host_or_error.status());
 

@@ -87,6 +87,7 @@ envoy_cc_library(
         "//source/common/http:codec_client_lib",
         "//source/common/http:headers_lib",
         "//source/common/http:utility_lib",
+        "//source/common/network:transport_socket_options_lib",
         "@abseil-cpp//absl/container:node_hash_map",
         "@abseil-cpp//absl/status",
         "@xds//xds/data/orca/v3:pkg_cc_proto",

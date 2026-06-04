@@ -167,7 +167,8 @@ void StrictDnsClusterImpl::ResolveTarget::startResolve() {
                     lb_endpoint_.load_balancing_weight().value(),
                     parent_.constLocalitySharedPool()->getObject(locality_lb_endpoints_.locality()),
                     lb_endpoint_.endpoint().health_check_config(),
-                    locality_lb_endpoints_.priority(), lb_endpoint_.health_status()),
+                    locality_lb_endpoints_.priority(), lb_endpoint_.health_status(),
+                    /*address_list=*/{}, lb_endpoint_.endpoint().orca_reporting_config()),
                 std::unique_ptr<HostImpl>));
             all_new_hosts.emplace(address->asString());
             ttl_refresh_rate = min(ttl_refresh_rate, addrinfo.ttl_);
