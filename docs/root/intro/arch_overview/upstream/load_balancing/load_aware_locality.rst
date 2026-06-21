@@ -5,10 +5,6 @@
 Load-aware locality load balancing
 -----------------------------------
 
-.. attention::
-
-  This extension is **work-in-progress** and is not yet implemented.
-
 The load-aware locality LB policy
 (:ref:`envoy.load_balancing_policies.load_aware_locality
 <envoy_v3_api_msg_extensions.load_balancing_policies.load_aware_locality.v3.LoadAwareLocality>`)
@@ -42,7 +38,14 @@ imbalance.
 - **Pick zone-aware routing when** only local-zone preference is needed
   and traffic is already balanced by other means. It has no ORCA
   dependency and is simpler to operate, but it only applies at priority
-  0 and does not react to backend load.
+  0 and does not react to backend load. Zone-aware routing is not
+  extended here because it is priority-0 only, recomputes synchronously
+  per-worker inside membership callbacks (no timer, EWMA, or
+  cross-thread snapshot), and is built around a local-cluster percentage
+  model that would require rewriting the base class shared by
+  round-robin, least-request, and random. This policy requires
+  all-priority support, async main-thread ORCA recompute, and no
+  local-cluster dependency.
 - **Pick**
   :ref:`WrrLocality
   <envoy_v3_api_msg_extensions.load_balancing_policies.wrr_locality.v3.WrrLocality>`
@@ -84,45 +87,34 @@ The policy is implemented as a ``ThreadAwareLoadBalancer``:
 
 - A main-thread timer recomputes per-locality weights from ORCA data and
   publishes an immutable snapshot to worker threads via a thread-local slot.
-  The snapshot carries a generation counter; workers rebuild per-locality
-  child LB instances when membership changes bump the generation.
-- Worker threads read the latest snapshot lock-free on the request path,
-  pick a locality, and delegate endpoint selection to the child LB for that
-  locality.
+  The snapshot carries only advisory per-priority locality weights; it does
+  not carry priority loads, panic state, or health information.
+- Workers rebuild per-locality child LB instances via a membership-update
+  callback registered on the cluster priority set, independent of the
+  weight snapshot and ``weight_update_period``.
+- Priority selection, health/degraded mode, and panic detection use standard
+  ``LoadBalancerBase`` machinery over live worker-thread host-set state,
+  recomputed on membership and health callbacks. Failover between priorities
+  is therefore callback-fresh, not timer-driven.
+- Worker threads read the latest locality-weight snapshot lock-free on the
+  request path, pick a locality, and delegate endpoint selection to the
+  child LB for that locality.
 - ORCA reports flow through per-host ``HostLbPolicyData`` slots shared
   with other ORCA consumers; see :ref:`ORCA data flow
   <load_aware_locality_orca_data_flow>` below for coexistence details.
-- When ``enable_oob_load_report`` is set, a cluster-level OOB manager runs
-  on the main-thread dispatcher and owns one ORCA gRPC streaming session
-  per host, reacting to membership updates to add and remove sessions. It
-  decodes reports into the same shared report handler that backs the
-  in-band path, so workers see OOB and in-band samples through the same
-  ``HostLbPolicyData`` slots.
 
 .. _load_aware_locality_orca_data_flow:
 
 ORCA data flow
 """"""""""""""
 
-Upstream endpoints must report ORCA utilization. The policy supports both
-in-band and out-of-band reporting modes:
+Upstream endpoints must report ORCA utilization in-band: ORCA reports are
+returned on the response headers or trailers of upstream responses. Sample
+rate is tied to the request rate to each host, so probing
+(``remote_probe_fraction``) is required to keep remote-locality data fresh.
 
-- **In-band (default).** ORCA reports returned on the response headers or
-  trailers of upstream responses. Sample rate is tied to the request rate
-  to each host, so probing (``remote_probe_fraction``) is required to keep
-  remote-locality data fresh.
-- **Out-of-band (OOB).** When ``enable_oob_load_report`` is set, the policy
-  opens a per-host ORCA gRPC stream and the endpoint pushes reports every
-  ``oob_reporting_period`` independent of request traffic. OOB reuses the
-  same central ORCA client as
-  :ref:`CSWRR <arch_overview_load_balancing_types_client_side_weighted_round_robin>`:
-  a cluster-level OOB manager owns one streaming session per host, reacts to
-  membership changes to add and remove sessions, and feeds every decoded
-  report into the shared ORCA report handler. Because OOB decouples sample
-  rate from request rate, ``remote_probe_fraction`` may safely be set to 0.
-
-Either way reports land in the same per-host ``HostLbPolicyData`` slots, so
-weight computation is identical regardless of reporting mode.
+Reports land in per-host ``HostLbPolicyData`` slots, which feed weight
+computation.
 
 Pairing this policy with
 :ref:`CSWRR <arch_overview_load_balancing_types_client_side_weighted_round_robin>`
@@ -132,15 +124,18 @@ per-endpoint capacity. Each consumer attaches independent
 ``HostLbPolicyData`` entries, so the two policies do not interfere.
 
 Utilization is derived from each host's ORCA report using the same
-extraction as CSWRR (precedence may be flipped by the
+extraction as CSWRR. The runtime flag
 ``envoy.reloadable_features.orca_weight_manager_use_named_metrics_first``
-runtime feature). By default:
+defaults to ``true``, so the default precedence is:
 
-1. ``application_utilization`` -- value in [0, 1], used when reported and
-   greater than 0.
-2. Named metrics via ``metric_names_for_computing_utilization`` -- max of
-   present values, used when ``application_utilization`` is not reported.
+1. Named metrics via ``metric_names_for_computing_utilization`` -- max of
+   present values, used when any matching metric is reported.
+2. ``application_utilization`` -- value in [0, 1], used when no named
+   metrics match.
 3. ``cpu_utilization`` -- final fallback.
+
+Disabling the runtime flag reverses steps 1 and 2 so
+``application_utilization`` is preferred over named metrics.
 
 .. _load_aware_locality_weight_computation:
 
@@ -342,9 +337,8 @@ Configuration parameters
      - 0.03
      - Minimum fraction of traffic sent to non-local localities to keep ORCA
        data fresh in all-local mode. The deficit is redistributed
-       proportionally to host count. Set to 0 to disable (safe only with
-       out-of-band ORCA reporting or when cross-zone traffic must be strictly
-       avoided). Range: [0, 1). See
+       proportionally to host count. Set to 0 to disable (safe only when
+       cross-zone traffic must be strictly avoided). Range: [0, 1). See
        :ref:`Caveats <load_aware_locality_caveats>` for scaling notes.
    * - ``weight_expiration_period``
      - 3 minutes
@@ -355,19 +349,6 @@ Configuration parameters
        falls back to host-count-proportional weighting. Tune higher to
        tolerate longer reporting gaps; tune lower to prune draining
        backends faster. Set to 0 s to disable expiration.
-   * - ``enable_oob_load_report``
-     - (unset / false)
-     - Enables out-of-band (OOB) ORCA utilization reporting. When set, the
-       policy opens a per-host ORCA gRPC stream and the endpoint pushes
-       reports on its own schedule rather than piggybacking on responses.
-       When unset, only in-band reports on response headers/trailers are
-       consumed. See :ref:`ORCA data flow
-       <load_aware_locality_orca_data_flow>`.
-   * - ``oob_reporting_period``
-     - 10 s
-     - Requested load-reporting interval, used only when
-       ``enable_oob_load_report`` is true. The upstream may report less
-       frequently than requested.
 
 Priority support
 ^^^^^^^^^^^^^^^^
@@ -378,6 +359,11 @@ Priority selection happens first via the standard healthy/degraded
 priority load calculation; locality selection then applies within the
 chosen priority. Unlike zone-aware routing (priority 0 only), this
 policy applies at all priority levels.
+
+The policy honors ``common_lb_config.healthy_panic_threshold`` and
+``common_lb_config.zone_aware_lb_config.fail_traffic_on_panic``. When
+in panic mode the policy routes to all hosts; when ``fail_traffic_on_panic``
+is set it returns no host instead.
 
 Three independent weight sets are maintained per priority:
 
@@ -395,17 +381,16 @@ weight, computed from the same per-host ORCA data in a single tick pass.
 Caveats and known limitations
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-- **Probing is required with in-band reporting.** In the default in-band
-  mode, a locality only produces fresh ORCA samples when it receives
-  traffic, so ``remote_probe_fraction`` must stay above 0 to keep remote
-  localities reporting. Set it to 0 only when ``enable_oob_load_report``
-  is on (OOB streams report independently of traffic) or when cross-zone
+- **Probing is required.** A locality only produces fresh ORCA samples
+  when it receives traffic, so ``remote_probe_fraction`` must stay above 0
+  to keep remote localities reporting. Set it to 0 only when cross-zone
   traffic must be strictly avoided.
 - **Hash-based child policies.** Ring hash and Maglev build their hash
   structures from the host set they are given. With this policy, that set
   is the chosen locality's hosts, not the full cluster. The same request
   hash will not necessarily map to the same endpoint cluster-wide, so
-  consistency guarantees apply only within a locality.
+  consistency guarantees apply only within a locality. Endpoint-selection
+  retry is owned by the child LB and operates within the chosen locality.
 - **Probe-fraction scaling.** ``remote_probe_fraction`` is a global value
   divided across all remote localities, then again across each locality's
   hosts. The per-host probe rate is therefore approximately
@@ -434,15 +419,18 @@ Caveats and known limitations
   row, samples expire before the next probe arrives, so remote
   localities will alternate between fresh data and host-count fallback
   every few ticks. To avoid this, either reduce locality count, raise
-  ``remote_probe_fraction``, raise ``weight_expiration_period`` to
-  tolerate longer gaps, or enable OOB ORCA reporting via
-  ``enable_oob_load_report`` (which decouples sample rate from request
-  rate entirely).
+  ``remote_probe_fraction``, or raise ``weight_expiration_period`` to
+  tolerate longer gaps.
 - **Variance-threshold oscillation.** Workloads sitting near the
   ``utilization_variance_threshold`` boundary can theoretically oscillate
   between snap-to-local and spillover modes across consecutive ticks.
   EWMA smoothing dampens this in practice; tune
   ``smoothing_time_constant`` higher if oscillation is observed.
+- **Child LB health view.** The child endpoint-picking LB sees only the
+  hosts in its chosen locality, all marked healthy (a flattened health
+  view). This is benign for ORCA-weighting children like CSWRR but
+  means a child that relies on Envoy health flags will not see degraded
+  or unhealthy markers within the locality slice.
 - **Subsetting.** Load balancer
   :ref:`subsetting <arch_overview_load_balancer_subsets>` partitions
   hosts orthogonally to locality boundaries. The policy will operate
@@ -461,8 +449,6 @@ The policy emits stats under ``cluster.<cluster_name>.load_aware_locality.*``:
 
    * - Counter
      - Increments when
-   * - ``recompute_total``
-     - Per main-thread tick that recomputes weights.
    * - ``all_overloaded_total``
      - Per tick where every locality's headroom was 0 (fallback to
        host-count weighting).
@@ -483,5 +469,6 @@ Migrating from zone-aware routing? The closest counter mappings:
 +======================================+==============================================+
 | ``lb_zone_routing_all_directly``     | ``load_aware_locality.local_preferred_total``|
 +--------------------------------------+----------------------------------------------+
-| ``lb_recalculate_zone_structures``   | ``load_aware_locality.recompute_total``      |
+| ``lb_recalculate_zone_structures``   | ``lb_recalculate_zone_structures`` (still    |
+|                                      | emitted at cluster scope, unchanged)         |
 +--------------------------------------+----------------------------------------------+
