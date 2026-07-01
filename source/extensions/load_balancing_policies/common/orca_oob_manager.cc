@@ -71,11 +71,9 @@ void applyOrcaOobConnectionOverrides(
 OrcaOobManager::OrcaOobManager(OrcaOobManagerConfig config,
                                const Upstream::PrioritySet& priority_set,
                                Event::Dispatcher& dispatcher, Random::RandomGenerator& random,
-                               Stats::Scope& stats_scope,
-                               OrcaLoadReportHandlerSharedPtr report_handler)
+                               Stats::Scope& stats_scope)
     : dispatcher_(dispatcher), random_(random), config_(sanitizeConfig(std::move(config))),
-      priority_set_(priority_set), report_handler_(std::move(report_handler)),
-      oob_stats_(generateOrcaOobStats(stats_scope)) {}
+      priority_set_(priority_set), oob_stats_(generateOrcaOobStats(stats_scope)) {}
 
 OrcaOobManager::~OrcaOobManager() {
   for (auto& [host, session] : oob_sessions_) {
@@ -385,14 +383,15 @@ void OrcaOobManager::OobSession::onReport(const xds::data::orca::v3::OrcaLoadRep
   parent_.oob_stats_.reports_received_.inc();
   backoff_->reset();
   inactivity_timer_->enableTimer(parent_.config_.reporting_period * kInactivityWatchdogMultiplier);
-  auto data_opt = host_->typedLbPolicyData<OrcaHostLbPolicyData>();
-  if (!data_opt.has_value()) {
-    parent_.oob_stats_.report_errors_.inc();
-    return;
-  }
-  const absl::Status status =
-      parent_.report_handler_->updateClientSideDataFromOrcaLoadReport(report, *data_opt);
-  if (!status.ok()) {
+  // Deliver the report to every ORCA-interested HostLbPolicyData on the host. OOB has no downstream
+  // stream, so onOrcaLoadReport is called with an empty stream_info.
+  bool apply_failed = false;
+  Upstream::forEachOrcaLoadReportRecipient(*host_, [&](Upstream::HostLbPolicyData& data) {
+    if (!data.onOrcaLoadReport(report).ok()) {
+      apply_failed = true;
+    }
+  });
+  if (apply_failed) {
     parent_.oob_stats_.report_errors_.inc();
   }
 }

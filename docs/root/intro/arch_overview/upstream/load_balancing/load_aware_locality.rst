@@ -95,9 +95,11 @@ The policy is implemented as a ``ThreadAwareLoadBalancer``:
 - When ``enable_oob_load_report`` is set, a cluster-level OOB manager runs
   on the main-thread dispatcher and owns one ORCA gRPC streaming session
   per host, reacting to membership updates to add and remove sessions. It
-  decodes reports into the same shared report handler that backs the
-  in-band path, so workers see OOB and in-band samples through the same
-  ``HostLbPolicyData`` slots.
+  decodes each report and delivers it to the host's ``HostLbPolicyData``
+  through the same ``onOrcaLoadReport`` entry point the in-band path uses,
+  so workers see OOB and in-band samples through the same slots. The OOB
+  connection can be redirected with ``oob_reporting_config`` (alternative
+  port, ``:authority``, transport socket selection).
 
 .. _load_aware_locality_orca_data_flow:
 
@@ -114,11 +116,14 @@ in-band and out-of-band reporting modes:
 - **Out-of-band (OOB).** When ``enable_oob_load_report`` is set, the policy
   opens a per-host ORCA gRPC stream and the endpoint pushes reports every
   ``oob_reporting_period`` independent of request traffic. OOB reuses the
-  same central ORCA client as
+  same policy-agnostic OOB manager as
   :ref:`CSWRR <arch_overview_load_balancing_types_client_side_weighted_round_robin>`:
   a cluster-level OOB manager owns one streaming session per host, reacts to
-  membership changes to add and remove sessions, and feeds every decoded
-  report into the shared ORCA report handler. Because OOB decouples sample
+  membership changes to add and remove sessions, and delivers every decoded
+  report to the host's ``HostLbPolicyData`` through the same
+  ``onOrcaLoadReport`` entry point used for in-band reports. The reporting
+  connection may be redirected to an alternative port, ``:authority``, or
+  transport socket via ``oob_reporting_config``. Because OOB decouples sample
   rate from request rate, ``remote_probe_fraction`` may safely be set to 0.
 
 Either way reports land in the same per-host ``HostLbPolicyData`` slots, so
@@ -368,6 +373,15 @@ Configuration parameters
      - Requested load-reporting interval, used only when
        ``enable_oob_load_report`` is true. The upstream may report less
        frequently than requested.
+   * - ``oob_reporting_config``
+     - (unset)
+     - Optional connection overrides for the OOB reporting stream, honored
+       only when ``enable_oob_load_report`` is true: an alternative
+       ``port_value`` (e.g. a dedicated reporting sidecar), the ``authority``
+       header, and ``transport_socket_match_criteria`` for selecting a
+       transport socket from the cluster's ``transport_socket_matches``. When
+       unset, the stream dials the host's default ORCA reporting address with
+       the cluster's default transport socket.
 
 Priority support
 ^^^^^^^^^^^^^^^^
